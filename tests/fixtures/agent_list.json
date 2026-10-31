@@ -1,0 +1,80 @@
+{
+  "id": "fixture-agents",
+  "result": {
+    "agents": [
+      {
+        "name": null,
+        "agent": "claude",
+        "agent_status": "idle",
+        "cwd": "~/projects/example-1",
+        "pane_id": "w1:p1",
+        "workspace_id": "w1"
+      },
+      {
+        "name": null,
+        "agent": "codex",
+        "agent_status": "idle",
+        "cwd": "~/projects/example-2",
+        "pane_id": "w2:p1",
+        "workspace_id": "w1"
+      },
+      {
+        "name": null,
+        "agent": "claude",
+        "agent_status": "idle",
+        "cwd": "~/projects/example-3",
+        "pane_id": "w3:p1",
+        "workspace_id": "w3"
+      },
+      {
+        "name": null,
+        "agent": "claude",
+        "agent_status": "idle",
+        "cwd": "~/projects/example-4",
+        "pane_id": "w4:p1",
+        "workspace_id": "w4"
+      },
+      {
+        "name": null,
+        "agent": "codex",
+        "agent_status": "idle",
+        "cwd": "~/projects/example-5",
+        "pane_id": "w5:p1",
+        "workspace_id": "w5"
+      },
+      {
+        "name": null,
+        "agent": "claude",
+        "agent_status": "idle",
+        "cwd": "~/projects/example-6",
+        "pane_id": "w6:p1",
+        "workspace_id": "w6"
+      },
+      {
+        "name": null,
+        "agent": "claude",
+        "agent_status": "idle",
+        "cwd": "~/projects/example-7",
+        "pane_id": "w7:p1",
+        "workspace_id": "w7"
+      },
+      {
+        "name": null,
+        "agent": "claude",
+        "agent_status": "done",
+        "cwd": "~/projects/example-8",
+        "pane_id": "w8:p1",
+        "workspace_id": "w11"
+      },
+      {
+        "name": null,
+        "agent": "codex",
+        "agent_status": "working",
+        "cwd": "~/projects/example-9",
+        "pane_id": "w9:p1",
+        "workspace_id": "w13"
+      }
+    ],
+    "type": "agent_list"
+  }
+}

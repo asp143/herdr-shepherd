@@ -1,0 +1,120 @@
+{
+  "id": "fixture-snapshot",
+  "result": {
+    "snapshot": {
+      "workspaces": [
+        {
+          "workspace_id": "w1",
+          "label": "repo-1",
+          "worktree": {
+            "repo_key": "~/projects/repo-1",
+            "repo_root": "~/projects/repo-1",
+            "checkout_path": "~/projects/repo-1",
+            "is_linked_worktree": false
+          }
+        },
+        {
+          "workspace_id": "w2",
+          "label": "worktree/task-2",
+          "worktree": {
+            "repo_key": "~/projects/repo-1",
+            "repo_root": "~/projects/repo-1",
+            "checkout_path": "~/.herdr/worktrees/repo-1/task-2",
+            "is_linked_worktree": true
+          }
+        },
+        {
+          "workspace_id": "w3",
+          "label": "repo-2",
+          "worktree": {
+            "repo_key": "~/projects/repo-2",
+            "repo_root": "~/projects/repo-2",
+            "checkout_path": "~/projects/repo-2",
+            "is_linked_worktree": false
+          }
+        },
+        {
+          "workspace_id": "w4",
+          "label": "repo-3",
+          "worktree": {
+            "repo_key": "~/projects/repo-3",
+            "repo_root": "~/projects/repo-3",
+            "checkout_path": "~/projects/repo-3",
+            "is_linked_worktree": false
+          }
+        },
+        {
+          "workspace_id": "w5",
+          "label": "worktree/task-5",
+          "worktree": {
+            "repo_key": "~/projects/repo-3",
+            "repo_root": "~/projects/repo-3",
+            "checkout_path": "~/.herdr/worktrees/repo-3/task-5",
+            "is_linked_worktree": true
+          }
+        },
+        {
+          "workspace_id": "w6",
+          "label": "workspace-6",
+          "worktree": null
+        },
+        {
+          "workspace_id": "w7",
+          "label": "repo-4",
+          "worktree": {
+            "repo_key": "~/projects/repo-4",
+            "repo_root": "~/projects/repo-4",
+            "checkout_path": "~/projects/repo-4",
+            "is_linked_worktree": false
+          }
+        },
+        {
+          "workspace_id": "w8",
+          "label": "worktree/task-8",
+          "worktree": {
+            "repo_key": "~/projects/repo-4",
+            "repo_root": "~/projects/repo-4",
+            "checkout_path": "~/.herdr/worktrees/repo-4/task-8",
+            "is_linked_worktree": true
+          }
+        },
+        {
+          "workspace_id": "w9",
+          "label": "workspace-9",
+          "worktree": null
+        },
+        {
+          "workspace_id": "w10",
+          "label": "workspace-10",
+          "worktree": null
+        },
+        {
+          "workspace_id": "w11",
+          "label": "workspace-11",
+          "worktree": null
+        },
+        {
+          "workspace_id": "w12",
+          "label": "repo-5",
+          "worktree": {
+            "repo_key": "~/projects/repo-5",
+            "repo_root": "~/projects/repo-5",
+            "checkout_path": "~/projects/repo-5",
+            "is_linked_worktree": false
+          }
+        },
+        {
+          "workspace_id": "w13",
+          "label": "worktree/task-13",
+          "worktree": {
+            "repo_key": "~/projects/repo-5",
+            "repo_root": "~/projects/repo-5",
+            "checkout_path": "~/.herdr/worktrees/repo-5/task-13",
+            "is_linked_worktree": true
+          }
+        }
+      ]
+    },
+    "type": "session_snapshot"
+  }
+}

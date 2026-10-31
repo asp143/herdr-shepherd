@@ -1,7 +1,12 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, error::ErrorKind};
-use herdr_shepherd::{config, error::ShepherdError, output};
+use herdr_shepherd::{
+    config,
+    error::ShepherdError,
+    herdr::{Herdr, cli::CliHerdr},
+    output, proc,
+};
 
 #[derive(Parser)]
 #[command(
@@ -23,6 +28,8 @@ struct Cli {
 enum Commands {
     /// Print the shepherd version.
     Version,
+    /// Relabel and pack linked worktree workspaces.
+    Regroup,
     /// Validate the resolved shepherd configuration.
     ValidateConfig {
         #[arg(long)]
@@ -39,7 +46,7 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
             });
         }
         Commands::ValidateConfig { project_root } => {
-            let current = std::env::current_dir().map_err(anyhow::Error::from)?;
+            let current = project_root_from_cwd()?;
             let cfg = config::load(
                 &config::resolve_config_dir(cli.config_dir.as_deref()),
                 Some(project_root.as_deref().unwrap_or(&current)),
@@ -48,8 +55,30 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 serde_json::to_string_pretty(&cfg).expect("config is serializable")
             });
         }
+        Commands::Regroup => {
+            let workspaces = CliHerdr::from_env().workspaces()?;
+            output::emit(
+                cli.json,
+                &serde_json::json!({"workspaces": workspaces.len()}),
+                || format!("{} workspaces", workspaces.len()),
+            );
+        }
     }
     Ok(())
+}
+
+fn project_root_from_cwd() -> Result<PathBuf, ShepherdError> {
+    let cwd = std::env::current_dir().map_err(anyhow::Error::from)?;
+    let root = proc::run(
+        std::process::Command::new("git").args(["rev-parse", "--show-toplevel"]),
+        std::time::Duration::from_secs(20),
+    );
+    Ok(root
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| PathBuf::from(s.trim()))
+        .unwrap_or(cwd))
 }
 
 fn main() {
