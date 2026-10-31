@@ -50,6 +50,8 @@ Mid/Low findings are treated as unaddressed. `check_attribution` rejects the
 specified attribution phrases with `attribution` (exit 2) while allowing
 technical references such as "Claude Code hook fix". Future GitHub writers must
 call that check before sending human-facing text.
+Attribution matching accepts Unicode whitespace between words, including NBSP
+and repeated spaces.
 
 Regroup preserves user labels such as `fix/foo`, skips children whose parent workspace is absent, and is idempotent. Nested generated prefixes are stripped in one run so another invocation does not rename again. Explicit `regroup` always runs; `[upkeep] regroup` controls automatic event handling.
 
@@ -97,10 +99,14 @@ command = ["your-ticket-command", "--json"]
 `ticket fetch <id>` appends the ID as one literal argument and allows 30 seconds
 for execution and stdout capture. The command must print JSON with string
 `id`, `title`, and `description` fields, an `acceptance_criteria` string array,
-and optional `url`. Missing or empty configuration returns `no_ticket_source`
-(exit 2); paste the ticket text instead. Malformed JSON is a usage error;
-execution failures and timeouts are runtime errors. Fetching requires no state
-directory and does not add a ticket to the store.
+and optional `url`. The returned ID must match the request, and the title must
+not be blank. Missing or empty configuration returns `no_ticket_source`
+(exit 2); paste the ticket text instead. Invalid JSON, invalid ticket content,
+execution failures, and timeouts are runtime errors (exit 1). Timeout errors
+and nonzero exit statuses have distinct messages. Sources run in an owned
+process group; timeouts kill the group, including descendants retaining
+stdout. Fetching requires no state directory and does not add a ticket to the
+store.
 
 Example global settings:
 

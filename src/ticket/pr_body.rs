@@ -57,7 +57,7 @@ fn append_items<'a>(body: &mut String, items: impl Iterator<Item = &'a str>) {
 
 pub fn check_attribution(text: &str) -> Result<(), ShepherdError> {
     static ATTRIBUTION: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)(generated (with|by) (claude|codex|chatgpt|gpt|an? ai)|co-authored-by:.*(claude|codex|openai|anthropic|gpt)|\bas an ai\b|🤖|claude\.com/claude-code)")
+        Regex::new(r"(?i)(generated\s+(with|by)\s+(claude|codex|chatgpt|gpt|an?\s+ai)|co-authored-by:.*(claude|codex|openai|anthropic|gpt)|\bas\s+an\s+ai\b|🤖|claude\.com/claude-code)")
             .expect("built-in attribution regex is valid")
     });
     if ATTRIBUTION.is_match(text) {

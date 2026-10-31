@@ -62,3 +62,29 @@ fn ticket_fetch_without_source_exits_2() {
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "no_ticket_source");
 }
+
+#[test]
+fn invalid_source_output_exits_1() {
+    let project = tempfile::tempdir().unwrap();
+    let global = tempfile::tempdir().unwrap();
+    for fixture in [
+        "not json".to_string(),
+        "{}".to_string(),
+        serde_json::json!({"id":"SYM-8","title":"Wrong ticket","description":"Text","acceptance_criteria":[]}).to_string(),
+        serde_json::json!({"id":"SYM-7","title":"","description":"Text","acceptance_criteria":[]}).to_string(),
+    ] {
+        let source = toml::Table::from_iter([(
+            "ticket_source".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "command".into(),
+                toml::Value::Array(["sh", "-c", "printf '%s' \"$1\"", "source", &fixture].into_iter().map(|arg| toml::Value::String(arg.into())).collect()),
+            )])),
+        )]);
+        std::fs::write(project.path().join(".shepherd.toml"), toml::to_string(&source).unwrap()).unwrap();
+        let output = run(project.path(), global.path(), "SYM-7");
+        assert_eq!(output.status.code(), Some(1));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "runtime");
+    }
+}

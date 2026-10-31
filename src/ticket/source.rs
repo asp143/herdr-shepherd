@@ -1,5 +1,17 @@
-use std::{process::Command, time::Duration};
+use std::{
+    io::Read,
+    os::unix::process::CommandExt,
+    process::{Child, Command, Stdio},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
+use anyhow::Context;
+use nix::{
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{config::Config, error::ShepherdError};
@@ -59,10 +71,74 @@ fn fetch_with_timeout(
     }
     let mut cmd = Command::new(program);
     cmd.args(arguments).arg(id);
-    let output = crate::proc::run(&mut cmd, timeout)?
-        .ok_or_else(|| anyhow::anyhow!("ticket source failed or exceeded its timeout"))?;
-    serde_json::from_str(&output)
-        .map_err(|err| ShepherdError::Usage(format!("invalid ticket source JSON: {err}")))
+    let output = run_source(&mut cmd, timeout)?;
+    let ticket: FetchedTicket =
+        serde_json::from_str(&output).context("invalid ticket source JSON")?;
+    if ticket.id != id {
+        return Err(
+            anyhow::anyhow!("ticket source returned id {:?}, expected {id:?}", ticket.id).into(),
+        );
+    }
+    if ticket.title.trim().is_empty() {
+        return Err(anyhow::anyhow!("ticket source returned an empty title").into());
+    }
+    Ok(ticket)
+}
+
+struct SourceProcess {
+    child: Child,
+    group: Pid,
+}
+
+impl Drop for SourceProcess {
+    fn drop(&mut self) {
+        // The source may exit while descendants retain its stdout. Kill the
+        // entire owned group before reaping, on timeout and other error paths.
+        let _ = killpg(self.group, Signal::SIGKILL);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Enforce one deadline for command execution and the complete stdout capture.
+fn run_source(cmd: &mut Command, timeout: Duration) -> anyhow::Result<String> {
+    let deadline = Instant::now() + timeout;
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .context("start ticket source")?;
+    let group = Pid::from_raw(child.id().try_into().expect("child pid fits pid_t"));
+    let mut process = SourceProcess { child, group };
+    let stdout = process.child.stdout.take().expect("stdout is piped");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut text = String::new();
+        let result = std::io::BufReader::new(stdout).read_to_string(&mut text);
+        let _ = tx.send(result.map(|_| text));
+    });
+    let timeout_error =
+        || anyhow::anyhow!("ticket source timeout after {} ms", timeout.as_millis());
+    loop {
+        if let Some(status) = process.child.try_wait().context("wait for ticket source")? {
+            if !status.success() {
+                anyhow::bail!("ticket source exited with non-zero status {status}");
+            }
+            return match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(result) => result.context("read ticket source stdout"),
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(timeout_error()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("ticket source stdout reader disconnected")
+                }
+            };
+        }
+        if Instant::now() >= deadline {
+            return Err(timeout_error());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[cfg(test)]
@@ -142,7 +218,7 @@ mod tests {
             let fixture = incomplete.to_string();
             let cfg = config(&["sh", "-c", "printf '%s' \"$1\"", "source", &fixture]);
             assert!(
-                matches!(fetch(&cfg, "SYM-7"), Err(ShepherdError::Usage(_))),
+                matches!(fetch(&cfg, "SYM-7"), Err(ShepherdError::Runtime(_))),
                 "{field}"
             );
         }
@@ -177,15 +253,100 @@ printf '{"id":"%s","title":"Literal argv","description":"Fetched","acceptance_cr
     }
 
     #[test]
+    fn timeout_kills_descendant_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("descendant-survived");
+        let cfg = config(&[
+            "sh",
+            "-c",
+            "(sleep 0.2; printf alive > \"$1\") & wait",
+            "source",
+            marker.to_str().unwrap(),
+        ]);
+        let error = fetch_with_timeout(&cfg, "SYM-7", Duration::from_millis(60)).unwrap_err();
+        assert!(error.to_string().contains("timeout"));
+        thread::sleep(Duration::from_millis(250));
+        assert!(!marker.exists(), "descendant survived the source timeout");
+    }
+
+    #[test]
+    fn timeout_covers_stdout_after_source_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("descendant-survived");
+        let cfg = config(&[
+            "sh",
+            "-c",
+            "(sleep 0.2; printf alive > \"$1\") & exit 0",
+            "source",
+            marker.to_str().unwrap(),
+        ]);
+        let started = Instant::now();
+        let error = fetch_with_timeout(&cfg, "SYM-7", Duration::from_millis(60)).unwrap_err();
+        assert!(error.to_string().contains("timeout"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(250));
+        assert!(
+            !marker.exists(),
+            "descendant retained stdout after the source exited"
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_cleans_up_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("descendant-survived");
+        let cfg = config(&[
+            "sh",
+            "-c",
+            "(sleep 0.2; printf alive > \"$1\") & exit 7",
+            "source",
+            marker.to_str().unwrap(),
+        ]);
+        let error = fetch_with_timeout(&cfg, "SYM-7", Duration::from_secs(1)).unwrap_err();
+        assert!(error.to_string().contains("non-zero"));
+        thread::sleep(Duration::from_millis(250));
+        assert!(
+            !marker.exists(),
+            "descendant survived failed source execution"
+        );
+    }
+
+    #[test]
     fn source_failure_does_not_parse_stdout() {
         let cfg = config(&["sh", "-c", "printf '{}'; exit 7"]);
-        assert_eq!(fetch(&cfg, "SYM-7").unwrap_err().code(), "runtime");
+        let error = fetch(&cfg, "SYM-7").unwrap_err();
+        assert_eq!(error.code(), "runtime");
+        assert!(error.to_string().contains("non-zero"));
+        assert!(error.to_string().contains('7'));
+        assert!(!error.to_string().contains("timeout"));
     }
 
     #[test]
     fn invalid_json_rejected() {
         let cfg = config(&["sh", "-c", "printf 'not json'"]);
-        assert_eq!(fetch(&cfg, "SYM-7").unwrap_err().code(), "usage");
+        let error = fetch(&cfg, "SYM-7").unwrap_err();
+        assert_eq!(error.code(), "runtime");
+        assert_eq!(error.exit_code(), 1);
+    }
+
+    #[test]
+    fn mismatched_id_and_blank_title_rejected() {
+        for (id, title) in [("SYM-8", "Valid title"), ("SYM-7", ""), ("SYM-7", " \t")] {
+            let fixture = serde_json::json!({
+                "id": id, "title": title, "description": "Ticket text",
+                "acceptance_criteria": [],
+            })
+            .to_string();
+            let cfg = config(&["sh", "-c", "printf '%s' \"$1\"", "source", &fixture]);
+            let error = fetch(&cfg, "SYM-7").unwrap_err();
+            assert_eq!(error.code(), "runtime");
+            assert_eq!(error.exit_code(), 1);
+            assert!(
+                error
+                    .to_string()
+                    .contains(if id != "SYM-7" { "id" } else { "title" })
+            );
+        }
     }
 
     #[test]
