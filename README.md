@@ -1,6 +1,6 @@
 # herdr-shepherd
 
-Shepherd is a herdr plugin intended to take a ticket through planning, parallel coding, review, QA, and a pull request, then handle feedback and cleanup after the user merges. Phase 1 supplies the foundation and upkeep: workspace regrouping, a read-only stale-worktree report, configuration, a JSON CLI, worktree event handling, and keybinding suggestions. Agent orchestration and PR workflows belong to later phases.
+Shepherd is a herdr plugin intended to take a ticket through planning, parallel coding, review, QA, and a pull request, then handle feedback and cleanup after the user merges. Phase 1 supplies the foundation and upkeep: workspace regrouping, a read-only stale-worktree report, configuration, a JSON CLI, worktree event handling, and keybinding suggestions. The standalone core adds ticket storage, state transitions, role and supervision settings, PR text helpers, and ticket fetching. Agent orchestration and PR workflows belong to later phases.
 
 ## Install
 
@@ -26,6 +26,7 @@ The binary is `bin/herdr-shepherd`. Add that directory to your PATH to use the s
 | `keys [--herdr-config PATH]` | Print a keybinding snippet without changing herdr configuration. |
 | `ticket list [--project-root PATH]` | List tickets in the invoking project's store. |
 | `ticket show <id> [--project-root PATH]` | Show a stored ticket and its history. |
+| `ticket fetch <id> [--project-root PATH]` | Fetch ticket JSON from the configured source without storing it. |
 
 Global options are `--json`, `--config-dir PATH`, and `--state-dir PATH`.
 Ticket inspection requires `--state-dir` or `HERDR_PLUGIN_STATE_DIR`. State lives
@@ -77,6 +78,21 @@ revision rounds, and PR polling every 180 seconds. Supervision defaults are a
 limited to `enter`, `esc`, `y`, `n`, `1` through `9`, `down`, and `up`. This core
 resolves supervision configuration; executing those rules is a later module.
 
+An optional ticket source is an argv array in the selected configuration:
+
+```toml
+[ticket_source]
+command = ["your-ticket-command", "--json"]
+```
+
+`ticket fetch <id>` appends the ID as one literal argument and allows 30 seconds
+for execution and stdout capture. The command must print JSON with string
+`id`, `title`, and `description` fields, an `acceptance_criteria` string array,
+and optional `url`. Missing or empty configuration returns `no_ticket_source`
+(exit 2); paste the ticket text instead. Malformed JSON is a usage error;
+execution failures and timeouts are runtime errors. Fetching requires no state
+directory and does not add a ticket to the store.
+
 Example global settings:
 
 ```toml
@@ -116,6 +132,7 @@ Errors use the same versioned envelope:
 | 1 | Runtime failure | `runtime` |
 | 2 | Usage or configuration error | `usage` or `config_invalid` |
 | 2 | Rejected human-facing attribution | `attribution` |
+| 2 | Ticket source is not configured | `no_ticket_source` |
 | 3 | Required herdr CLI or server unavailable | `herdr_unavailable` |
 
 Prune treats unavailable herdr as a warning and returns its report successfully. Config errors include the offending path. Consumers should use this CLI or herdr actions rather than reading plugin state files.

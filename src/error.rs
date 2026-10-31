@@ -7,6 +7,7 @@ pub enum ShepherdError {
     HerdrUnavailable(String),
     Runtime(anyhow::Error),
     Attribution,
+    NoTicketSource,
 }
 
 impl ShepherdError {
@@ -17,6 +18,7 @@ impl ShepherdError {
             Self::HerdrUnavailable(_) => "herdr_unavailable",
             Self::Runtime(_) => "runtime",
             Self::Attribution => "attribution",
+            Self::NoTicketSource => "no_ticket_source",
         }
     }
 
@@ -25,7 +27,7 @@ impl ShepherdError {
             Self::Usage(_) | Self::Config { .. } => 2,
             Self::HerdrUnavailable(_) => 3,
             Self::Runtime(_) => 1,
-            Self::Attribution => 2,
+            Self::Attribution | Self::NoTicketSource => 2,
         }
     }
 }
@@ -37,6 +39,9 @@ impl fmt::Display for ShepherdError {
             Self::Config { path, message } => write!(f, "{}: {message}", path.display()),
             Self::Runtime(error) => write!(f, "{error:#}"),
             Self::Attribution => f.write_str("human-facing text contains AI attribution"),
+            Self::NoTicketSource => {
+                f.write_str("no ticket source configured; paste the ticket text")
+            }
         }
     }
 }

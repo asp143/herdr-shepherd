@@ -72,6 +72,7 @@ enum Commands {
 enum TicketCommands {
     List,
     Show { id: String },
+    Fetch { id: String },
 }
 
 #[derive(serde::Serialize)]
@@ -89,15 +90,22 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
             command,
         } => {
             let project = resolve_project_root(project_root.as_deref())?;
-            let state_dir = cli.state_dir.as_deref().ok_or_else(|| {
-                ShepherdError::Usage("--state-dir or HERDR_PLUGIN_STATE_DIR is required".into())
-            })?;
-            let data = herdr_shepherd::store::Store::open(state_dir, &project)?.read()?;
+            let read_store = || {
+                let state_dir = cli.state_dir.as_deref().ok_or_else(|| {
+                    ShepherdError::Usage("--state-dir or HERDR_PLUGIN_STATE_DIR is required".into())
+                })?;
+                herdr_shepherd::store::Store::open(state_dir, &project)?.read()
+            };
             match command {
-                TicketCommands::List => output::emit(cli.json, &data.tickets, || {
-                    serde_json::to_string_pretty(&data.tickets).expect("tickets are serializable")
-                }),
+                TicketCommands::List => {
+                    let data = read_store()?;
+                    output::emit(cli.json, &data.tickets, || {
+                        serde_json::to_string_pretty(&data.tickets)
+                            .expect("tickets are serializable")
+                    });
+                }
                 TicketCommands::Show { id } => {
+                    let data = read_store()?;
                     let ticket = data
                         .tickets
                         .iter()
@@ -105,6 +113,16 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                         .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
                     output::emit(cli.json, ticket, || {
                         serde_json::to_string_pretty(ticket).expect("ticket is serializable")
+                    });
+                }
+                TicketCommands::Fetch { id } => {
+                    let cfg = config::load(
+                        &config::resolve_config_dir(cli.config_dir.as_deref()),
+                        Some(&project),
+                    )?;
+                    let ticket = herdr_shepherd::ticket::source::fetch(&cfg, id)?;
+                    output::emit(cli.json, &ticket, || {
+                        serde_json::to_string_pretty(&ticket).expect("ticket is serializable")
                     });
                 }
             }
