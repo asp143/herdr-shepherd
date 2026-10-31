@@ -57,11 +57,16 @@ fn verify_owned(store: &Store, h: &dyn Herdr, ticket: &Ticket) -> Result<(), She
     };
     let path = ticket.worktree.as_deref().ok_or_else(denied)?;
     let data = store.read()?;
-    if !same_path(&crate::trusted::main_checkout(path)?, &data.project_root)
-        || git(path, &["branch", "--show-current"])? != ticket.branch
-    {
+    let state_dir = store
+        .root()
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(denied)?;
+    let transport = PushTransport::open(state_dir, path)?;
+    if transport.trust.project_root != data.project_root || !transport.matches_repository(path)? {
         return Err(denied());
     }
+    transport.verified_ticket_head(&ticket.branch)?;
     let workspaces = h.workspaces()?;
     let matches = workspaces
         .iter()
@@ -146,11 +151,10 @@ fn unpushed(
     status: &PrStatus,
     transport: &PushTransport,
 ) -> Result<bool, ShepherdError> {
-    let path = ticket
-        .worktree
-        .as_deref()
-        .ok_or_else(|| ShepherdError::Usage("ticket has no worktree".into()))?;
-    if !git(path, &["status", "--porcelain"])?.is_empty() {
+    if status.head_oid.is_none() {
+        return Ok(true);
+    }
+    if !transport.worktree_status(&ticket.branch)?.is_empty() {
         return Ok(true);
     }
     let tip = transport.verified_ticket_head(&ticket.branch)?;
@@ -290,7 +294,19 @@ fn handle_with_context(
         }
         return Ok(MergeOutcome::Unchanged);
     }
-    verify_owned(store, h, ticket)?;
+    if let Err(error) = verify_owned(store, h, ticket) {
+        if status.state == PrState::Merged {
+            return escalate(
+                store,
+                h,
+                cfg,
+                id,
+                now,
+                &format!("{id}: merged but resource verification failed; resources kept: {error}"),
+            );
+        }
+        return Err(error);
+    }
     if ticket.state == TicketState::Closed {
         retire_flock(store, h, id)?;
         return Ok(MergeOutcome::Unchanged);
@@ -748,6 +764,41 @@ mod tests {
     }
 
     #[test]
+    fn merged_cleanup_never_executes_agent_clean_filter() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fixture = Fixture::new(TicketState::PrOpen);
+        fs::write(fixture.path.join(".gitattributes"), "*.txt filter=agent\n").unwrap();
+        fs::write(fixture.path.join("tracked.txt"), "human content\n").unwrap();
+        git(&fixture.path, &["add", ".gitattributes", "tracked.txt"]);
+        git(&fixture.path, &["commit", "-m", "track attributed content"]);
+        git(&fixture.path, &["push", "origin", "feat/t"]);
+        git(&fixture.h.main, &["merge", "--ff-only", "feat/t"]);
+        git(&fixture.h.main, &["push", "origin", "main"]);
+        fixture.status.head_oid = Some(git(&fixture.path, &["rev-parse", "HEAD"]));
+        let marker = fixture._dir.path().join("agent-clean-executed");
+        let helper = fixture._dir.path().join("agent-clean");
+        fs::write(
+            &helper,
+            format!("#!/bin/sh\nprintf ran > '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        git(
+            &fixture.path,
+            &["config", "filter.agent.clean", helper.to_str().unwrap()],
+        );
+        // Refresh the timestamp so status must examine the attributed file.
+        fs::write(fixture.path.join("tracked.txt"), "human content\n").unwrap();
+        fixture.h.fail_remove = true;
+        assert_eq!(fixture.run().unwrap(), MergeOutcome::Escalated);
+        assert!(
+            !marker.exists(),
+            "merged-ticket observation executed agent Git config"
+        );
+        assert!(fixture.path.exists());
+    }
+
+    #[test]
     fn cleanup_uses_snapshot_despite_mutated_origin() {
         let fixture = Fixture::new(TicketState::PrOpen);
         git(
@@ -788,6 +839,24 @@ mod tests {
         assert_eq!(fixture.run().unwrap(), MergeOutcome::CleanedUp);
         assert!(trusted.exists());
         assert!(!watcher.exists());
+    }
+
+    #[test]
+    fn missing_merged_head_keeps_existing_remote_worktree() {
+        let mut fixture = Fixture::new(TicketState::PrOpen);
+        fixture.status.head_oid = None;
+        assert_eq!(fixture.run().unwrap(), MergeOutcome::Escalated);
+        assert!(fixture.path.exists());
+        assert_eq!(fixture.ticket().state, TicketState::Blocked);
+        assert!(
+            fixture
+                .h
+                .fake
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.contains("unpushed work"))
+        );
     }
 
     #[test]

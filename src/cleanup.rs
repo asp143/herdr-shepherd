@@ -75,6 +75,25 @@ impl MergeProof {
         Ok(())
     }
 
+    pub(crate) fn base_sync_target<'a>(
+        &'a self,
+        transport: &crate::gate::transport::PushTransport,
+    ) -> Result<(&'a Path, &'a str, &'a str), ShepherdError> {
+        if transport.trust.common_git_dir != self.repo
+            || transport.trust.project_root != self.project_root
+            || transport.trust.push_url != self.origin
+            || transport.state_dir() != self.state_dir
+            || self.pr == 0
+            || self.merged_at.is_empty()
+            || !transport.matches_repository(&self.project_root)?
+        {
+            return Err(ShepherdError::PolicyDenied(
+                "merge proof does not authorize base synchronization".into(),
+            ));
+        }
+        Ok((&self.project_root, &self.base, &self.base_tip))
+    }
+
     pub(crate) fn tip(&self) -> &str {
         &self.tip
     }
@@ -123,16 +142,26 @@ pub struct Preflight<'a> {
 }
 
 fn capture(path: &Path, args: &[&str]) -> Result<proc::Captured, ShepherdError> {
-    proc::capture(
-        Command::new("git")
-            .current_dir(path)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .args(["-c", "core.fsmonitor=false"])
-            .args(args),
-        Duration::from_secs(120),
-        None,
-    )
-    .map_err(ShepherdError::Runtime)
+    let mut command = Command::new("git");
+    command.current_dir(path);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(args);
+    proc::capture(&mut command, Duration::from_secs(120), None).map_err(ShepherdError::Runtime)
 }
 
 fn git(path: &Path, args: &[&str]) -> Result<String, ShepherdError> {
@@ -187,15 +216,9 @@ fn owned_target(
     branch: &str,
     workspaces: &[Workspace],
     force_discard: bool,
+    transport: &crate::gate::transport::PushTransport,
 ) -> Result<Target, ShepherdError> {
-    let extension =
-        git(path, &["config", "--bool", "extensions.worktreeConfig"]).unwrap_or_default();
-    let marker = git(
-        path,
-        &["config", "--worktree", "--get", "shepherd.ticketBranch"],
-    )
-    .unwrap_or_default();
-    if extension != "true" || marker != branch {
+    if transport.ownership_marker(path)?.as_deref() != Some(branch) {
         return Err(ShepherdError::Usage(
             "worktree is not shepherd-owned (ticket branch marker missing or mismatched)".into(),
         ));
@@ -224,18 +247,13 @@ fn owned_target(
         &workspace,
         std::env::var("HERDR_WORKSPACE_ID").ok().as_deref(),
     )?;
-    if git(path, &["branch", "--show-current"])? != branch {
-        return Err(ShepherdError::Usage(
-            "worktree branch changed during cleanup".into(),
-        ));
-    }
-    if !force_discard && !git(path, &["status", "--porcelain"])?.is_empty() {
+    let tip = transport.checkout_head(path, branch)?;
+    if !force_discard && !transport.checkout_status(path, branch)?.is_empty() {
         return Err(ShepherdError::Usage(format!(
             "worktree is dirty: {}",
             path.display()
         )));
     }
-    let tip = git(path, &["rev-parse", "HEAD"])?;
     Ok(Target {
         path: path.into(),
         workspace,
@@ -385,15 +403,19 @@ pub fn preflight_with_transport<'a>(
 ) -> Result<Preflight<'a>, ShepherdError> {
     let result = (|| {
         let worktree = worktree.canonicalize().map_err(anyhow::Error::from)?;
-        let branch = git(&worktree, &["branch", "--show-current"])?;
-        if branch.is_empty() {
-            return Err(ShepherdError::Usage(
-                "cleanup requires a branch checkout".into(),
-            ));
-        }
+        let data = crate::store::Store::open(transport.state_dir(), &transport.trust.project_root)?
+            .read()?;
+        let branch = data
+            .tickets
+            .iter()
+            .find(|ticket| ticket.worktree.as_deref() == Some(worktree.as_path()))
+            .map(|ticket| ticket.branch.clone())
+            .ok_or_else(|| {
+                ShepherdError::PolicyDenied("cleanup requires a stored ticket worktree".into())
+            })?;
         git(&worktree, &["check-ref-format", "--branch", &branch])?;
         let workspaces = h.workspaces()?;
-        let target = owned_target(&worktree, &branch, &workspaces, force_discard)?;
+        let target = owned_target(&worktree, &branch, &workspaces, force_discard, &transport)?;
         if transport.trust.origin_url != transport.trust.push_url {
             return Err(ShepherdError::PolicyDenied(
                 "cleanup requires one snapshotted fetch/push origin".into(),
@@ -487,7 +509,7 @@ pub fn preflight_with_transport<'a>(
                     "child belongs to a different repo".into(),
                 ));
             }
-            let child = owned_target(&path, child_branch, &workspaces, force_discard)?;
+            let child = owned_target(&path, child_branch, &workspaces, force_discard, &transport)?;
             if !ancestor(&path, &child.tip, &target.tip)?
                 && !transport.is_ancestor(&child.tip, &base_tip)?
                 && !transport.patch_equivalent(&child.tip, &base_tip)?
@@ -544,15 +566,19 @@ fn notify(h: &dyn Herdr, cfg: &Config, title: &str, body: &str) {
     }
 }
 
-fn base_sync_status(main: &Path, base: &str) -> Result<(), String> {
-    match git(main, &["status", "--porcelain"]) {
+fn base_sync_status(main: &Path, base: &str, proof: &MergeProof) -> Result<(), String> {
+    let transport = proof
+        .transport()
+        .map_err(|_| "main_checkout_unavailable".to_owned())?;
+    transport
+        .checkout_head(main, base)
+        .map_err(|_| "main_checkout_not_on_base".to_owned())?;
+    match transport.checkout_status(main, base) {
         Ok(status) if status.is_empty() => (),
         Ok(_) => return Err("main_checkout_dirty".into()),
         Err(_) => return Err("main_checkout_unavailable".into()),
     }
-    if git(main, &["branch", "--show-current"]).ok().as_deref() != Some(base) {
-        return Err("main_checkout_not_on_base".into());
-    }
+
     Ok(())
 }
 
@@ -618,7 +644,7 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
             local_branch_deleted: contained,
             local_branch_kept_reason: (!contained).then(|| "branch_not_contained".into()),
             remote_branch: remote_state(&p.proof, &p.target.branch, &p.proof.tip, contained)?,
-            base_synced: base_sync_status(&p.main, &p.proof.base),
+            base_synced: base_sync_status(&p.main, &p.proof.base, &p.proof),
             children_removed: p.children.iter().map(|child| child.path.clone()).collect(),
             ignored_files: p
                 .children
@@ -647,7 +673,16 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
         check_tree_set(&worktrees(&p.main)?, &p.target, &p.children)?;
         for target in p.children.iter().chain(std::iter::once(&p.target)) {
             p.proof.validate_repository(&target.path)?;
-            let current = owned_target(&target.path, &target.branch, &workspaces, p.force_discard)?;
+            let current = {
+                let transport = p.proof.transport()?;
+                owned_target(
+                    &target.path,
+                    &target.branch,
+                    &workspaces,
+                    p.force_discard,
+                    &transport,
+                )?
+            };
             if current.workspace != target.workspace {
                 return Err(ShepherdError::Usage(
                     "worktree workspace changed after preflight".into(),
@@ -700,23 +735,13 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
             };
             gate.delete_remote_branch(&p.target.branch, &p.proof)?;
         }
-        report.base_synced = base_sync_status(&p.main, &p.proof.base);
+        report.base_synced = base_sync_status(&p.main, &p.proof.base, &p.proof);
         if report.base_synced.is_ok() {
-            report.base_synced = git(
-                &p.main,
-                &[
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "merge",
-                    "--ff-only",
-                    "--no-verify-signatures",
-                    &p.proof.base_tip,
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string());
+            report.base_synced = p
+                .proof
+                .transport()?
+                .sync_merged_base(&p.proof)
+                .map_err(|error| error.to_string());
         }
         if p.cfg.upkeep.regroup {
             regroup::apply(p.herdr, &regroup::plan_regroup(&p.herdr.workspaces()?))?;
@@ -752,16 +777,15 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
 }
 
 fn raw_ignored(path: &Path) -> Result<String, ShepherdError> {
-    let out = crate::proc::capture(
-        Command::new("git").current_dir(path).args([
+    let out = capture(
+        path,
+        &[
             "ls-files",
             "--others",
             "--ignored",
             "--exclude-standard",
             "-z",
-        ]),
-        Duration::from_secs(20),
-        None,
+        ],
     )?;
     if !out.status.success() {
         return Err(anyhow::anyhow!("cannot enumerate ignored files").into());

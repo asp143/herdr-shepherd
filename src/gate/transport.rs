@@ -502,7 +502,11 @@ impl PushTransport {
                 "push requires the stored ticket worktree and branch",
             ));
         }
-        let git_dir = self.git_dir(&path)?;
+        self.checkout_head(&path, branch)
+    }
+
+    pub(crate) fn checkout_head(&self, path: &Path, branch: &str) -> Result<String, ShepherdError> {
+        let git_dir = self.git_dir(path)?;
         let head = checked_read(&git_dir.join("HEAD"), &self.trust.common_git_dir)?;
         let reference = format!("refs/heads/{branch}");
         if head.trim() != format!("ref: {reference}") {
@@ -619,11 +623,63 @@ impl PushTransport {
         Ok(tip)
     }
 
-    fn local_command(&self, head: &str) -> Result<Command, ShepherdError> {
+    pub(crate) fn ownership_marker(&self, path: &Path) -> Result<Option<String>, ShepherdError> {
+        let common = self.trust.common_git_dir.join("config");
+        if self
+            .config_value(&common, "extensions.worktreeConfig", true)?
+            .as_deref()
+            != Some("true")
+        {
+            return Ok(None);
+        }
+        self.config_value(
+            &self.git_dir(path)?.join("config.worktree"),
+            "shepherd.ticketBranch",
+            false,
+        )
+    }
+
+    fn config_value(
+        &self,
+        path: &Path,
+        key: &str,
+        boolean: bool,
+    ) -> Result<Option<String>, ShepherdError> {
+        let actual = match path.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(anyhow::Error::from(error).into()),
+        };
+        if !actual.starts_with(&self.trust.common_git_dir) || !actual.is_file() {
+            return Err(denied(
+                "worktree metadata config left the trusted repository",
+            ));
+        }
+        let contents = checked_read(&actual, &self.trust.common_git_dir)?;
+        let mut command = self.command()?;
+        command.args(["config", "--no-includes", "--file", "-"]);
+        if boolean {
+            command.arg("--bool");
+        }
+        let out = proc::capture(
+            command.args(["--get", key]),
+            Duration::from_secs(20),
+            Some(contents.as_bytes()),
+        )?;
+        if out.status.code() == Some(1) {
+            return Ok(None);
+        }
+        if !out.status.success() {
+            return Err(denied("cannot read worktree ownership metadata"));
+        }
+        Ok(Some(out.stdout.trim().into()))
+    }
+
+    fn local_command(&self, path: &Path, head: &str) -> Result<Command, ShepherdError> {
         if !oid(head) {
             return Err(denied("local operation requires a verified commit"));
         }
-        let git_dir = self.git_dir(&self.worktree)?;
+        let git_dir = self.git_dir(path)?;
         let index = git_dir.join("index");
         if let Ok(metadata) = fs::symlink_metadata(&index)
             && !metadata.file_type().is_file()
@@ -636,6 +692,14 @@ impl PushTransport {
         let local = self.root.join("local.git");
         fs::create_dir_all(local.join("objects/info")).map_err(anyhow::Error::from)?;
         fs::create_dir_all(local.join("refs")).map_err(anyhow::Error::from)?;
+        fs::create_dir_all(local.join("info")).map_err(anyhow::Error::from)?;
+        let exclude = self.trust.common_git_dir.join("info/exclude");
+        let ignored = if exclude.exists() {
+            checked_read(&exclude, &self.trust.common_git_dir)?
+        } else {
+            String::new()
+        };
+        fs::write(local.join("info/exclude"), ignored).map_err(anyhow::Error::from)?;
         let config = if self.trust.object_format == "sha256" {
             "[core]\nrepositoryformatversion=1\nbare=false\n[extensions]\nobjectformat=sha256\n"
         } else {
@@ -676,7 +740,7 @@ impl PushTransport {
             .arg("--git-dir")
             .arg(local)
             .arg("--work-tree")
-            .arg(&self.worktree)
+            .arg(path)
             .args([
                 "-c",
                 "core.hooksPath=/dev/null",
@@ -691,9 +755,19 @@ impl PushTransport {
     }
 
     pub fn worktree_status(&self, branch: &str) -> Result<String, ShepherdError> {
-        let head = self.verified_ticket_head(branch)?;
+        self.verified_ticket_head(branch)?;
+        self.checkout_status(&self.worktree, branch)
+    }
+
+    pub(crate) fn checkout_status(
+        &self,
+        path: &Path,
+        branch: &str,
+    ) -> Result<String, ShepherdError> {
+        let head = self.checkout_head(path, branch)?;
         let out = proc::capture(
-            self.local_command(&head)?.args(["status", "--porcelain"]),
+            self.local_command(path, &head)?
+                .args(["status", "--porcelain"]),
             Duration::from_secs(60),
             None,
         )?;
@@ -715,14 +789,39 @@ impl PushTransport {
         expected: &str,
         target: &str,
     ) -> Result<(), ShepherdError> {
+        self.check_destination(branch)?;
+        if self.verified_ticket_head(branch)? != expected {
+            return Err(denied("ticket changed before fast-forward"));
+        }
+        self.fast_forward_checkout(&self.worktree, branch, expected, target)
+    }
+
+    pub(crate) fn sync_merged_base(
+        &self,
+        proof: &crate::cleanup::MergeProof,
+    ) -> Result<(), ShepherdError> {
+        let (path, branch, target) = proof.base_sync_target(self)?;
+        let expected = self.checkout_head(path, branch)?;
+        if !self.checkout_status(path, branch)?.is_empty() {
+            return Err(denied("main checkout is dirty"));
+        }
+        self.fast_forward_checkout(path, branch, &expected, target)
+    }
+
+    fn fast_forward_checkout(
+        &self,
+        path: &Path,
+        branch: &str,
+        expected: &str,
+        target: &str,
+    ) -> Result<(), ShepherdError> {
         use std::{io::Write, os::unix::fs::OpenOptionsExt};
         let conflict = || ShepherdError::Conflict {
             unit: 0,
             range: "ticket branch changed during sync".into(),
         };
-        self.check_destination(branch)?;
         self.execute(&["check-ref-format", &format!("refs/heads/{branch}")])?;
-        if self.verified_ticket_head(branch)? != expected
+        if self.checkout_head(path, branch)? != expected
             || !oid(target)
             || !self.is_ancestor(expected, target)?
         {
@@ -755,11 +854,11 @@ impl PushTransport {
             .map_err(|_| conflict())?;
         let mut published = false;
         let result = (|| {
-            if self.verified_ticket_head(branch)? != expected {
+            if self.checkout_head(path, branch)? != expected {
                 return Err(conflict());
             }
             let out = proc::capture(
-                self.local_command(expected)?
+                self.local_command(path, expected)?
                     .args(["merge", "--ff-only", target]),
                 Duration::from_secs(60),
                 None,
@@ -770,7 +869,7 @@ impl PushTransport {
                     range: out.stderr.trim().into(),
                 });
             }
-            if self.verified_ticket_head(branch)? != expected {
+            if self.checkout_head(path, branch)? != expected {
                 return Err(conflict());
             }
             lock.write_all(format!("{target}\n").as_bytes())

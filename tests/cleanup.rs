@@ -283,6 +283,73 @@ impl Repo {
     }
 }
 #[test]
+fn base_sync_never_executes_agent_smudge_filter() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut repo = Repo::new();
+    let before = ok(&repo.main, &["rev-parse", "HEAD"]).trim().to_owned();
+    fs::write(repo.ticket.join(".gitattributes"), "*.txt filter=agent\n").unwrap();
+    fs::write(repo.ticket.join("synced.txt"), "merged content\n").unwrap();
+    ok(&repo.ticket, &["add", ".gitattributes", "synced.txt"]);
+    ok(&repo.ticket, &["commit", "-m", "add attributed file"]);
+    ok(&repo.ticket, &["push", "origin", "feat/t"]);
+    let target = ok(&repo.ticket, &["rev-parse", "HEAD"]).trim().to_owned();
+    repo.backend.0.head_oid = Some(target.clone());
+    repo.merge();
+    ok(&repo.main, &["reset", "--hard", &before]);
+    let marker = repo._dir.path().join("agent-smudge-executed");
+    let helper = repo._dir.path().join("agent-smudge");
+    fs::write(
+        &helper,
+        format!("#!/bin/sh\nprintf ran > '{}'\ncat\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    ok(
+        &repo.main,
+        &["config", "filter.agent.smudge", helper.to_str().unwrap()],
+    );
+    let report = cleanup::run(repo.preflight(false).unwrap(), false).unwrap();
+    assert!(report.base_synced.is_ok(), "{:?}", report.base_synced);
+    assert!(
+        !marker.exists(),
+        "base synchronization executed agent Git config"
+    );
+    assert_eq!(ok(&repo.main, &["rev-parse", "HEAD"]).trim(), target);
+    assert_eq!(
+        fs::read_to_string(repo.main.join("synced.txt")).unwrap(),
+        "merged content\n"
+    );
+}
+
+#[test]
+fn local_branch_deletion_never_runs_agent_ref_hook() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = Repo::new();
+    repo.merge();
+    let preflight = repo.preflight(false).unwrap();
+    let hooks = repo._dir.path().join("agent-hooks");
+    fs::create_dir(&hooks).unwrap();
+    let marker = repo._dir.path().join("agent-ref-hook-executed");
+    let hook = hooks.join("reference-transaction");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    ok(
+        &repo.main,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    let report = cleanup::run(preflight, false).unwrap();
+    assert!(report.local_branch_deleted);
+    assert!(
+        !marker.exists(),
+        "cleanup executed agent reference-transaction hook"
+    );
+}
+
+#[test]
 fn refuses_dirty_without_force_discard() {
     let repo = Repo::new();
     fs::write(repo.ticket.join("dirty"), "dirty").unwrap();
@@ -352,6 +419,32 @@ fn dry_run_changes_nothing() {
     assert!(repo.h.removals.borrow().is_empty());
     assert!(repo.ticket.exists());
 }
+#[test]
+fn included_config_cannot_forge_ownership_marker() {
+    let repo = Repo::new();
+    let included = repo._dir.path().join("agent-marker.gitconfig");
+    fs::write(&included, "[shepherd]\nticketBranch = feat/t\n").unwrap();
+    ok(
+        &repo.ticket,
+        &["config", "--worktree", "--unset", "shepherd.ticketBranch"],
+    );
+    ok(
+        &repo.ticket,
+        &[
+            "config",
+            "--worktree",
+            "include.path",
+            included.to_str().unwrap(),
+        ],
+    );
+    let error = repo
+        .preflight(false)
+        .err()
+        .expect("included marker must not prove ownership");
+    assert!(error.to_string().contains("owned"));
+    assert!(repo.h.removals.borrow().is_empty());
+}
+
 #[test]
 fn marker_missing_refused() {
     let repo = Repo::new();
