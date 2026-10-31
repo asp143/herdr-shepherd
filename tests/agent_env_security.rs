@@ -111,13 +111,21 @@ fn agent_gh_token_does_not_fall_back_to_keyring() {
     let fake = repo.dir.path().join("gh");
     fs::write(&fake,"#!/bin/sh\nif test -z \"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; then printf '%s\\n' valid-fixture-keyring-token; exit 0; fi\nif test \"${GH_TOKEN:-}\" = shepherd-agent-no-token; then printf '%s\\n' 'invalid fixture token' >&2; exit 1; fi\nprintf '%s\\n' \"$GH_TOKEN\"\n").unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
-    let unguarded = repo.run(&fake, &["auth", "token"], &repo.base);
+    let unguarded = repo.run(
+        Path::new("/bin/sh"),
+        &[fake.to_str().unwrap(), "auth", "token"],
+        &repo.base,
+    );
     assert_eq!(
         String::from_utf8(unguarded.stdout).unwrap().trim(),
         "valid-fixture-keyring-token"
     );
     let env = repo.clean_env();
-    let protected = repo.run(&fake, &["auth", "token"], &env);
+    let protected = repo.run(
+        Path::new("/bin/sh"),
+        &[fake.to_str().unwrap(), "auth", "token"],
+        &env,
+    );
     assert!(!protected.status.success());
     assert!(protected.stdout.is_empty());
     assert_eq!(env["GH_TOKEN"], "shepherd-agent-no-token");
