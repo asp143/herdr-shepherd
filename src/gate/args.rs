@@ -280,7 +280,7 @@ fn check_api(args: &[&str]) -> Result<(), ShepherdError> {
         i += 1;
     }
     let path = api_path(endpoint.ok_or_else(|| denied("missing API endpoint"))?)?;
-    let write = payload || !matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD");
+    let write = payload || !method.eq_ignore_ascii_case("GET");
     if path == "graphql"
         || path.ends_with("/graphql")
         || path.contains("/merges")
@@ -288,8 +288,44 @@ fn check_api(args: &[&str]) -> Result<(), ShepherdError> {
     {
         return Err(denied("merge API is forbidden"));
     }
+    let sensitive = path.contains("git/refs")
+        || path.contains("actions/workflows/")
+        || path.split('/').any(|segment| {
+            matches!(
+                segment,
+                "contents" | "branches" | "merge-upstream" | "merges" | "protection"
+            )
+        });
+    if write && sensitive {
+        return Err(denied("repository or workflow mutations are forbidden"));
+    }
     if write && (path.ends_with("/reviews") || path.contains("/reviews/")) {
         return Err(denied("review API mutations are forbidden"));
+    }
+    if write {
+        let parts: Vec<_> = path.split('/').collect();
+        let comment_route = match parts.as_slice() {
+            ["repos", _, _, "issues" | "pulls", number, "comments"] => {
+                number.parse::<u64>().is_ok()
+            }
+            [
+                "repos",
+                _,
+                _,
+                "pulls",
+                number,
+                "comments",
+                comment,
+                "replies",
+            ] => number.parse::<u64>().is_ok() && comment.parse::<u64>().is_ok(),
+            _ => false,
+        };
+        if !comment_route || (!payload && !method.eq_ignore_ascii_case("POST")) {
+            return Err(denied("API writes are restricted to comment creation"));
+        }
+        if !matches!(method.to_ascii_uppercase().as_str(), "GET" | "POST") {
+            return Err(denied("only comment creation is permitted"));
+        }
     }
     Ok(())
 }
@@ -301,7 +337,21 @@ pub fn check_gh(args: &[&str]) -> Result<(), ShepherdError> {
     match *command {
         "pr" => check_pr(rest),
         "api" => check_api(rest),
-        "repo" | "issue" | "search" | "run" | "workflow" | "version" => Ok(()),
+        "repo"
+            if rest
+                .first()
+                .is_some_and(|verb| matches!(*verb, "view" | "list" | "clone")) =>
+        {
+            Ok(())
+        }
+        "workflow"
+            if rest
+                .first()
+                .is_some_and(|verb| matches!(*verb, "view" | "list")) =>
+        {
+            Ok(())
+        }
+        "issue" | "search" | "run" | "version" => Ok(()),
         _ => Err(denied("unsupported gh command or global option")),
     }
 }
