@@ -24,8 +24,14 @@ The binary is `bin/herdr-shepherd`. Add that directory to your PATH to use the s
 | `prune [--root PATH] [--no-size] [--all]` | Report stale worktrees; OPEN entries are hidden unless `--all` is passed. |
 | `event` | Handle the event name and JSON supplied by herdr. |
 | `keys [--herdr-config PATH]` | Print a keybinding snippet without changing herdr configuration. |
+| `ticket list [--project-root PATH]` | List tickets in the invoking project's store. |
+| `ticket show <id> [--project-root PATH]` | Show a stored ticket and its history. |
 
-Global options are `--json`, `--config-dir PATH`, and `--state-dir PATH`. Phase 1 has no persistent ticket state.
+Global options are `--json`, `--config-dir PATH`, and `--state-dir PATH`.
+Ticket inspection requires `--state-dir` or `HERDR_PLUGIN_STATE_DIR`. State lives
+in `projects/<sha256 of canonical project path>/state.json`, with a per-project
+lock covering each update and a synced atomic replacement. Ticket inspection
+does not change stored ticket data.
 
 Regroup preserves user labels such as `fix/foo`, skips children whose parent workspace is absent, and is idempotent. Nested generated prefixes are stripped in one run so another invocation does not rename again. Explicit `regroup` always runs; `[upkeep] regroup` controls automatic event handling.
 
@@ -58,7 +64,7 @@ token_prefix = "shepherd_"
 
 All booleans default to `true`. `pr_status`, `notifications`, `model_badge`, and `token_prefix` are reserved for later phases; Phase 1 writes no metadata tokens. Set `regroup = false` to disable auto-regroup, or `keybindings = false` to emit no key suggestions.
 
-Herdr access uses `HERDR_BIN_PATH` or `herdr` on PATH, and `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`. Event dispatch reads `HERDR_PLUGIN_EVENT` and `HERDR_PLUGIN_EVENT_JSON`. Config validation uses `HERDR_PLUGIN_CONTEXT_JSON` to find the invoking checkout, falling back to the current directory's Git root; `--project-root` overrides both. `--state-dir` takes precedence over `HERDR_PLUGIN_STATE_DIR`; Phase 1 accepts these for future stateful commands and creates no state files.
+Herdr access uses `HERDR_BIN_PATH` or `herdr` on PATH, and `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`. Event dispatch reads `HERDR_PLUGIN_EVENT` and `HERDR_PLUGIN_EVENT_JSON`. Config validation and ticket commands use `HERDR_PLUGIN_CONTEXT_JSON` to find the invoking checkout, falling back to the current directory's Git root; `--project-root` overrides both. `--state-dir` takes precedence over `HERDR_PLUGIN_STATE_DIR`.
 
 ## JSON interface
 
