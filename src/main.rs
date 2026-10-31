@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, error::ErrorKind};
-use herdr_shepherd::{error::ShepherdError, output};
+use herdr_shepherd::{config, error::ShepherdError, output};
 
 #[derive(Parser)]
 #[command(
@@ -23,14 +23,29 @@ struct Cli {
 enum Commands {
     /// Print the shepherd version.
     Version,
+    /// Validate the resolved shepherd configuration.
+    ValidateConfig {
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
 }
 
 fn run(cli: &Cli) -> Result<(), ShepherdError> {
-    match cli.command {
+    match &cli.command {
         Commands::Version => {
             let version = env!("CARGO_PKG_VERSION");
             output::emit(cli.json, &serde_json::json!({ "version": version }), || {
                 format!("herdr-shepherd {version}")
+            });
+        }
+        Commands::ValidateConfig { project_root } => {
+            let current = std::env::current_dir().map_err(anyhow::Error::from)?;
+            let cfg = config::load(
+                &config::resolve_config_dir(cli.config_dir.as_deref()),
+                Some(project_root.as_deref().unwrap_or(&current)),
+            )?;
+            output::emit(cli.json, &cfg, || {
+                serde_json::to_string_pretty(&cfg).expect("config is serializable")
             });
         }
     }
