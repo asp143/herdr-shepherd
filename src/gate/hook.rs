@@ -106,19 +106,7 @@ pub fn pre_push(worktree: &Path, input: &str) -> Result<(), ShepherdError> {
     }
     let root = git(worktree, &["rev-parse", "--show-toplevel"])?;
     let cfg = config::load(&config::resolve_config_dir(None), Some(Path::new(&root)))?;
-    let extra = cfg
-        .raw
-        .get("shepherd")
-        .and_then(|value| value.get("protected_branches"))
-        .and_then(toml::Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let extra = super::policy::extra_patterns(&cfg)?;
     let default = git(
         worktree,
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],

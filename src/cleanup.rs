@@ -317,27 +317,6 @@ fn check_tree_set(
     Ok(())
 }
 
-fn extras(cfg: &Config) -> Result<Vec<String>, ShepherdError> {
-    match cfg
-        .raw
-        .get("shepherd")
-        .and_then(|value| value.get("protected_branches"))
-    {
-        None => Ok(vec![]),
-        Some(toml::Value::Array(values)) => values
-            .iter()
-            .map(|value| {
-                value.as_str().map(str::to_owned).ok_or_else(|| {
-                    ShepherdError::Usage("protected_branches must contain strings".into())
-                })
-            })
-            .collect(),
-        Some(_) => Err(ShepherdError::Usage(
-            "protected_branches must be an array".into(),
-        )),
-    }
-}
-
 fn check_agents(h: &dyn Herdr, targets: &[&Target]) -> Result<(), ShepherdError> {
     for agent in h.agents()? {
         let cwd = agent
@@ -406,7 +385,11 @@ pub fn preflight<'a>(
         .and_then(|value| value.strip_prefix("origin/").map(str::to_owned));
         let base = default.clone().unwrap_or_else(|| status.base.clone());
         git(&worktree, &["check-ref-format", "--branch", &base])?;
-        let policy = BranchPolicy::new(&extras(cfg)?, default.as_deref(), Some(&status.base))?;
+        let policy = BranchPolicy::new(
+            &crate::gate::policy::extra_patterns(cfg)?,
+            default.as_deref(),
+            Some(&status.base),
+        )?;
         if policy.is_protected(&branch) {
             return Err(ShepherdError::PolicyDenied(
                 "cleanup cannot remove a protected branch".into(),

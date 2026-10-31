@@ -85,24 +85,7 @@ pub fn gate(worktree: &Path, cfg: &Config, base: Option<&str>) -> Result<Gate, S
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
     )
     .ok();
-    let extra = match cfg
-        .raw
-        .get("shepherd")
-        .and_then(|value| value.get("protected_branches"))
-    {
-        None => Vec::new(),
-        Some(value) => value
-            .as_array()
-            .and_then(|values| {
-                values
-                    .iter()
-                    .map(|v| v.as_str().map(str::to_owned))
-                    .collect::<Option<Vec<_>>>()
-            })
-            .ok_or_else(|| {
-                ShepherdError::Usage("protected_branches must be an array of globs".into())
-            })?,
-    };
+    let extra = herdr_shepherd::gate::policy::extra_patterns(cfg)?;
     Ok(Gate {
         policy: BranchPolicy::new(
             &extra,

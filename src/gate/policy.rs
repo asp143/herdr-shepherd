@@ -42,6 +42,30 @@ impl BranchPolicy {
     }
 }
 
+/// Read additive branch protection without silently dropping malformed values.
+pub fn extra_patterns(cfg: &crate::config::Config) -> Result<Vec<String>, ShepherdError> {
+    let Some(shepherd) = cfg.raw.get("shepherd") else {
+        return Ok(Vec::new());
+    };
+    let shepherd = shepherd
+        .as_table()
+        .ok_or_else(|| ShepherdError::Usage("shepherd must be a table".into()))?;
+    match shepherd.get("protected_branches") {
+        None => Ok(Vec::new()),
+        Some(toml::Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    ShepherdError::Usage("protected_branches must contain strings".into())
+                })
+            })
+            .collect(),
+        Some(_) => Err(ShepherdError::Usage(
+            "protected_branches must be an array of globs".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,5 +94,27 @@ mod tests {
         for branch in ["main", "trunk", "staging", "custom/x"] {
             assert!(policy.is_protected(branch));
         }
+    }
+    #[test]
+    fn extra_patterns_rejects_invalid_config_types() {
+        let dir = tempfile::tempdir().unwrap();
+        for value in ["'feat/t'", "['other/*', 1]"] {
+            let mut cfg = crate::config::load(dir.path(), None).unwrap();
+            cfg.raw = format!("[shepherd]\nprotected_branches = {value}\n")
+                .parse()
+                .unwrap();
+            assert!(matches!(extra_patterns(&cfg), Err(ShepherdError::Usage(_))));
+        }
+    }
+
+    #[test]
+    fn extra_patterns_preserves_configured_globs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::load(dir.path(), None).unwrap();
+        assert!(extra_patterns(&cfg).unwrap().is_empty());
+        cfg.raw = "[shepherd]\nprotected_branches = ['custom/*', 'trunk']\n"
+            .parse()
+            .unwrap();
+        assert_eq!(extra_patterns(&cfg).unwrap(), ["custom/*", "trunk"]);
     }
 }

@@ -160,3 +160,25 @@ fn main_checkout_install_refused() {
             .is_empty()
     );
 }
+
+#[test]
+fn invalid_protected_branches_type_blocks_direct_push() {
+    let repo = Repo::new();
+    fs::write(
+        repo.worktree.join(".shepherd.toml"),
+        "[shepherd]\nprotected_branches = 'feat/t'\n",
+    )
+    .unwrap();
+    repo.blocked(&["push", "origin", "feat/t"]);
+}
+
+#[test]
+fn mixed_protected_branches_array_blocks_direct_push() {
+    let repo = Repo::new();
+    fs::write(
+        repo.worktree.join(".shepherd.toml"),
+        "[shepherd]\nprotected_branches = ['other/*', 1]\n",
+    )
+    .unwrap();
+    repo.blocked(&["push", "origin", "feat/t"]);
+}
