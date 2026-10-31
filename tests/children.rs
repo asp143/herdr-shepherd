@@ -555,3 +555,53 @@ fn integrates_already_contained_child_without_replaying_commits() {
     );
     assert!(ok(&repo.ticket, &["status", "--porcelain"]).is_empty());
 }
+
+#[test]
+fn child_hook_uses_explicit_config_on_first_install() {
+    let repo = Repo::new();
+    let state = repo.dir.path().join("state");
+    let config_dir = repo.dir.path().join("custom global config");
+    fs::create_dir(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("shepherd.toml"),
+        "[shepherd]\nprotected_branches = ['feat/tiny--2']\n",
+    )
+    .unwrap();
+    let remote = repo.dir.path().join("origin.git");
+    ok(
+        repo.dir.path(),
+        &["init", "--bare", remote.to_str().unwrap()],
+    );
+    ok(
+        &repo.main,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    let ticket = herdr_shepherd::store::Ticket {
+        id: "TINY".into(),
+        slug: "tiny".into(),
+        branch: "feat/tiny".into(),
+        worktree: Some(repo.ticket.clone()),
+        ..Default::default()
+    };
+    let child = herdr_shepherd::ticket::children::create_child_configured(
+        &LocalHerdr::default(),
+        &ticket,
+        2,
+        &state,
+        Path::new(env!("CARGO_BIN_EXE_herdr-shepherd")),
+        &config_dir,
+    )
+    .unwrap();
+    let hook = fs::read_to_string(state.join("hooks/pre-push")).unwrap();
+    assert!(hook.contains(&format!(
+        "--config-dir '{}' hook pre-push",
+        config_dir.display()
+    )));
+    let output = git(
+        &child.path,
+        &["push", "origin", "HEAD:refs/heads/feat/tiny--2"],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("push blocked"));
+    assert!(ok(&repo.main, &["ls-remote", "origin"]).is_empty());
+}

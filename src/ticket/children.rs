@@ -198,6 +198,25 @@ pub fn create_child(
     state_dir: &Path,
     bin: &Path,
 ) -> Result<ChildWorktree, ShepherdError> {
+    create_child_configured(
+        h,
+        ticket,
+        unit,
+        state_dir,
+        bin,
+        &crate::config::resolve_config_dir(None),
+    )
+}
+
+/// Create a child whose first push guard uses the selected global config.
+pub fn create_child_configured(
+    h: &dyn Herdr,
+    ticket: &Ticket,
+    unit: u32,
+    state_dir: &Path,
+    bin: &Path,
+    config_dir: &Path,
+) -> Result<ChildWorktree, ShepherdError> {
     if unit == 0 || ticket.children.iter().any(|child| child.unit == unit) {
         return Err(ShepherdError::Usage(
             "child unit must be positive and unique".into(),
@@ -238,7 +257,9 @@ pub fn create_child(
         base_sha,
         integrated: false,
     };
-    if let Err(error) = hook::install(&child.path, &child.branch, state_dir, bin) {
+    if let Err(error) =
+        hook::install_configured(&child.path, &child.branch, state_dir, bin, config_dir)
+    {
         if let Err(cleanup) = rollback_created_child(h, ticket_wt, &child) {
             let recovery = record_failed_child(&child)?;
             return Err(ShepherdError::Runtime(anyhow::anyhow!(

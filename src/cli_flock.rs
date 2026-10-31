@@ -169,8 +169,8 @@ pub fn run(
                     child.clone()
                 } else {
                     let bin = std::env::current_exe().map_err(anyhow::Error::from)?;
-                    let child = herdr_shepherd::ticket::children::create_child(
-                        h, &ticket, unit, state, &bin,
+                    let child = herdr_shepherd::ticket::children::create_child_configured(
+                        h, &ticket, unit, state, &bin, config_dir,
                     )?;
                     store.update(|data| {
                         let t = data
@@ -181,13 +181,6 @@ pub fn run(
                         t.children.push(child.clone());
                         Ok(())
                     })?;
-                    herdr_shepherd::gate::hook::install_configured(
-                        &child.path,
-                        &child.branch,
-                        state,
-                        &bin,
-                        config_dir,
-                    )?;
                     child
                 };
                 ticket.worktree = Some(child.path);
