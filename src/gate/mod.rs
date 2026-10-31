@@ -98,6 +98,15 @@ impl Gate {
     }
 
     fn github_command(&self, executable: &Path, args: &[&str]) -> Result<Command, ShepherdError> {
+        self.github_command_scoped(executable, args, true)
+    }
+
+    fn github_command_scoped(
+        &self,
+        executable: &Path,
+        args: &[&str],
+        restore_auth: bool,
+    ) -> Result<Command, ShepherdError> {
         check_gh(args)?;
         let repository = self.github_repository()?;
         if args.iter().any(|arg| {
@@ -129,6 +138,10 @@ impl Gate {
         } else if args.starts_with(&["repo", "view"]) {
             // gh repo view takes a positional repository, not -R.
             scoped.insert(2, repository.clone());
+        } else if args.first() == Some(&"repo") {
+            return Err(ShepherdError::PolicyDenied(
+                "scoped repository forwarding supports only repo view".into(),
+            ));
         } else {
             scoped.extend(["-R".into(), repository.clone()]);
         }
@@ -137,6 +150,7 @@ impl Gate {
         std::fs::create_dir_all(&self.state_dir).map_err(anyhow::Error::from)?;
         let mut command = Command::new(executable);
         command.current_dir(&self.state_dir).args(scoped);
+        env::prepare_provider_command(&mut command, &self.state_dir, restore_auth)?;
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("GIT_")
                 || matches!(key.to_str(), Some("GH_REPO" | "GH_HOST"))
@@ -175,10 +189,12 @@ pub mod shim;
 
 impl Gate {
     /// Execute the real gh for a credential-stripped agent, preserving its env.
-    pub fn exec_gh(args: &[&str], path: &std::ffi::OsStr) -> Result<(), ShepherdError> {
+    pub fn exec_gh(&self, args: &[&str], path: &std::ffi::OsStr) -> Result<(), ShepherdError> {
         use std::os::unix::process::CommandExt;
-        check_gh(args)?;
-        let error = Command::new("gh").args(args).env("PATH", path).exec();
+        let error = self
+            .github_command_scoped(Path::new("gh"), args, false)?
+            .env("PATH", path)
+            .exec();
         Err(ShepherdError::Runtime(error.into()))
     }
 }

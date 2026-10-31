@@ -310,6 +310,7 @@ impl PushTransport {
     fn command(&self) -> Result<Command, ShepherdError> {
         let mut command = Command::new("git");
         command.current_dir(&self.root);
+        crate::gate::env::prepare_provider_command(&mut command, &self.state_dir, true)?;
         for (key, _) in std::env::vars_os() {
             let name = key.to_string_lossy();
             if name.starts_with("GIT_") || name == "SSH_ASKPASS" {
@@ -996,6 +997,99 @@ impl PushTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transport_helpers_restore_owned_auth_sentinels() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var("SHEPHERD_TEST_PROVIDER_CHILD").as_deref() != Ok("fixture") {
+            let dir = tempfile::tempdir_in("/tmp").unwrap();
+            let fake = dir.path().join("fake");
+            let shim = dir.path().join("shim");
+            fs::create_dir(&fake).unwrap();
+            fs::create_dir(&shim).unwrap();
+            let marker = dir.path().join("provider-env");
+            let script = format!(
+                "#!/bin/sh\nprintf '%s\n' \"${{GH_TOKEN-unset}}\" \"${{GITHUB_TOKEN-unset}}\" \"${{GH_CONFIG_DIR-unset}}\" > {}\nprintf 'username=fixture\npassword=fixture-password\n'\n",
+                crate::gate::shim::shell_quote(&marker)
+            );
+            fs::write(fake.join("gh"), script).unwrap();
+            fs::set_permissions(fake.join("gh"), fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(shim.join("gh"), "#!/bin/sh\nexit 70\n").unwrap();
+            fs::set_permissions(shim.join("gh"), fs::Permissions::from_mode(0o700)).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gate::transport::tests::transport_helpers_restore_owned_auth_sentinels",
+                    "--nocapture",
+                ])
+                .env("SHEPHERD_TEST_PROVIDER_CHILD", "fixture")
+                .env("SHEPHERD_TEST_PROVIDER_ROOT", dir.path())
+                .env(
+                    "PATH",
+                    std::env::join_paths([
+                        shim,
+                        fake,
+                        std::path::PathBuf::from("/usr/bin"),
+                        std::path::PathBuf::from("/bin"),
+                    ])
+                    .unwrap(),
+                )
+                .env("GH_TOKEN", crate::gate::env::NO_TOKEN)
+                .env("GITHUB_TOKEN", crate::gate::env::NO_TOKEN)
+                .env("GH_ENTERPRISE_TOKEN", crate::gate::env::NO_TOKEN)
+                .env("GITHUB_ENTERPRISE_TOKEN", crate::gate::env::NO_TOKEN)
+                .env("GH_CONFIG_DIR", dir.path().join("agent-gh"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(fs::read_to_string(marker).unwrap(), "unset\nunset\nunset\n");
+            return;
+        }
+        let root =
+            std::path::PathBuf::from(std::env::var_os("SHEPHERD_TEST_PROVIDER_ROOT").unwrap());
+        let global = root.join("provider-global");
+        fs::write(&global, "[credential]\nhelper = !gh auth git-credential\n").unwrap();
+        let trust = ProjectTrust {
+            project_root: root.clone(),
+            common_git_dir: root.join("source.git"),
+            origin_url: "https://github.com/o/r".into(),
+            push_url: "https://github.com/o/r".into(),
+            default_branch: "main".into(),
+            config_commit: None,
+            config_blob: None,
+            config_text: None,
+            trusted_at: "fixture".into(),
+            global_config: Some(global),
+            object_format: "sha1".into(),
+        };
+        let global_copy = flatten_global_config(&trust, &root).unwrap();
+        let transport = PushTransport {
+            trust,
+            root: root.clone(),
+            state_dir: root.clone(),
+            worktree: root.clone(),
+            _lock: File::create(root.join("lock")).unwrap(),
+            allow_local_for_tests: false,
+            global_copy,
+        };
+        fs::create_dir(root.join("objects")).unwrap();
+        fs::create_dir(root.join("refs")).unwrap();
+        fs::write(root.join("HEAD"), "ref: refs/heads/fixture\n").unwrap();
+        fs::write(root.join("config"), "[core]\nbare = true\n").unwrap();
+        let result = crate::proc::capture(
+            transport.command().unwrap().args(["credential", "fill"]),
+            std::time::Duration::from_secs(5),
+            Some(b"protocol=https\nhost=github.com\n\n"),
+        )
+        .unwrap();
+        assert!(result.status.success(), "{}", result.stderr);
+        assert!(result.stdout.contains("username=fixture"));
+    }
+
     #[test]
     fn transport_restores_only_global_matching_helpers_and_ssh() {
         let dir = tempfile::tempdir().unwrap();

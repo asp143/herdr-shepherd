@@ -26,9 +26,30 @@ fn shim_blocks_merge() {
 fn shim_passes_through_allowed() {
     let _guard = SCRIPT_EXEC_LOCK.lock().unwrap();
     let state = tempfile::tempdir().unwrap();
+    let repo = state.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    let store = herdr_shepherd::store::Store::open(state.path(), &repo).unwrap();
+    store
+        .update(|data| {
+            data.trust = Some(herdr_shepherd::store::ProjectTrust {
+                project_root: repo.clone(),
+                common_git_dir: repo.join(".git"),
+                origin_url: "https://github.com/trusted/project.git".into(),
+                push_url: "https://github.com/trusted/project.git".into(),
+                default_branch: "main".into(),
+                config_commit: None,
+                config_blob: None,
+                config_text: None,
+                trusted_at: "fixture".into(),
+                global_config: None,
+                object_format: "sha1".into(),
+            });
+            Ok(())
+        })
+        .unwrap();
     let real = state.path().join("real");
     fs::create_dir(&real).unwrap();
-    fs::write(real.join("gh"), "#!/bin/sh\nprintf 'REAL %s\\n' \"$*\"\n").unwrap();
+    fs::write(real.join("gh"), "#!/bin/sh\nprintf 'REAL %s\nCWD %s\nREPO %s\nTOKEN %s\nGIT %s\nCONFIG %s\n' \"$*\" \"$PWD\" \"$GH_REPO\" \"$GH_TOKEN\" \"$GIT_DIR\" \"$GH_CONFIG_DIR\"\n").unwrap();
     fs::set_permissions(real.join("gh"), fs::Permissions::from_mode(0o700)).unwrap();
     let dir = install_shim(
         state.path(),
@@ -38,6 +59,11 @@ fn shim_passes_through_allowed() {
     let path = std::env::join_paths([dir.clone(), real]).unwrap();
     let output = Command::new(dir.join("gh"))
         .env("PATH", path)
+        .current_dir(&repo)
+        .env("GH_TOKEN", herdr_shepherd::gate::env::NO_TOKEN)
+        .env("GH_CONFIG_DIR", state.path().join("agent-gh"))
+        .env("GH_REPO", "evil/project")
+        .env("GIT_DIR", "/untrusted/git-dir")
         .args(["pr", "view", "1"])
         .output()
         .unwrap();
@@ -46,7 +72,16 @@ fn shim_passes_through_allowed() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "REAL pr view 1\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "REAL pr view 1 -R trusted/project\nCWD {}\nREPO trusted/project\nTOKEN {}\nGIT {}\nCONFIG {}\n",
+            state.path().display(),
+            herdr_shepherd::gate::env::NO_TOKEN,
+            state.path().join("github-no-repository.git").display(),
+            state.path().join("agent-gh").display()
+        )
+    );
 }
 
 #[test]
@@ -96,4 +131,27 @@ fn shim_blocks_merge_api_bypasses() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("blocked"));
         assert!(!String::from_utf8_lossy(&output.stdout).contains("UNEXPECTED_REAL_GH"));
     }
+}
+
+#[test]
+fn shim_allowed_call_without_trust_fails_closed() {
+    let _guard = SCRIPT_EXEC_LOCK.lock().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let real = state.path().join("real");
+    fs::create_dir(&real).unwrap();
+    fs::write(real.join("gh"), "#!/bin/sh\nprintf UNEXPECTED_REAL_GH\n").unwrap();
+    fs::set_permissions(real.join("gh"), fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = install_shim(
+        state.path(),
+        std::path::Path::new(env!("CARGO_BIN_EXE_herdr-shepherd")),
+    )
+    .unwrap();
+    let output = Command::new(dir.join("gh"))
+        .current_dir(state.path())
+        .env("PATH", std::env::join_paths([dir.clone(), real]).unwrap())
+        .args(["pr", "view", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("UNEXPECTED_REAL_GH"));
 }

@@ -126,6 +126,9 @@ impl FakeGh {
         fs::write(bin.join("gh"), r#"#!/bin/sh
 printf 'CALL\n' >> "$SHEPHERD_TEST_ARGS"
 printf '%s\n' "$@" >> "$SHEPHERD_TEST_ARGS"
+if [ -n "$SHEPHERD_TEST_AUTH_ENV" ]; then
+    printf '%s\n' "${GH_TOKEN-unset}" "${GITHUB_TOKEN-unset}" "${GH_ENTERPRISE_TOKEN-unset}" "${GITHUB_ENTERPRISE_TOKEN-unset}" "${GH_CONFIG_DIR-unset}" > "$SHEPHERD_TEST_AUTH_ENV"
+fi
 if [ -n "$SHEPHERD_TEST_ERROR" ]; then
     printf '%s\n' "$SHEPHERD_TEST_ERROR" >&2
     exit 1
@@ -224,6 +227,72 @@ esac
             .arg(&self.repo);
         command
     }
+}
+
+#[test]
+fn gated_gh_restores_only_owned_auth_sentinels() {
+    let fixture = FakeGh::new();
+    let marker = fixture._dir.path().join("auth-env");
+    let sentinel = herdr_shepherd::gate::env::NO_TOKEN;
+    let out = fixture
+        .command("view")
+        .env("GH_TOKEN", sentinel)
+        .env("GITHUB_TOKEN", sentinel)
+        .env("GH_ENTERPRISE_TOKEN", sentinel)
+        .env("GITHUB_ENTERPRISE_TOKEN", sentinel)
+        .env("GH_CONFIG_DIR", fixture._dir.path().join("state/agent-gh"))
+        .env("SHEPHERD_TEST_AUTH_ENV", &marker)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "unset\nunset\nunset\nunset\nunset\n"
+    );
+    let out = fixture
+        .command("view")
+        .env("GH_TOKEN", "fixture-token")
+        .env("GITHUB_TOKEN", "fixture-token")
+        .env("GH_ENTERPRISE_TOKEN", "fixture-token")
+        .env("GITHUB_ENTERPRISE_TOKEN", "fixture-token")
+        .env("GH_CONFIG_DIR", fixture._dir.path().join("custom-gh"))
+        .env("SHEPHERD_TEST_AUTH_ENV", &marker)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        format!(
+            "fixture-token\nfixture-token\nfixture-token\nfixture-token\n{}\n",
+            fixture._dir.path().join("custom-gh").display()
+        )
+    );
+}
+
+#[test]
+fn gated_gh_does_not_reenter_agent_shim() {
+    let fixture = FakeGh::new();
+    let shim = herdr_shepherd::gate::shim::install_shim(
+        &fixture._dir.path().join("state"),
+        Path::new(env!("CARGO_BIN_EXE_herdr-shepherd")),
+    )
+    .unwrap();
+    let path = std::env::join_paths([shim, fixture.bin.clone()]).unwrap();
+    let out = fixture.command("view").env("PATH", path).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

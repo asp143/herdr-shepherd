@@ -75,6 +75,25 @@ impl Fixture {
             Path::new(env!("CARGO_BIN_EXE_herdr-shepherd")),
         )
         .unwrap();
+        let store = herdr_shepherd::store::Store::open(&dir.path().join("state"), &repo).unwrap();
+        store
+            .update(|data| {
+                data.trust = Some(herdr_shepherd::store::ProjectTrust {
+                    project_root: repo.clone(),
+                    common_git_dir: repo.join(".git"),
+                    origin_url: "https://github.com/o/r.git".into(),
+                    push_url: remote.to_string_lossy().into_owned(),
+                    default_branch: "main".into(),
+                    config_commit: None,
+                    config_blob: None,
+                    config_text: None,
+                    trusted_at: "fixture".into(),
+                    global_config: None,
+                    object_format: "sha1".into(),
+                });
+                Ok(())
+            })
+            .unwrap();
         let path = std::env::join_paths([shim.clone(), fake]).unwrap();
         Self {
             _dir: dir,
@@ -182,6 +201,8 @@ fn shim_blocks_repository_and_workflow_cli_mutations() {
         vec!["repo", "rename", "other", "--repo", "o/r"],
         vec!["repo", "sync", "o/r", "--force"],
         vec!["repo", "fork", "o/r"],
+        vec!["repo", "list", "o"],
+        vec!["repo", "clone", "o/r"],
         vec!["workflow", "run", "deploy.yml", "--ref", "main"],
         vec!["workflow", "enable", "deploy.yml"],
         vec!["release", "create", "v1"],
@@ -204,8 +225,6 @@ fn shim_preserves_read_only_repo_commands_and_comment_replies() {
     let f = Fixture::new();
     for args in [
         vec!["repo", "view", "--json", "defaultBranchRef"],
-        vec!["repo", "list", "o"],
-        vec!["repo", "clone", "o/r"],
         vec!["workflow", "list"],
         vec!["workflow", "view", "deploy.yml"],
         vec!["api", "repos/o/r/contents/file"],
@@ -233,9 +252,15 @@ fn shim_preserves_read_only_repo_commands_and_comment_replies() {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout), "FIXTURE_GH\n");
+        let mut expected = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        if args.starts_with(&["repo", "view"]) {
+            expected.insert(2, "o/r".into());
+        } else if args[0] != "api" {
+            expected.extend(["-R".into(), "o/r".into()]);
+        }
         assert_eq!(
             fs::read_to_string(&f.marker).unwrap().trim(),
-            args.join(" ")
+            expected.join(" ")
         );
     }
 }

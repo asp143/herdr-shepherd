@@ -11,6 +11,57 @@ use std::{
 
 pub const NO_TOKEN: &str = "shepherd-agent-no-token";
 
+/// Prepare only a trusted provider subprocess. Raw shim forwarding passes
+/// false so its credentials remain stripped; checked gate and transport calls
+/// may restore the user's default gh/keyring lookup without reading credentials.
+pub(crate) fn prepare_provider_command(
+    command: &mut Command,
+    state_dir: &Path,
+    restore_auth: bool,
+) -> Result<(), ShepherdError> {
+    // A nested shepherd command must invoke the provider, not re-enter
+    // the credential-stripped shim installed on its caller's PATH.
+    let shim = state_dir.join("shim");
+    let shim = shim.canonicalize().unwrap_or(shim);
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let kept: Vec<_> = std::env::split_paths(&inherited_path)
+        .filter(|entry| entry.canonicalize().unwrap_or_else(|_| entry.clone()) != shim)
+        .collect();
+    command.env(
+        "PATH",
+        std::env::join_paths(kept).map_err(anyhow::Error::from)?,
+    );
+    let tokens = [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ];
+    let owned_directory = state_dir.join("agent-gh");
+    let caller_directory = std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from);
+    let own_sentinels = caller_directory.as_ref().is_some_and(|path| {
+        path == &owned_directory
+            || path
+                .canonicalize()
+                .ok()
+                .zip(owned_directory.canonicalize().ok())
+                .is_some_and(|(left, right)| left == right)
+    }) && tokens
+        .iter()
+        .any(|key| std::env::var(key).as_deref() == Ok(NO_TOKEN));
+    if restore_auth && own_sentinels {
+        // Only a checked shepherd operation may return to the user's
+        // default gh/keyring lookup. Never copy or persist credentials.
+        command.env_remove("GH_CONFIG_DIR");
+        for token in tokens {
+            if std::env::var(token).as_deref() == Ok(NO_TOKEN) {
+                command.env_remove(token);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Copy safe global Git settings without following includes or preserving
 /// credential discovery, HTTP authentication, SSH commands, or URL rewrites.
 pub fn prepare_agent_gitconfig(
