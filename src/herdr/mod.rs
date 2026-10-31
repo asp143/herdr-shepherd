@@ -1,6 +1,6 @@
 pub mod cli;
 pub mod model;
-mod socket;
+pub mod socket;
 
 pub use cli::CliHerdr;
 pub use model::{AgentInfo, Workspace, WorktreeInfo};
@@ -13,5 +13,5 @@ pub trait Herdr {
     fn rename_workspace(&self, id: &str, label: &str) -> Result<(), ShepherdError>;
     fn move_block(&self, ids: &[String], before: Option<&str>) -> Result<(), ShepherdError>;
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod fake;

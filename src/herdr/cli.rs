@@ -82,6 +82,7 @@ impl Herdr for CliHerdr {
                 "params": {"workspace_ids": ids, "before_workspace_id": before}
             }),
         )
+        .map(|_| ())
     }
 }
 

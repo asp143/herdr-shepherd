@@ -15,16 +15,34 @@ pub(super) fn connect(path: &Path) -> Result<UnixStream, ShepherdError> {
     })
 }
 
-pub(super) fn request(path: &Path, value: &Value) -> Result<(), ShepherdError> {
+pub fn request(path: &Path, value: &Value) -> Result<Value, ShepherdError> {
+    request_with_timeout(path, value, Duration::from_secs(20))
+}
+
+fn request_with_timeout(
+    path: &Path,
+    value: &Value,
+    timeout: Duration,
+) -> Result<Value, ShepherdError> {
     let mut stream = connect(path)?;
-    let timeout = Some(Duration::from_secs(20));
+    let timeout = Some(timeout);
     stream.set_read_timeout(timeout).map_err(runtime)?;
     stream.set_write_timeout(timeout).map_err(runtime)?;
     serde_json::to_writer(&mut stream, value).map_err(|e| ShepherdError::Runtime(e.into()))?;
     stream.write_all(b"\n").map_err(runtime)?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).map_err(|err| {
-        ShepherdError::HerdrUnavailable(format!("herdr unavailable at {}: {err}", path.display()))
+        if matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            runtime(err)
+        } else {
+            ShepherdError::HerdrUnavailable(format!(
+                "herdr unavailable at {}: {err}",
+                path.display()
+            ))
+        }
     })?;
     if !line.ends_with('\n') {
         return Err(ShepherdError::HerdrUnavailable(format!(
@@ -39,7 +57,9 @@ pub(super) fn request(path: &Path, value: &Value) -> Result<(), ShepherdError> {
             "herdr socket error: {error}"
         )));
     }
-    Ok(())
+    response.get("result").cloned().ok_or_else(|| {
+        ShepherdError::Runtime(anyhow::anyhow!("herdr socket response has no result"))
+    })
 }
 
 fn runtime(error: std::io::Error) -> ShepherdError {
@@ -92,6 +112,61 @@ mod tests {
         assert!(matches!(
             request(&path, &json!({"id":"test"})),
             Err(ShepherdError::Runtime(_))
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn request_returns_parsed_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&conn).read_line(&mut line).unwrap();
+            conn.write_all(b"{\"id\":\"test\",\"result\":{\"value\":42}}\n")
+                .unwrap();
+        });
+        assert_eq!(
+            request(&path, &json!({"id":"test"})).unwrap(),
+            json!({"value":42})
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stalled_socket_is_runtime_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(100));
+            drop(conn);
+        });
+        let result = request_with_timeout(&path, &json!({"id":"test"}), Duration::from_millis(20));
+        assert!(
+            matches!(result, Err(ShepherdError::Runtime(_))),
+            "{result:?}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn socket_eof_is_herdr_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&conn).read_line(&mut line).unwrap();
+            drop(conn);
+        });
+        assert!(matches!(
+            request(&path, &json!({"id":"test"})),
+            Err(ShepherdError::HerdrUnavailable(_))
         ));
         server.join().unwrap();
     }

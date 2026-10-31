@@ -21,11 +21,18 @@ pub struct WorktreeInfo {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AgentInfo {
     pub name: Option<String>,
+    #[serde(default, deserialize_with = "null_string")]
     pub agent: String,
+    #[serde(default, deserialize_with = "null_string")]
     pub agent_status: String,
     pub cwd: Option<PathBuf>,
+    #[serde(default, deserialize_with = "null_string")]
     pub pane_id: String,
     pub workspace_id: Option<String>,
+}
+
+fn null_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 pub fn parse_snapshot(json: &str) -> anyhow::Result<Vec<Workspace>> {
@@ -76,6 +83,20 @@ mod tests {
         .unwrap();
         assert_eq!(workspaces.len(), 1);
         assert!(workspaces[0].worktree.is_none());
+    }
+
+    #[test]
+    fn parse_agent_list_tolerates_null_fields() {
+        let agents = parse_agent_list(r#"{"result":{"agents":[{"name":null,"agent":null,"agent_status":null,"cwd":null,"pane_id":null,"workspace_id":null},{}]}}"#).unwrap();
+        assert_eq!(agents.len(), 2);
+        for agent in agents {
+            assert!(agent.agent.is_empty());
+            assert!(agent.agent_status.is_empty());
+            assert!(agent.pane_id.is_empty());
+            assert_eq!(agent.name, None);
+            assert_eq!(agent.cwd, None);
+            assert_eq!(agent.workspace_id, None);
+        }
     }
 
     #[test]

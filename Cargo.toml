@@ -9,6 +9,9 @@ description = "Herdr upkeep and coding agent orchestration"
 name = "herdr-shepherd"
 path = "src/main.rs"
 
+[features]
+test-support = []
+
 [dependencies]
 anyhow = "1"
 globset = "0.4"
