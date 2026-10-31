@@ -174,6 +174,18 @@ pub fn start_ticket(
     id: &str,
     options: &StartTicketOptions<'_>,
 ) -> Result<Ticket, ShepherdError> {
+    start_ticket_with_backend(h, &crate::github::gh::GhBackend, store, id, options, true)
+}
+
+/// Start with an injectable read-only GitHub backend for protection warnings.
+pub fn start_ticket_with_backend(
+    h: &dyn crate::herdr::Herdr,
+    gh: &dyn crate::github::PrBackend,
+    store: &Store,
+    id: &str,
+    options: &StartTicketOptions<'_>,
+    notifications: bool,
+) -> Result<Ticket, ShepherdError> {
     use crate::store::{BlockedReason, TicketState};
 
     let (project, ticket) = store.update(|data| {
@@ -283,6 +295,22 @@ pub fn start_ticket(
             .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))
     };
     let result = setup();
+    if result.is_ok() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        if let Err(error) =
+            crate::github::protection::check_started_ticket(store, gh, h, id, now, notifications)
+        {
+            eprintln!("shepherd: branch protection warning: {error}");
+        }
+        return store
+            .read()?
+            .tickets
+            .into_iter()
+            .find(|ticket| ticket.id == id)
+            .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")));
+    }
     if result.is_err() {
         store.update(|data| {
             let ticket = data
@@ -451,10 +479,30 @@ mod tests {
             settings: &settings,
             now: "after",
         };
-        let started = start_ticket(&h, &store, "T1", &options).unwrap();
+        let backend = crate::github::fake::FakeBackend::new(vec![]);
+        let started =
+            start_ticket_with_backend(&h, &backend, &store, "T1", &options, true).unwrap();
         assert_eq!(started.state, crate::store::TicketState::Planning);
         assert_eq!(started.worktree, Some(path.clone()));
         assert_eq!(started.workspace_id.as_deref(), Some("fake-w1"));
+        assert!(!started.protection_warnings.is_empty());
+        assert!(
+            started
+                .protection_warnings
+                .iter()
+                .all(|warning| warning.reason.starts_with("unknown:"))
+        );
+        assert_eq!(
+            store.read().unwrap().tickets[0].protection_warnings,
+            started.protection_warnings
+        );
+        assert!(
+            h.calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("notify ")
+                    && call.contains("branch protection unknown:"))
+        );
         assert_eq!(
             git(
                 &path,
@@ -466,7 +514,7 @@ mod tests {
             std::fs::read_to_string(path.join("node_modules/fixture.txt")).unwrap(),
             "fixture"
         );
-        assert!(start_ticket(&h, &store, "T1", &options).is_err());
+        assert!(start_ticket_with_backend(&h, &backend, &store, "T1", &options, true).is_err());
         assert_eq!(h.workspaces.borrow().len(), 1);
     }
 }

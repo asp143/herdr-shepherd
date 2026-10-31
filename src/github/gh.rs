@@ -82,6 +82,12 @@ impl PrBackend for GhBackend {
         GhBackend::requested_reviewers(self, gate, number)
     }
 
+    fn branch_protected(&self, worktree: &Path, branch: &str) -> Result<bool, ShepherdError> {
+        super::protection::gh_branch_protected(worktree, branch)
+    }
+    fn default_branch(&self, worktree: &Path) -> Result<String, ShepherdError> {
+        super::protection::gh_default_branch(worktree)
+    }
     fn author(&self, worktree: &Path) -> Result<String, ShepherdError> {
         let text = read_gate(worktree)?
             .gh(&["api", "user", "--jq", ".login"], worktree)

@@ -8,6 +8,8 @@ pub struct FakeBackend {
     pub views: RefCell<VecDeque<Result<Option<PrStatus>, ShepherdError>>>,
     pub comments: RefCell<Vec<PrComment>>,
     pub author: RefCell<String>,
+    pub protected: RefCell<std::collections::HashMap<String, Result<bool, String>>>,
+    pub default_branch: RefCell<Result<String, String>>,
     pub calls: RefCell<Vec<String>>,
 }
 
@@ -17,12 +19,33 @@ impl FakeBackend {
             views: RefCell::new(views.into()),
             comments: RefCell::new(vec![]),
             author: RefCell::new("fixture-author".into()),
+            protected: RefCell::new(Default::default()),
+            default_branch: RefCell::new(Err("default branch reads are unsupported".into())),
             calls: RefCell::new(vec![]),
         }
     }
 }
 
 impl PrBackend for FakeBackend {
+    fn branch_protected(&self, _: &Path, branch: &str) -> Result<bool, ShepherdError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("branch_protected {branch}"));
+        self.protected
+            .borrow()
+            .get(branch)
+            .cloned()
+            .unwrap_or_else(|| Err("protection reads are unsupported".into()))
+            .map_err(ShepherdError::GithubUnavailable)
+    }
+    fn default_branch(&self, _: &Path) -> Result<String, ShepherdError> {
+        self.calls.borrow_mut().push("default_branch".into());
+        self.default_branch
+            .borrow()
+            .clone()
+            .map_err(ShepherdError::GithubUnavailable)
+    }
+
     fn comments(&self, _: &Path, number: u64) -> Result<Vec<PrComment>, ShepherdError> {
         self.calls.borrow_mut().push(format!("comments {number}"));
         Ok(self.comments.borrow().clone())
@@ -100,6 +123,10 @@ struct DiskState {
     #[serde(default)]
     author: String,
     #[serde(default)]
+    protected: std::collections::HashMap<String, bool>,
+    #[serde(default)]
+    default_branch: Option<String>,
+    #[serde(default)]
     calls: Vec<String>,
 }
 
@@ -131,6 +158,21 @@ impl DiskBackend {
 }
 
 impl PrBackend for DiskBackend {
+    fn branch_protected(&self, _: &Path, branch: &str) -> Result<bool, ShepherdError> {
+        self.call(format!("branch_protected {branch}"), |state| {
+            state.protected.get(branch).copied().ok_or_else(|| {
+                ShepherdError::GithubUnavailable("protection reads are unsupported".into())
+            })
+        })
+    }
+    fn default_branch(&self, _: &Path) -> Result<String, ShepherdError> {
+        self.call("default_branch".into(), |state| {
+            state.default_branch.clone().ok_or_else(|| {
+                ShepherdError::GithubUnavailable("default branch reads are unsupported".into())
+            })
+        })
+    }
+
     fn view(&self, _: &Path, branch: &str) -> Result<Option<PrStatus>, ShepherdError> {
         self.call(format!("view {branch}"), |s| Ok(s.status.clone()))
     }

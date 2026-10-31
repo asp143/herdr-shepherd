@@ -106,6 +106,11 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
+    /// Summarize tickets and cached branch protection warnings.
+    Status {
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
     /// Inspect tickets for the invoking project.
     Ticket {
         #[arg(long, global = true)]
@@ -521,6 +526,29 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                     });
                 }
             }
+        }
+        Commands::Status { project_root } => {
+            let project = resolve_project_root(project_root.as_deref())?;
+            let store = herdr_shepherd::store::Store::open(&state_dir(cli), &project)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs());
+            let data = herdr_shepherd::github::protection::refresh_status(
+                &store,
+                github_client()?.as_ref(),
+                now,
+            )?;
+            let warnings = herdr_shepherd::github::protection::status_warnings(&data);
+            let value = serde_json::json!({"tickets":data.tickets, "protection_warnings":warnings});
+            output::emit(cli.json, &value, || {
+                let mut lines: Vec<String> = data
+                    .tickets
+                    .iter()
+                    .map(|ticket| format!("{}: {:?}", ticket.id, ticket.state))
+                    .collect();
+                lines.extend(warnings);
+                lines.join("\n")
+            });
         }
         Commands::Version => {
             let version = env!("CARGO_PKG_VERSION");

@@ -73,6 +73,8 @@ pub struct Ticket {
     pub revision_task: Option<String>,
     #[serde(default)]
     pub revision_run: Option<crate::ticket::revise::RevisionRun>,
+    #[serde(default)]
+    pub protection_warnings: Vec<crate::github::protection::ProtectionWarning>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -153,6 +155,8 @@ pub struct StoreData {
     pub agents: Vec<AgentRecord>,
     #[serde(default)]
     pub pending_pings: Vec<String>,
+    #[serde(default)]
+    pub protection_cache: crate::github::protection::ProtectionCache,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

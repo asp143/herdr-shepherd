@@ -8,6 +8,7 @@ pub mod codeowners;
 #[cfg(any(test, debug_assertions, feature = "test-support"))]
 pub mod fake;
 pub mod gh;
+pub mod protection;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +68,17 @@ pub trait PrBackend {
         _number: u64,
     ) -> Result<Vec<String>, ShepherdError> {
         Ok(vec![])
+    }
+
+    fn branch_protected(&self, _worktree: &Path, _branch: &str) -> Result<bool, ShepherdError> {
+        Err(ShepherdError::GithubUnavailable(
+            "protection reads are unsupported".into(),
+        ))
+    }
+    fn default_branch(&self, _worktree: &Path) -> Result<String, ShepherdError> {
+        Err(ShepherdError::GithubUnavailable(
+            "default branch reads are unsupported".into(),
+        ))
     }
 
     fn comments(&self, _worktree: &Path, _number: u64) -> Result<Vec<PrComment>, ShepherdError> {

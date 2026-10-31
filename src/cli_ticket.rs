@@ -23,8 +23,9 @@ pub fn dispatch_with_backend(
     for action in actions {
         let (ticket, role, task) = match action {
             scheduler::Action::StartTicket(id) => {
-                let ticket = intake::start_ticket(
+                let ticket = intake::start_ticket_with_backend(
                     h,
+                    gh,
                     store,
                     &id,
                     &intake::StartTicketOptions {
@@ -33,6 +34,7 @@ pub fn dispatch_with_backend(
                         settings: &resolved.shepherd,
                         now: &launch::now(),
                     },
+                    cfg.upkeep.notifications,
                 )?;
                 herdr_shepherd::gate::hook::install_configured(
                     ticket.worktree.as_deref().expect("setup worktree"),
