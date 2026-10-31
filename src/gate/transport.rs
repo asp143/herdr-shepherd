@@ -596,6 +596,199 @@ impl PushTransport {
         self.import_fetched_objects()?;
         Ok(tip)
     }
+    /// Fetch a revision into an owned ticket ref, never a worktree remote.
+    pub fn fetch_ticket(&self, ticket: &str, branch: &str) -> Result<String, ShepherdError> {
+        let destination = format!("refs/shepherd/{ticket}");
+        self.execute(&["check-ref-format", &destination])?;
+        self.execute(&["check-ref-format", &format!("refs/heads/{branch}")])?;
+        self.execute(&[
+            "fetch",
+            "--no-tags",
+            "--",
+            self.url()?,
+            &format!("+refs/heads/{branch}:{destination}"),
+        ])?;
+        let tip = self
+            .execute(&["rev-parse", "--verify", &destination])?
+            .trim()
+            .to_owned();
+        if !oid(&tip) {
+            return Err(denied("fetched revision is not an object ID"));
+        }
+        self.import_fetched_objects()?;
+        Ok(tip)
+    }
+
+    fn local_command(&self, head: &str) -> Result<Command, ShepherdError> {
+        if !oid(head) {
+            return Err(denied("local operation requires a verified commit"));
+        }
+        let git_dir = self.git_dir(&self.worktree)?;
+        let index = git_dir.join("index");
+        if let Ok(metadata) = fs::symlink_metadata(&index)
+            && !metadata.file_type().is_file()
+        {
+            return Err(denied("worktree index must be a regular file"));
+        }
+        // A separate Git directory isolates every repository setting, including
+        // filters, includes, attributesFile and worktree-specific config. Only
+        // the index is shared with the registered worktree.
+        let local = self.root.join("local.git");
+        fs::create_dir_all(local.join("objects/info")).map_err(anyhow::Error::from)?;
+        fs::create_dir_all(local.join("refs")).map_err(anyhow::Error::from)?;
+        let config = if self.trust.object_format == "sha256" {
+            "[core]\nrepositoryformatversion=1\nbare=false\n[extensions]\nobjectformat=sha256\n"
+        } else {
+            "[core]\nrepositoryformatversion=0\nbare=false\n"
+        };
+        fs::write(local.join("config"), config).map_err(anyhow::Error::from)?;
+        fs::write(local.join("HEAD"), format!("{head}\n")).map_err(anyhow::Error::from)?;
+        fs::write(
+            local.join("objects/info/alternates"),
+            format!("{}\n", self.trust.common_git_dir.join("objects").display()),
+        )
+        .map_err(anyhow::Error::from)?;
+        // Split indexes name their shared immutable index by hash in GIT_DIR.
+        for entry in fs::read_dir(&git_dir).map_err(anyhow::Error::from)? {
+            let entry = entry.map_err(anyhow::Error::from)?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.strip_prefix("sharedindex.").is_some_and(oid) {
+                if !entry.file_type().map_err(anyhow::Error::from)?.is_file() {
+                    return Err(denied("shared index must be a regular file"));
+                }
+                fs::copy(entry.path(), local.join(name)).map_err(anyhow::Error::from)?;
+            }
+        }
+        let mut command = Command::new("git");
+        command.current_dir(&self.root);
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(name);
+            }
+        }
+        command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .env("GIT_INDEX_FILE", index)
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .arg("--git-dir")
+            .arg(local)
+            .arg("--work-tree")
+            .arg(&self.worktree)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.attributesFile=/dev/null",
+                "-c",
+                "core.splitIndex=false",
+            ]);
+        Ok(command)
+    }
+
+    pub fn worktree_status(&self, branch: &str) -> Result<String, ShepherdError> {
+        let head = self.verified_ticket_head(branch)?;
+        let out = proc::capture(
+            self.local_command(&head)?.args(["status", "--porcelain"]),
+            Duration::from_secs(60),
+            None,
+        )?;
+        if !out.status.success() {
+            return Err(denied(format!(
+                "cannot inspect ticket worktree: {}",
+                out.stderr.trim()
+            )));
+        }
+        Ok(out.stdout)
+    }
+
+    /// Update the worktree using owned config, then atomically publish only the
+    /// stored branch. A detached shadow HEAD prevents merge from changing any
+    /// source ref before the expected-tip check and lock are established.
+    pub fn fast_forward_ticket(
+        &self,
+        branch: &str,
+        expected: &str,
+        target: &str,
+    ) -> Result<(), ShepherdError> {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let conflict = || ShepherdError::Conflict {
+            unit: 0,
+            range: "ticket branch changed during sync".into(),
+        };
+        self.check_destination(branch)?;
+        self.execute(&["check-ref-format", &format!("refs/heads/{branch}")])?;
+        if self.verified_ticket_head(branch)? != expected
+            || !oid(target)
+            || !self.is_ancestor(expected, target)?
+        {
+            return Err(conflict());
+        }
+        let mut parent = self.trust.common_git_dir.clone();
+        let reference = format!("refs/heads/{branch}");
+        let parts: Vec<_> = reference.split('/').collect();
+        for part in &parts[..parts.len() - 1] {
+            parent.push(part);
+            match fs::symlink_metadata(&parent) {
+                Ok(metadata) if metadata.file_type().is_dir() => (),
+                Ok(_) => return Err(denied("branch directory must be a real directory")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&parent).map_err(anyhow::Error::from)?;
+                }
+                Err(error) => return Err(anyhow::Error::from(error).into()),
+            }
+        }
+        let destination = parent.join(parts.last().expect("nonempty reference"));
+        let lock_path = parent.join(format!(
+            "{}.lock",
+            parts.last().expect("nonempty reference")
+        ));
+        let mut lock = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|_| conflict())?;
+        let mut published = false;
+        let result = (|| {
+            if self.verified_ticket_head(branch)? != expected {
+                return Err(conflict());
+            }
+            let out = proc::capture(
+                self.local_command(expected)?
+                    .args(["merge", "--ff-only", target]),
+                Duration::from_secs(60),
+                None,
+            )?;
+            if !out.status.success() {
+                return Err(ShepherdError::Conflict {
+                    unit: 0,
+                    range: out.stderr.trim().into(),
+                });
+            }
+            if self.verified_ticket_head(branch)? != expected {
+                return Err(conflict());
+            }
+            lock.write_all(format!("{target}\n").as_bytes())
+                .map_err(anyhow::Error::from)?;
+            lock.sync_all().map_err(anyhow::Error::from)?;
+            fs::rename(&lock_path, destination).map_err(anyhow::Error::from)?;
+            published = true;
+            File::open(&parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(anyhow::Error::from)?;
+            Ok(())
+        })();
+        if !published {
+            let _ = fs::remove_file(lock_path);
+        }
+        result
+    }
+
     fn import_fetched_objects(&self) -> Result<(), ShepherdError> {
         // A fetched merge may exist only in this owned repository. Import its
         // immutable object files before cleanup can remove any worktree or

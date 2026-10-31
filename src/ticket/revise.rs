@@ -1,6 +1,6 @@
 //! Synchronize and run a revision without creating another pull request.
 
-use std::{path::Path, process::Command, time::Duration};
+use std::path::Path;
 
 use crate::{
     error::ShepherdError,
@@ -82,6 +82,7 @@ pub fn resume_revision(
     // revision work with terminal PR handling.
     let preparation = (|| {
         validate_gate(&initial, gate)?;
+        let base_head = verified_head(gate)?;
         if initial.revision_run.is_none() {
             if initial
                 .revision_task
@@ -94,7 +95,7 @@ pub fn resume_revision(
             }
             prepare_revision(&initial, gate)?;
         }
-        verified_head(gate)
+        Ok((base_head, verified_head(gate)?))
     })();
     let prepared = store.update(|data| {
         let ticket = data
@@ -105,8 +106,8 @@ pub fn resume_revision(
         if ticket.state != TicketState::Revising {
             return Err(ShepherdError::Usage("ticket must be revising".into()));
         }
-        let observed_head = match preparation {
-            Ok(head) => head,
+        let (base_head, observed_head) = match preparation {
+            Ok(heads) => heads,
             Err(error) if error.code() == "conflict" => {
                 super::state::transition_with_limit(
                     ticket,
@@ -121,7 +122,7 @@ pub fn resume_revision(
         };
         if ticket.revision_run.is_none() {
             ticket.revision_run = Some(RevisionRun {
-                base_sha: observed_head.clone(),
+                base_sha: base_head,
                 stage: RevisionStage::Coder,
                 agent: None,
                 tested_sha: None,
@@ -350,7 +351,9 @@ fn finish_revision(
         .as_ref()
         .and_then(|run| run.tested_sha.as_ref())
         != Some(&head)
-        || !git(&gate.worktree, &["status", "--porcelain"])?.is_empty()
+        || !crate::gate::transport::PushTransport::open(&gate.state_dir, &gate.worktree)?
+            .worktree_status(&initial.branch)?
+            .is_empty()
     {
         store.update(|data| {
             let ticket = data
@@ -456,32 +459,6 @@ fn revision_task(ticket: &Ticket, run: &RevisionRun, role: &str) -> String {
     )
 }
 
-fn git(path: &Path, args: &[&str]) -> Result<String, ShepherdError> {
-    let mut command = Command::new("git");
-    command.current_dir(path);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("GIT_") {
-            command.env_remove(name);
-        }
-    }
-    command
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-        ])
-        .args(args);
-    let output = crate::proc::capture(&mut command, Duration::from_secs(60), None)?;
-    if !output.status.success() {
-        return Err(anyhow::anyhow!("git {args:?}: {}", output.stderr.trim()).into());
-    }
-    Ok(output.stdout.trim().into())
-}
-
 fn conflict(reason: impl Into<String>) -> ShepherdError {
     ShepherdError::Conflict {
         unit: 0,
@@ -495,16 +472,16 @@ pub fn prepare_revision(ticket: &Ticket, gate: &Gate) -> Result<(), ShepherdErro
     }
     validate_gate(ticket, gate)?;
     let path = &gate.worktree;
-    if !git(path, &["status", "--porcelain"])?.is_empty() {
+    let transport = crate::gate::transport::PushTransport::open(&gate.state_dir, path)?;
+    if !transport.worktree_status(&ticket.branch)?.is_empty() {
         return Err(conflict("ticket worktree contains uncommitted changes"));
     }
-    let transport = crate::gate::transport::PushTransport::open(&gate.state_dir, path)?;
     let head = transport.verified_ticket_head(&ticket.branch)?;
-    let synced = transport.fetch_branch(&ticket.branch)?;
+    let synced = transport.fetch_ticket(&ticket.id, &ticket.branch)?;
     if !transport.is_ancestor(&head, &synced)? {
         return Err(conflict("remote branch diverged from the ticket"));
     }
-    git(path, &["merge", "--ff-only", &synced]).map_err(|error| conflict(error.to_string()))?;
+    transport.fast_forward_ticket(&ticket.branch, &head, &synced)?;
     Ok(())
 }
 

@@ -160,6 +160,118 @@ fn user_commit_fast_forwarded() {
 }
 
 #[test]
+fn revision_sync_ignores_agent_git_config() {
+    if !local_transport_enabled("revision_sync_ignores_agent_git_config") {
+        return;
+    }
+    let repo = Repo::new();
+    let marker = repo.dir.path().join("agent-config-executed");
+    let evil = repo.dir.path().join("agent-helper");
+    fs::write(
+        &evil,
+        format!("#!/bin/sh\nprintf executed > '{}'\ncat\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&evil, fs::Permissions::from_mode(0o700)).unwrap();
+    let hooks = repo.dir.path().join("agent-hooks");
+    fs::create_dir(&hooks).unwrap();
+    fs::copy(&evil, hooks.join("post-merge")).unwrap();
+    fs::write(repo.user.join(".gitattributes"), "*.txt filter=agent\n").unwrap();
+    fs::write(repo.user.join("user.txt"), "human change\n").unwrap();
+    git(&repo.user, &["add", ".gitattributes", "user.txt"]);
+    git(
+        &repo.user,
+        &["commit", "-m", "human change with attributes"],
+    );
+    git(&repo.user, &["push", "origin", "fix/ticket"]);
+    let expected = git(&repo.user, &["rev-parse", "HEAD"]);
+    for (key, value) in [
+        ("remote.origin.uploadpack", evil.to_str().unwrap()),
+        ("core.hooksPath", hooks.to_str().unwrap()),
+        ("core.fsmonitor", evil.to_str().unwrap()),
+        ("filter.agent.smudge", evil.to_str().unwrap()),
+        ("filter.agent.clean", evil.to_str().unwrap()),
+        ("remote.origin.url", "ssh://agent.invalid/redirect"),
+    ] {
+        git(&repo.root, &["config", key, value]);
+    }
+    git(
+        &repo.root,
+        &[
+            "config",
+            "url.ssh://agent.invalid/rewrite.insteadOf",
+            repo.remote.to_str().unwrap(),
+        ],
+    );
+    let invalid = repo.dir.path().join("untrusted.gitconfig");
+    fs::write(&invalid, "not valid git config\n").unwrap();
+    git(
+        &repo.root,
+        &["config", "include.path", invalid.to_str().unwrap()],
+    );
+    prepare_revision(&repo.ticket(), &repo.gate()).unwrap();
+    assert!(
+        !marker.exists(),
+        "agent-controlled Git configuration executed"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join(".git/refs/heads/fix/ticket"))
+            .unwrap()
+            .trim(),
+        expected
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root.join("user.txt")).unwrap(),
+        "human change\n"
+    );
+}
+
+#[test]
+fn revision_sync_preserves_linked_and_split_indexes() {
+    if !local_transport_enabled("revision_sync_preserves_linked_and_split_indexes") {
+        return;
+    }
+    let repo = Repo::new();
+    let before = git(&repo.root, &["rev-parse", "HEAD"]);
+    git(&repo.root, &["update-ref", "refs/heads/main", &before]);
+    git(&repo.root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let linked = repo.dir.path().join("ticket-worktree");
+    git(
+        &repo.root,
+        &["worktree", "add", linked.to_str().unwrap(), "fix/ticket"],
+    );
+    git(&linked, &["update-index", "--split-index"]);
+    git(&repo.root, &["pack-refs", "--all"]);
+    let mut ticket = repo.ticket();
+    ticket.worktree = Some(linked.clone());
+    Store::open(&repo.gate().state_dir, &repo.root)
+        .unwrap()
+        .update(|data| {
+            data.tickets[0] = ticket.clone();
+            Ok(())
+        })
+        .unwrap();
+    let mut gate = repo.gate();
+    gate.worktree = linked.clone();
+    let expected = repo.user_commit();
+    prepare_revision(&ticket, &gate).unwrap();
+    assert_eq!(git(&linked, &["rev-parse", "HEAD"]), expected);
+    assert!(git(&linked, &["status", "--porcelain"]).is_empty());
+    assert_eq!(git(&repo.root, &["rev-parse", "HEAD"]), before);
+    assert_eq!(
+        fs::read_to_string(linked.join("user.txt")).unwrap(),
+        "human change\n"
+    );
+    let transport =
+        herdr_shepherd::gate::transport::PushTransport::open(&gate.state_dir, &linked).unwrap();
+    assert_eq!(
+        transport.verified_ticket_head("fix/ticket").unwrap(),
+        expected
+    );
+    assert!(transport.worktree_status("fix/ticket").unwrap().is_empty());
+}
+
+#[test]
 fn diverged_remote_blocks_conflict() {
     if !local_transport_enabled("diverged_remote_blocks_conflict") {
         return;
@@ -362,6 +474,7 @@ fn revision_syncs_before_coder_starts() {
     let repo = Repo::new();
     let store = stored_revision(&repo);
     let gh = PushBackend::new(&repo);
+    let base = git(&repo.root, &["rev-parse", "HEAD"]);
     let expected = repo.user_commit();
     let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
     let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
@@ -377,8 +490,53 @@ fn revision_syncs_before_coder_starts() {
             .as_ref()
             .unwrap()
             .base_sha,
-        expected
+        base
     );
+}
+
+#[test]
+fn revision_base_includes_pulled_user_commits() {
+    if !local_transport_enabled("revision_base_includes_pulled_user_commits") {
+        return;
+    }
+    let repo = Repo::new();
+    let store = stored_revision(&repo);
+    let gh = PushBackend::new(&repo);
+    let base = git(&repo.root, &["rev-parse", "HEAD"]);
+    let synced = repo.user_commit();
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+    let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+    for expected_role in ["coder", "reviewer", "qa"] {
+        let herdr_shepherd::ticket::revise::RevisionOutcome::Started { agent, role } =
+            resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "now").unwrap()
+        else {
+            panic!("expected revision agent");
+        };
+        assert_eq!(role, expected_role);
+        let data = store.read().unwrap();
+        assert_eq!(
+            data.tickets[0].revision_run.as_ref().unwrap().base_sha,
+            base
+        );
+        let task = &data
+            .agents
+            .iter()
+            .find(|record| record.name == agent)
+            .unwrap()
+            .task;
+        assert!(task.contains(&format!("New diff: {base}..HEAD")));
+        assert_eq!(git(&repo.root, &["rev-parse", "HEAD"]), synced);
+        herdr_shepherd::flock::store_report(
+            &store,
+            &agent,
+            &serde_json::json!({
+                "status":"completed", "summary":"reviewed human change", "tests":[],
+                "changed_paths":["user.txt"], "blockers":[], "findings":[], "commit_sha":synced
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
 }
 
 #[test]
