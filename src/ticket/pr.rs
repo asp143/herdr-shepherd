@@ -174,12 +174,14 @@ pub fn open(
             None => gh.create(gate, &t.base, &title, &body)?,
         };
         validate_status(t, &status)?;
+        let pushed_sha = tested_sha.to_owned();
         let t = data
             .tickets
             .iter_mut()
             .find(|t| t.id == id)
             .expect("validated ticket");
         t.pr_number = Some(status.number);
+        t.ci_head_sha = Some(pushed_sha);
         t.pr_reviewers_pending = reviewers;
         super::state::transition_with_limit(t, TicketState::CiWait, None, now, cap)?;
         Ok((t.clone(), true))
@@ -191,6 +193,7 @@ pub fn open(
             .find(|t| t.id == id)
             .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
         current.pr_number = result.pr_number;
+        current.ci_head_sha = result.ci_head_sha.clone();
         current.pr_reviewers_pending = result.pr_reviewers_pending.clone();
         current.state = result.state;
         current.updated_at = result.updated_at.clone();
@@ -889,6 +892,36 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn initial_and_ci_fix_push_record_the_ci_head() {
+        for existing_pr in [None, Some(7)] {
+            let (dir, store) = ready_fixture();
+            store
+                .update(|data| {
+                    data.tickets[0].pr_number = existing_pr;
+                    Ok(())
+                })
+                .unwrap();
+            let expected = store.read().unwrap().tickets[0].qa_commit_sha.clone();
+            let cfg = crate::config::load(&dir.path().join("cfg"), None).unwrap();
+            let gh = FakeBackend::new(vec![Ok(Some(pr_status()))]);
+            let result = open(
+                &store,
+                &gh,
+                &gate(dir.path()),
+                &cfg,
+                "T-1",
+                "Fix boundary",
+                &["Check input".into()],
+                &["cargo test".into()],
+                "2",
+            )
+            .unwrap();
+            assert_eq!(result.ci_head_sha, expected);
+            assert_eq!(store.read().unwrap().tickets[0].ci_head_sha, expected);
+        }
     }
 
     #[test]

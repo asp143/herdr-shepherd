@@ -480,6 +480,7 @@ fn revision_pushes_and_returns_to_ci_wait() {
         }
     );
     assert_eq!(store.read().unwrap().tickets[0].state, TicketState::CiWait);
+    assert_eq!(store.read().unwrap().tickets[0].ci_head_sha.as_deref(), Some(expected.as_str()));
     assert_eq!(
         git(
             &repo.root,

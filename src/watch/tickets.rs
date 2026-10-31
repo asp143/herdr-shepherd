@@ -93,7 +93,16 @@ fn poll_ticket(
         .map(|outcome| outcome != crate::ticket::merge::MergeOutcome::Unchanged);
     }
     crate::ticket::pr::comments(store, gh, &ticket.id, false)?;
-    if ticket.state == TicketState::CiWait && status.checks == Checks::Failing {
+    let checks = if ticket
+        .ci_head_sha
+        .as_ref()
+        .is_some_and(|sha| status.head_oid.as_ref() == Some(sha))
+    {
+        status.checks
+    } else {
+        Checks::Pending
+    };
+    if ticket.state == TicketState::CiWait && checks == Checks::Failing {
         let checks = gh.failed_checks(path, status.number)?;
         let details = checks
             .iter()
@@ -171,7 +180,7 @@ fn poll_ticket(
             else {
                 return Ok(false);
             };
-            if status.checks == Checks::None {
+            if checks == Checks::None {
                 let since = current
                     .ci_none_since
                     .as_deref()
@@ -192,8 +201,7 @@ fn poll_ticket(
     } else {
         false
     };
-    if ticket.state == TicketState::CiWait && (status.checks == Checks::Passing || no_checks_ready)
-    {
+    if ticket.state == TicketState::CiWait && (checks == Checks::Passing || no_checks_ready) {
         let _dispatch = crate::ticket::revise::dispatch_lock(store, &ticket.id)?;
         if !store
             .read()?
@@ -238,6 +246,7 @@ fn same_ci_generation(current: &Ticket, observed: &Ticket) -> bool {
     current.id == observed.id
         && current.state == TicketState::CiWait
         && current.pr_number == observed.pr_number
+        && current.ci_head_sha == observed.ci_head_sha
         && current.history.len() == observed.history.len()
         && current.updated_at == observed.updated_at
 }
@@ -383,6 +392,7 @@ mod tests {
                         base: "main".into(),
                         state,
                         pr_number: Some(1),
+                        ci_head_sha: Some("fixture-head".into()),
                         worktree: Some(root.clone()),
                         workspace_id: Some("w1".into()),
                         ..Ticket::default()
@@ -432,7 +442,7 @@ mod tests {
                 merged_at: None,
                 base: "main".into(),
                 head: "feat/t1".into(),
-                head_oid: None,
+                head_oid: Some("fixture-head".into()),
                 checks,
                 review: ReviewDecision::None,
                 comment_ids: vec![],
@@ -468,6 +478,74 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn stale_red_head_does_not_bounce_or_consume_round() {
+        let fixture = Fixture::new(TicketState::CiWait);
+        fixture
+            .store
+            .update(|data| {
+                data.tickets[0].ci_head_sha = Some("new-head".into());
+                data.tickets[0].ci_none_since = Some("1".into());
+                Ok(())
+            })
+            .unwrap();
+        let mut status = Fixture::status(Checks::Failing);
+        status.head_oid = Some("old-head".into());
+        let gh = FakeBackend::new(vec![Ok(Some(status))]);
+        let report = fixture.tick(&gh, 1000);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let ticket = fixture.ticket();
+        assert_eq!(ticket.state, TicketState::CiWait);
+        assert_eq!(ticket.revision_round, 0);
+        assert!(ticket.ci_failure_task.is_none());
+        assert!(ticket.ci_none_since.is_none());
+        assert!(
+            !gh.calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("failed_checks"))
+        );
+    }
+
+    #[test]
+    fn stale_green_head_does_not_hand_off() {
+        let fixture = Fixture::new(TicketState::CiWait);
+        fixture
+            .store
+            .update(|data| {
+                data.tickets[0].ci_head_sha = Some("new-head".into());
+                Ok(())
+            })
+            .unwrap();
+        fixture.reported_agent();
+        let mut status = Fixture::status(Checks::Passing);
+        status.head_oid = Some("old-head".into());
+        let gh = FakeBackend::new(vec![Ok(Some(status))]);
+        let report = fixture.tick(&gh, 1000);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(fixture.ticket().state, TicketState::CiWait);
+        assert_eq!(
+            fixture.store.read().unwrap().agents[0].status,
+            crate::store::AgentStatus::Reported
+        );
+    }
+
+    #[test]
+    fn unknown_pushed_head_keeps_ci_pending() {
+        let fixture = Fixture::new(TicketState::CiWait);
+        fixture
+            .store
+            .update(|data| {
+                data.tickets[0].ci_head_sha = None;
+                Ok(())
+            })
+            .unwrap();
+        let gh = FakeBackend::new(vec![Ok(Some(Fixture::status(Checks::Passing)))]);
+        let report = fixture.tick(&gh, 1000);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(fixture.ticket().state, TicketState::CiWait);
     }
 
     #[test]

@@ -430,6 +430,8 @@ fn finish_revision(
         let ticket = data.tickets.iter_mut().find(|ticket| ticket.id == id)
             .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
         super::state::transition(ticket, TicketState::CiWait, None, now)?;
+        ticket.ci_head_sha = Some(head.clone());
+        ticket.ci_none_since = None;
         for comment in ticket.comments.iter_mut().filter(|comment| comment.verdict.as_deref() == Some("accepted") && !comment.acknowledged) {
             comment.ack_sha = Some(head.clone());
             data.pending_pings.push(format!("{id}: run ticket ack {id} --comment {} --body-file <path>; explain the change and include commit {head}", comment.id));
