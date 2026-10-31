@@ -1,3 +1,4 @@
+mod cli_pr;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, error::ErrorKind};
@@ -38,6 +39,11 @@ enum Commands {
     Hook {
         #[command(subcommand)]
         command: HookCommand,
+    },
+    /// Read and update GitHub pull requests through the gate.
+    Pr {
+        #[command(subcommand)]
+        command: cli_pr::PrCommand,
     },
     /// Gate gh calls from agent panes.
     Shim {
@@ -128,6 +134,11 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 }
             }
         },
+        Commands::Pr { command } => cli_pr::run(
+            command,
+            &config::resolve_config_dir(cli.config_dir.as_deref()),
+            cli.json,
+        )?,
         Commands::Shim {
             command: ShimCommand::Gh { args },
         } => {

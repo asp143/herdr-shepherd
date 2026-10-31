@@ -1,6 +1,7 @@
 pub mod config;
 pub mod error;
 pub mod gate;
+pub mod github;
 pub mod herdr;
 pub mod output;
 pub mod probe;

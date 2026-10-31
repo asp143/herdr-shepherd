@@ -1,0 +1,15 @@
+{
+  "number": 42,
+  "url": "https://github.com/example/project/pull/42",
+  "state": "OPEN",
+  "mergedAt": null,
+  "baseRefName": "main",
+  "headRefName": "feat/example",
+  "statusCheckRollup": [
+    { "__typename": "CheckRun", "name": "unit", "status": "COMPLETED", "conclusion": "SUCCESS" },
+    { "__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "FAILURE" }
+  ],
+  "reviewDecision": "CHANGES_REQUESTED",
+  "comments": [ { "id": 123 } ],
+  "reviews": []
+}

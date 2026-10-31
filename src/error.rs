@@ -5,6 +5,7 @@ pub enum ShepherdError {
     Usage(String),
     Config { path: PathBuf, message: String },
     HerdrUnavailable(String),
+    GithubUnavailable(String),
     Runtime(anyhow::Error),
     PolicyDenied(String),
 }
@@ -15,6 +16,7 @@ impl ShepherdError {
             Self::Usage(_) => "usage",
             Self::Config { .. } => "config_invalid",
             Self::HerdrUnavailable(_) => "herdr_unavailable",
+            Self::GithubUnavailable(_) => "github_unavailable",
             Self::Runtime(_) => "runtime",
             Self::PolicyDenied(_) => "policy_denied",
         }
@@ -24,7 +26,7 @@ impl ShepherdError {
         match self {
             Self::Usage(_) | Self::Config { .. } => 2,
             Self::HerdrUnavailable(_) => 3,
-            Self::Runtime(_) => 1,
+            Self::Runtime(_) | Self::GithubUnavailable(_) => 1,
             Self::PolicyDenied(_) => 4,
         }
     }
@@ -35,6 +37,7 @@ impl fmt::Display for ShepherdError {
         match self {
             Self::Usage(message)
             | Self::HerdrUnavailable(message)
+            | Self::GithubUnavailable(message)
             | Self::PolicyDenied(message) => f.write_str(message),
             Self::Config { path, message } => write!(f, "{}: {message}", path.display()),
             Self::Runtime(error) => write!(f, "{error:#}"),
