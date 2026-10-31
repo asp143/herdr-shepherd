@@ -1,7 +1,8 @@
 //! Resolve orchestration settings from the selected Phase 1 configuration.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 
+use indexmap::IndexMap;
 use regex::Regex;
 use serde::{Deserialize, Serialize, Serializer};
 
@@ -11,7 +12,7 @@ use crate::{
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ShepherdSettings {
     pub runner: String,
     pub max_concurrent_tickets: usize,
@@ -56,7 +57,7 @@ pub enum WorktreeMode {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Role {
     pub name: String,
     pub description: String,
@@ -80,6 +81,7 @@ impl Default for Role {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Runner {
     #[serde(default)]
     pub name: String,
@@ -107,6 +109,7 @@ pub struct Rule {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuleConfig {
     name: String,
     harness: Option<String>,
@@ -115,7 +118,7 @@ struct RuleConfig {
 }
 
 #[derive(Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct SupervisionConfig {
     sweep_seconds: u64,
     report_grace_seconds: u64,
@@ -144,7 +147,7 @@ fn serialize_pattern<S: Serializer>(pattern: &Regex, serializer: S) -> Result<S:
 pub struct Resolved {
     pub shepherd: ShepherdSettings,
     pub roles: Vec<Role>,
-    pub runners: HashMap<String, Runner>,
+    pub runners: IndexMap<String, Runner>,
     pub supervision: SupervisionSettings,
 }
 
@@ -249,6 +252,7 @@ fn overlay<T: Serialize + serde::de::DeserializeOwned>(
 
 /// Overlay named roles and runners on the built-in catalog in the selected file.
 /// New roles default to the ticket worktree and the primary codex runner.
+/// Configured entries retain file order, followed by unspecified built-ins.
 pub fn resolve(cfg: &Config) -> Result<Resolved, ShepherdError> {
     let mut resolved = defaults();
     if let Some(value) = cfg.raw.get("shepherd") {
@@ -258,36 +262,79 @@ pub fn resolve(cfg: &Config) -> Result<Resolved, ShepherdError> {
         let table = value
             .as_table()
             .ok_or_else(|| invalid(cfg, "runners must be a table"))?;
+        let mut runners = IndexMap::new();
         for (name, value) in table {
             let mut runner: Runner = match resolved.runners.get(name) {
                 Some(base) => overlay(cfg, base, value)?,
                 None => value.clone().try_into().map_err(|err| invalid(cfg, err))?,
             };
             runner.name = name.clone();
-            resolved.runners.insert(name.clone(), runner);
+            runners.insert(name.clone(), runner);
         }
+        for (name, runner) in resolved.runners {
+            runners.entry(name).or_insert(runner);
+        }
+        resolved.runners = runners;
     }
     if let Some(value) = cfg.raw.get("roles") {
         let table = value
             .as_table()
             .ok_or_else(|| invalid(cfg, "roles must be a table"))?;
+        let mut roles = Vec::new();
         for (name, value) in table {
-            let index = resolved.roles.iter().position(|role| role.name == *name);
-            let base = index.map(|i| resolved.roles[i].clone()).unwrap_or_default();
+            let base = resolved
+                .roles
+                .iter()
+                .find(|role| role.name == *name)
+                .cloned()
+                .unwrap_or_default();
             let mut role: Role = overlay(cfg, &base, value)?;
             role.name = name.clone();
-            if let Some(index) = index {
-                resolved.roles[index] = role;
-            } else {
-                resolved.roles.push(role);
-            }
+            roles.push(role);
         }
+        roles.extend(
+            resolved
+                .roles
+                .into_iter()
+                .filter(|role| !table.contains_key(&role.name)),
+        );
+        resolved.roles = roles;
     }
     if let Some(value) = cfg.raw.get("supervision") {
         let settings: SupervisionConfig =
             value.clone().try_into().map_err(|err| invalid(cfg, err))?;
         let mut rules = Vec::new();
+        let mut rule_names: HashSet<String> = ["codex-trust", "press-enter", "codex-update-notice"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         for rule in settings.rules {
+            if !rule_names.insert(rule.name.clone()) {
+                return Err(invalid(
+                    cfg,
+                    format!("duplicate supervision rule name {}", rule.name),
+                ));
+            }
+            if rule.pattern.trim().is_empty() {
+                return Err(invalid(
+                    cfg,
+                    format!("rule {} pattern must not be empty", rule.name),
+                ));
+            }
+            if rule.keys.is_empty() {
+                return Err(invalid(
+                    cfg,
+                    format!("rule {} keys must not be empty", rule.name),
+                ));
+            }
+            if let Some(harness) = &rule.harness
+                && !matches!(harness.as_str(), "codex" | "omp" | "claude" | "pi")
+            {
+                return Err(invalid(
+                    cfg,
+                    format!("rule {} has unknown harness {harness}", rule.name),
+                ));
+            }
             for key in &rule.keys {
                 if !matches!(
                     key.as_str(),
@@ -331,6 +378,12 @@ pub fn resolve(cfg: &Config) -> Result<Resolved, ShepherdError> {
         };
     }
     for role in &resolved.roles {
+        if role.runners.is_empty() {
+            return Err(invalid(
+                cfg,
+                format!("role {} must specify at least one runner", role.name),
+            ));
+        }
         for runner in &role.runners {
             if !resolved.runners.contains_key(runner) {
                 return Err(invalid(

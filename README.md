@@ -72,6 +72,10 @@ Defaults include planner, researcher, coder, reviewer, and QA roles, with the
 `codex-sol-high`, `omp-astra`, and `omp-glm-infra` runner catalog. Named role and
 runner entries override built-in fields; new roles default to the ticket
 worktree and `codex-sol-high`. No fields are merged between config files.
+Configured roles and runners retain file order, followed by unspecified
+built-ins in catalog order. The library uses `IndexMap<String, Runner>` for
+`Resolved.runners`. Unknown fields within orchestration sections and rules are
+configuration errors; each role must have at least one runner.
 
 Shepherd defaults are two concurrent tickets, six parallel agents, three
 revision rounds, and PR polling every 180 seconds. Supervision defaults are a
@@ -80,6 +84,8 @@ revision rounds, and PR polling every 180 seconds. Supervision defaults are a
 `codex-trust`, `press-enter`, and `codex-update-notice` rules. Rule keys are
 limited to `enter`, `esc`, `y`, `n`, `1` through `9`, `down`, and `up`. This core
 resolves supervision configuration; executing those rules is a later module.
+Rules require a nonempty pattern and keys, unique names (including built-ins),
+and either no harness filter or one of `codex`, `omp`, `claude`, and `pi`.
 
 An optional ticket source is an argv array in the selected configuration:
 
