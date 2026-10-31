@@ -6,6 +6,7 @@ use herdr_shepherd::{
     error::ShepherdError,
     herdr::{Herdr, cli::CliHerdr},
     output, proc,
+    upkeep::regroup,
 };
 
 #[derive(Parser)]
@@ -56,12 +57,14 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
             });
         }
         Commands::Regroup => {
-            let workspaces = CliHerdr::from_env().workspaces()?;
-            output::emit(
-                cli.json,
-                &serde_json::json!({"workspaces": workspaces.len()}),
-                || format!("{} workspaces", workspaces.len()),
-            );
+            let h = CliHerdr::from_env();
+            let report = regroup::apply(&h, &regroup::plan_regroup(&h.workspaces()?))?;
+            output::emit(cli.json, &report, || {
+                format!(
+                    "herdr-shepherd: {} relabeled, {} group(s) repacked",
+                    report.relabeled, report.repacked
+                )
+            });
         }
     }
     Ok(())

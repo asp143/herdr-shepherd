@@ -13,3 +13,5 @@ pub trait Herdr {
     fn rename_workspace(&self, id: &str, label: &str) -> Result<(), ShepherdError>;
     fn move_block(&self, ids: &[String], before: Option<&str>) -> Result<(), ShepherdError>;
 }
+#[cfg(test)]
+pub mod fake;
