@@ -79,3 +79,67 @@ fn fake_herdr_spawn_and_list_share_durable_state() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["data"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn report_requires_calling_pane_identity() {
+    use herdr_shepherd::store::{AgentRecord, AgentStatus, Store};
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let store = Store::open(&state, dir.path()).unwrap();
+    store
+        .update(|d| {
+            d.agents.push(AgentRecord {
+                name: "sh-fixture-coder-1".into(),
+                ticket: "T-1".into(),
+                role: "coder".into(),
+                runner: "codex-sol-high".into(),
+                status: AgentStatus::Working,
+                pane_id: Some("owned-pane".into()),
+                tab_id: Some("owned-tab".into()),
+                worktree: dir.path().into(),
+                task: "implement".into(),
+                report: None,
+                observed: None,
+                last_progress_at: "0".into(),
+                nudges: 0,
+                restarts: 0,
+                prompt_pending: false,
+            });
+            Ok(())
+        })
+        .unwrap();
+    let report = dir.path().join("report.json");
+    std::fs::write(&report,r#"{"status":"completed","summary":"done","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+    let fake = dir.path().join("fake.json");
+    std::fs::write(&fake, "{}").unwrap();
+    let run = |pane: &str| {
+        Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+            .env("HERDR_PANE_ID", pane)
+            .env("SHEPHERD_FAKE_HERDR", &fake)
+            .args(["--json", "--state-dir"])
+            .arg(&state)
+            .args(["--config-dir"])
+            .arg(dir.path().join("cfg"))
+            .args(["agent", "--project-root"])
+            .arg(dir.path())
+            .args(["report", "--agent", "sh-fixture-coder-1", "--report-file"])
+            .arg(&report)
+            .output()
+            .unwrap()
+    };
+    let out = run("unowned-pane");
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(store.read().unwrap().agents[0].report.is_none());
+    let out = run("owned-pane");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(store.read().unwrap().agents[0].report.is_some());
+}

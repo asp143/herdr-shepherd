@@ -80,19 +80,33 @@ pub fn reconcile(
         )
     }) {
         let live = h.agent_get(&rec.name)?;
-        store.update(|data| {
+        let send_pending = store.update(|data| {
             let Some(current) = data
                 .agents
                 .iter_mut()
                 .find(|r| r.name == rec.name && r.status == rec.status)
             else {
-                return Ok(());
+                return Ok(false);
             };
+            let send_pending = current.prompt_pending
+                && live
+                    .as_ref()
+                    .is_some_and(|info| matches!(info.agent_status.as_str(), "idle" | "done"));
+            if send_pending {
+                current.prompt_pending = false;
+            }
             match &live {
                 Some(info) => {
                     current.pane_id = Some(info.pane_id.clone());
                     current.status = if info.agent_status == "blocked" {
                         AgentStatus::Blocked
+                    } else if current.prompt_pending
+                        && matches!(
+                            info.agent_status.as_str(),
+                            "unknown" | "starting" | "initializing"
+                        )
+                    {
+                        AgentStatus::Starting
                     } else {
                         AgentStatus::Working
                     };
@@ -114,8 +128,38 @@ pub fn reconcile(
                     result.vanished += 1;
                 }
             }
-            Ok(())
+            Ok(send_pending)
         })?;
+        if send_pending {
+            let inside = live
+                .as_ref()
+                .and_then(|i| i.cwd.as_ref())
+                .and_then(|p| p.canonicalize().ok())
+                .zip(rec.worktree.canonicalize().ok())
+                .is_some_and(|(cwd, root)| cwd.starts_with(root));
+            let delivery = if inside {
+                h.prompt_agent(&rec.name, &rec.task, true)
+            } else {
+                Err(ShepherdError::PolicyDenied(
+                    "recovered agent is outside its worktree".into(),
+                ))
+            };
+            if let Err(error) = delivery
+                && !error.prompt_was_submitted()
+            {
+                store.update(|data| {
+                    if let Some(current) = data.agents.iter_mut().find(|a| a.name == rec.name)
+                        && current.report.is_none()
+                        && current.status != AgentStatus::Retired
+                    {
+                        current.prompt_pending = true;
+                        current.status = AgentStatus::Blocked;
+                    }
+                    Ok(())
+                })?;
+                return Err(error);
+            }
+        }
     }
     Ok(result)
 }
@@ -300,6 +344,80 @@ mod tests {
             prompt: "Implement".into(),
             state_dir: state.into(),
         }
+    }
+    #[test]
+    fn reconcile_waits_for_readiness_before_pending_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("state"), dir.path()).unwrap();
+        let rec = stored_agent(&store);
+        store
+            .update(|d| {
+                d.agents[0].status = crate::store::AgentStatus::Starting;
+                d.agents[0].prompt_pending = true;
+                Ok(())
+            })
+            .unwrap();
+        let h = crate::herdr::fake::FakeHerdr::new(vec![]);
+        h.agent_records.borrow_mut().push(crate::herdr::AgentInfo {
+            name: Some(rec.name),
+            agent: "codex".into(),
+            agent_status: "unknown".into(),
+            cwd: Some(dir.path().into()),
+            pane_id: "p1".into(),
+            workspace_id: Some("w1".into()),
+        });
+        reconcile(&h, &store).unwrap();
+        assert!(
+            h.calls
+                .borrow()
+                .iter()
+                .all(|c| !c.starts_with("prompt_agent"))
+        );
+        h.agent_records.borrow_mut()[0].agent_status = "idle".into();
+        reconcile(&h, &store).unwrap();
+        reconcile(&h, &store).unwrap();
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|c| c.starts_with("prompt_agent"))
+                .count(),
+            1
+        );
+        assert!(!store.read().unwrap().agents[0].prompt_pending);
+    }
+    #[test]
+    fn reconcile_delivers_pending_startup_prompt_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("state"), dir.path()).unwrap();
+        let rec = stored_agent(&store);
+        store
+            .update(|d| {
+                d.agents[0].status = crate::store::AgentStatus::Starting;
+                d.agents[0].prompt_pending = true;
+                Ok(())
+            })
+            .unwrap();
+        let h = crate::herdr::fake::FakeHerdr::new(vec![]);
+        h.agent_records.borrow_mut().push(crate::herdr::AgentInfo {
+            name: Some(rec.name.clone()),
+            agent: "codex".into(),
+            agent_status: "idle".into(),
+            cwd: Some(dir.path().into()),
+            pane_id: "p1".into(),
+            workspace_id: Some("w1".into()),
+        });
+        reconcile(&h, &store).unwrap();
+        reconcile(&h, &store).unwrap();
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("prompt_agent"))
+                .count(),
+            1
+        );
+        assert!(!store.read().unwrap().agents[0].prompt_pending);
     }
     #[test]
     fn concurrent_reports_both_land() {

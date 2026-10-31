@@ -65,14 +65,25 @@ pub fn run(
                 .ok_or_else(|| ShepherdError::Usage(format!("unknown agent: {name}")))?,
         )
         .expect("serializable"),
-        AgentCommand::Report { agent, report_file } => serde_json::to_value(flock::report(
-            h,
-            &store,
-            &cfg,
-            agent,
-            &crate::cli_pr::read_text(report_file)?,
-        )?)
-        .expect("serializable"),
+        AgentCommand::Report { agent, report_file } => {
+            let text = crate::cli_pr::read_text(report_file)?;
+            flock::validate_report(&text)?;
+            if let Ok(caller) = std::env::var("HERDR_PANE_ID") {
+                let data = store.read()?;
+                let rec = data
+                    .agents
+                    .iter()
+                    .find(|a| &a.name == agent)
+                    .ok_or_else(|| ShepherdError::Usage(format!("unknown agent: {agent}")))?;
+                if rec.pane_id.as_deref() != Some(caller.as_str()) {
+                    return Err(ShepherdError::PolicyDenied(
+                        "report caller pane does not own this agent".into(),
+                    ));
+                }
+            }
+            serde_json::to_value(flock::report(h, &store, &cfg, agent, &text)?)
+                .expect("serializable")
+        }
         AgentCommand::Cancel { name, force } => {
             serde_json::to_value(flock::cancel(h, &store, name, *force)?).expect("serializable")
         }
@@ -82,6 +93,7 @@ pub fn run(
             task_file,
             unit,
         } => {
+            let _placement = spawn_placement_lock(&store)?;
             let resolved = roles::resolve(&cfg)?;
             let role = resolved
                 .roles
@@ -141,6 +153,19 @@ pub fn run(
                     return Err(ShepherdError::Capacity);
                 }
                 let child = if let Some(child) = ticket.children.iter().find(|c| c.unit == unit) {
+                    if data.agents.iter().any(|a| {
+                        a.worktree == child.path
+                            && matches!(
+                                a.status,
+                                herdr_shepherd::store::AgentStatus::Starting
+                                    | herdr_shepherd::store::AgentStatus::Working
+                                    | herdr_shepherd::store::AgentStatus::Blocked
+                            )
+                    }) {
+                        return Err(ShepherdError::Usage(
+                            "child unit already has an active agent".into(),
+                        ));
+                    }
                     child.clone()
                 } else {
                     let bin = std::env::current_exe().map_err(anyhow::Error::from)?;
@@ -283,4 +308,17 @@ pub fn spawn_task_request(
             state_dir: state.into(),
         },
     )
+}
+
+fn spawn_placement_lock(store: &Store) -> Result<std::fs::File, ShepherdError> {
+    std::fs::create_dir_all(store.root()).map_err(anyhow::Error::from)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(store.root().join("spawn.lock"))
+        .map_err(anyhow::Error::from)?;
+    lock.lock().map_err(anyhow::Error::from)?;
+    Ok(lock)
 }
