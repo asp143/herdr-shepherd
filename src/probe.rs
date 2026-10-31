@@ -1,0 +1,121 @@
+use std::{path::Path, process::Command, time::Duration};
+
+use crate::proc;
+
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const SIZE_TIMEOUT: Duration = Duration::from_secs(120);
+
+// Scans share one probe across scoped workers; implementations must permit
+// concurrent independent reads.
+pub trait Probe: Sync {
+    fn branch(&self, p: &Path) -> Option<String>;
+    fn dirty(&self, p: &Path) -> bool;
+    fn pr_state(&self, p: &Path, branch: &str) -> Option<String>;
+    fn size(&self, p: &Path) -> Option<String>;
+}
+
+pub struct SystemProbe;
+
+fn output(cmd: &mut Command, timeout: Duration) -> Option<String> {
+    proc::run(cmd, timeout)
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_owned())
+}
+
+fn pr_state_with(bin: &Path, p: &Path, branch: &str, timeout: Duration) -> Option<String> {
+    output(
+        Command::new(bin)
+            .current_dir(p)
+            .args(["pr", "view", branch, "--json", "state", "-q", ".state"]),
+        timeout,
+    )
+}
+
+impl Probe for SystemProbe {
+    fn branch(&self, p: &Path) -> Option<String> {
+        output(
+            Command::new("git")
+                .current_dir(p)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .args(["branch", "--show-current"]),
+            PROBE_TIMEOUT,
+        )
+        .filter(|s| !s.is_empty())
+    }
+
+    fn dirty(&self, p: &Path) -> bool {
+        output(
+            Command::new("git")
+                .current_dir(p)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .args(["status", "--porcelain"]),
+            PROBE_TIMEOUT,
+        )
+        .is_some_and(|s| !s.is_empty())
+    }
+
+    fn pr_state(&self, p: &Path, branch: &str) -> Option<String> {
+        pr_state_with(Path::new("gh"), p, branch, PROBE_TIMEOUT)
+    }
+
+    fn size(&self, p: &Path) -> Option<String> {
+        output(Command::new("du").args(["-sh", "--"]).arg(p), SIZE_TIMEOUT)?
+            .split_whitespace()
+            .next()
+            .map(str::to_owned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, time::Instant};
+
+    fn script(dir: &Path, text: &str) -> PathBuf {
+        let p = dir.join("fake-gh");
+        fs::write(&p, text).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
+        p
+    }
+
+    #[test]
+    fn missing_gh_returns_no_pr_state() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            pr_state_with(
+                &dir.path().join("missing-gh"),
+                dir.path(),
+                "feat/example",
+                PROBE_TIMEOUT
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn non_github_remote_returns_no_pr_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let gh = script(
+            dir.path(),
+            "#!/bin/sh\nprintf '%s\\n' 'none of the git remotes point to a known GitHub host' >&2\nexit 1\n",
+        );
+        assert_eq!(
+            pr_state_with(&gh, dir.path(), "feat/example", PROBE_TIMEOUT),
+            None
+        );
+    }
+
+    #[test]
+    fn slow_gh_times_out_and_returns_no_pr_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let gh = script(dir.path(), "#!/bin/sh\nexec sleep 1\n");
+        let start = Instant::now();
+        assert_eq!(
+            pr_state_with(&gh, dir.path(), "feat/example", Duration::from_millis(40)),
+            None
+        );
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert_eq!(PROBE_TIMEOUT, Duration::from_secs(20));
+    }
+}

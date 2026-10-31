@@ -5,8 +5,10 @@ use herdr_shepherd::{
     config,
     error::ShepherdError,
     herdr::{Herdr, cli::CliHerdr},
-    output, proc,
-    upkeep::regroup,
+    output,
+    probe::SystemProbe,
+    proc,
+    upkeep::{prune, regroup},
 };
 
 #[derive(Parser)]
@@ -31,6 +33,15 @@ enum Commands {
     Version,
     /// Relabel and pack linked worktree workspaces.
     Regroup,
+    /// Report stale worktrees without changing them.
+    Prune {
+        #[arg(long)]
+        no_size: bool,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Validate the resolved shepherd configuration.
     ValidateConfig {
         #[arg(long)]
@@ -66,8 +77,50 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 )
             });
         }
+        Commands::Prune { no_size, all, root } => {
+            let root = root
+                .clone()
+                .unwrap_or_else(|| home().join(".herdr/worktrees"));
+            let h = CliHerdr::from_env();
+            let mut warnings = Vec::new();
+            let ws = h.workspaces().unwrap_or_else(|err| {
+                warnings.push(format!("herdr workspace information unavailable: {err}"));
+                Vec::new()
+            });
+            let agents = h.agents().unwrap_or_else(|err| {
+                warnings.push(format!("herdr agent information unavailable: {err}"));
+                Vec::new()
+            });
+            let entries = prune::scan(&root, &ws, &agents, &SystemProbe, !no_size);
+            let shown: Vec<_> = entries
+                .iter()
+                .filter(|entry| *all || entry.kind != prune::Kind::Open)
+                .collect();
+            output::emit(
+                cli.json,
+                &serde_json::json!({
+                    "entries": shown,
+                    "warnings": warnings,
+                    "total": entries.len(),
+                    "hidden_open": entries.len() - shown.len(),
+                }),
+                || {
+                    let mut report = prune::human_report(&entries, *all);
+                    for warning in &warnings {
+                        report.push_str(&format!("\nwarning: {warning}"));
+                    }
+                    report
+                },
+            );
+        }
     }
     Ok(())
+}
+
+fn home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn project_root_from_cwd() -> Result<PathBuf, ShepherdError> {
