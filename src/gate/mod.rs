@@ -143,6 +143,10 @@ impl Gate {
                         "absolute API URLs are forbidden".into(),
                     ));
                 }
+                let relative = arg.trim_start_matches('/');
+                if relative.starts_with("repos/") {
+                    *arg = relative.to_owned();
+                }
                 *arg = arg.replace("repos/{owner}/{repo}/", &format!("repos/{repository}/"));
                 if arg.starts_with("repos/") && !arg.starts_with(&format!("repos/{repository}/")) {
                     return Err(ShepherdError::PolicyDenied(
@@ -261,6 +265,66 @@ pub fn state_dir() -> PathBuf {
 mod github_scope_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn leading_slash_api_routes_stay_in_snapshot_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let state = dir.path().join("state");
+        std::fs::create_dir(&project).unwrap();
+        let store = crate::store::Store::open(&state, &project).unwrap();
+        store
+            .update(|data| {
+                data.trust = Some(crate::store::ProjectTrust {
+                    project_root: project.clone(),
+                    common_git_dir: project.join(".git"),
+                    origin_url: "https://github.com/trusted/project.git".into(),
+                    push_url: "https://github.com/trusted/project.git".into(),
+                    default_branch: "main".into(),
+                    config_commit: None,
+                    config_blob: None,
+                    config_text: None,
+                    trusted_at: "fixture".into(),
+                    global_config: None,
+                    object_format: "sha1".into(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let script = dir.path().join("gh");
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let gate = Gate {
+            policy: BranchPolicy::new(&[], None, None).unwrap(),
+            ticket_branch: "feat/test".into(),
+            worktree: project,
+            state_dir: state,
+            config_dir: dir.path().join("cfg"),
+        };
+        for route in ["/repos/other/x", "//repos/other/x/pulls/7"] {
+            assert_eq!(
+                gate.gh_using(
+                    &script,
+                    &["api", route],
+                    &gate.worktree,
+                    Duration::from_secs(2)
+                )
+                .unwrap_err()
+                .code(),
+                "policy_denied"
+            );
+        }
+        let own = gate
+            .gh_using(
+                &script,
+                &["api", "/repos/{owner}/{repo}/pulls/7"],
+                &gate.worktree,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        assert!(own.contains("repos/trusted/project/pulls/7"));
+        assert!(!own.contains("/repos/"));
+    }
 
     #[test]
     fn gh_uses_snapshot_in_neutral_directory() {
