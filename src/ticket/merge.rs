@@ -318,12 +318,15 @@ fn handle_with_context(
     let unsafe_work = if ticket.state == TicketState::Revising {
         true
     } else {
-        let transport = PushTransport::open_with_options(
-            state_dir,
-            ticket.worktree.as_deref().unwrap(),
-            transport_options,
-        )?;
-        match unpushed(ticket, status, &transport) {
+        let check = (|| {
+            let transport = PushTransport::open_with_options(
+                state_dir,
+                ticket.worktree.as_deref().unwrap(),
+                transport_options,
+            )?;
+            unpushed(ticket, status, &transport)
+        })();
+        match check {
             Ok(unsafe_work) => unsafe_work,
             Err(error) => {
                 let outcome = escalate(
@@ -720,6 +723,30 @@ mod tests {
                 });
         }
     }
+    #[test]
+    fn transport_open_failure_escalates_and_notifies() {
+        let fixture = Fixture::new(TicketState::PrOpen);
+        fixture
+            .store
+            .update(|data| {
+                data.trust = None;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(fixture.run().unwrap(), MergeOutcome::Escalated);
+        assert_eq!(fixture.ticket().state, TicketState::Blocked);
+        assert!(fixture.path.exists());
+        assert!(
+            fixture
+                .h
+                .fake
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("notify"))
+        );
+    }
+
     #[test]
     fn cleanup_uses_snapshot_despite_mutated_origin() {
         let fixture = Fixture::new(TicketState::PrOpen);
