@@ -322,6 +322,47 @@ fn stored_revision(repo: &Repo) -> Store {
 }
 
 #[test]
+fn revision_coder_prompt_keeps_writing_rules() {
+    if !local_transport_enabled("revision_coder_prompt_keeps_writing_rules") {
+        return;
+    }
+    let repo = Repo::new();
+    let store = stored_revision(&repo);
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+    let gh = PushBackend::new(&repo);
+    let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+    let herdr_shepherd::ticket::revise::RevisionOutcome::Started { agent, role } =
+        resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "now").unwrap()
+    else {
+        panic!("expected revision coder");
+    };
+    assert_eq!(role, "coder");
+    let data = store.read().unwrap();
+    let task = &data
+        .agents
+        .iter()
+        .find(|record| record.name == agent)
+        .unwrap()
+        .task;
+    for rule in [
+        "test-first",
+        "Use conventional commits",
+        "type(scope)",
+        "imperative subject under 50 characters",
+        "body explaining why",
+        "Do not add AI attribution or Co-Authored-By trailers",
+        "report concrete evidence",
+        "delegate code fixes back through the shepherd",
+        "Never commit report files",
+    ] {
+        assert!(task.contains(rule), "missing revision writing rule: {rule}");
+    }
+    assert!(task.contains("Fix the reviewed edge case"));
+    assert!(task.contains("New diff:"));
+    assert!(task.contains("Revision "));
+}
+
+#[test]
 fn revision_runs_coder_reviewer_then_qa() {
     if !local_transport_enabled("revision_runs_coder_reviewer_then_qa") {
         return;
