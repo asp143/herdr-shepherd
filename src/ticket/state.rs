@@ -43,6 +43,7 @@ pub fn transition_with_limit(
             | (ReadyForPr, CiWait | PrOpen)
             | (CiWait, Building | PrOpen)
             | (PrOpen, Revising | Merged | Closed)
+            | (Building | Reviewing | Qa | ReadyForPr | CiWait, Merged)
             | (Revising, Building | Reviewing | Qa | CiWait | PrOpen)
             | (Merged, CleanedUp)
             | (ReadyForPr | PrOpen | Merged, Blocked)
