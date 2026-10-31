@@ -161,6 +161,7 @@ pub fn cancel(
 
 pub struct StartTicketOptions<'a> {
     pub state_dir: &'a Path,
+    pub config_dir: &'a Path,
     pub bin: &'a Path,
     pub settings: &'a crate::roles::ShepherdSettings,
     pub now: &'a str,
@@ -176,7 +177,37 @@ pub fn start_ticket(
 ) -> Result<Ticket, ShepherdError> {
     use crate::store::{BlockedReason, TicketState};
 
+    let preflight = store.read()?;
+    let at_capacity = |data: &crate::store::StoreData| {
+        data.agents
+            .iter()
+            .filter(|agent| {
+                agent.role != "lead"
+                    && matches!(
+                        agent.status,
+                        crate::store::AgentStatus::Starting
+                            | crate::store::AgentStatus::Working
+                            | crate::store::AgentStatus::Blocked
+                    )
+            })
+            .count()
+            >= options.settings.max_parallel_agents
+    };
+    if at_capacity(&preflight) {
+        return Err(ShepherdError::Capacity);
+    }
+    if !super::scheduler::next_actions(&preflight, options.settings)
+        .contains(&super::scheduler::Action::StartTicket(id.into()))
+    {
+        return Err(ShepherdError::Usage(format!(
+            "ticket {id} is not queued with an available scheduling slot"
+        )));
+    }
+    crate::trusted::ensure_snapshot(options.state_dir, &preflight.project_root)?;
     let (project, ticket) = store.update(|data| {
+        if at_capacity(data) {
+            return Err(ShepherdError::Capacity);
+        }
         if !super::scheduler::next_actions(data, options.settings)
             .contains(&super::scheduler::Action::StartTicket(id.into()))
         {
@@ -261,7 +292,13 @@ pub fn start_ticket(
             ticket.workspace_id = Some(workspace.workspace_id.clone());
             Ok(())
         })?;
-        crate::gate::hook::install(&path, &ticket.branch, options.state_dir, options.bin)?;
+        crate::gate::hook::install_configured(
+            &path,
+            &ticket.branch,
+            options.state_dir,
+            options.bin,
+            options.config_dir,
+        )?;
         if project.join("node_modules").is_dir() && !path.join("node_modules").exists() {
             let output = crate::proc::capture(
                 Command::new("cp")
@@ -445,8 +482,16 @@ mod tests {
         let h = crate::herdr::fake::FakeHerdr::new(vec![]);
         let settings = crate::roles::ShepherdSettings::default();
         let bin = std::env::current_exe().unwrap();
+        let config_dir = dir.path().join("selected-config");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("shepherd.toml"),
+            "[shepherd]\nprotected_branches=['feat/t1']\n",
+        )
+        .unwrap();
         let options = StartTicketOptions {
             state_dir: &state_dir,
+            config_dir: &config_dir,
             bin: &bin,
             settings: &settings,
             now: "after",
@@ -468,5 +513,10 @@ mod tests {
         );
         assert!(start_ticket(&h, &store, "T1", &options).is_err());
         assert_eq!(h.workspaces.borrow().len(), 1);
+        let hook = std::fs::read_to_string(state_dir.join("hooks/pre-push")).unwrap();
+        assert!(hook.contains(&format!(
+            "--config-dir {}",
+            crate::gate::shim::shell_quote(&config_dir)
+        )));
     }
 }
