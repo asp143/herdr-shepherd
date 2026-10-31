@@ -9,7 +9,7 @@ fn manifest_parses_and_matches_crate() {
         Some(env!("CARGO_PKG_VERSION"))
     );
     assert_eq!(manifest["min_herdr_version"].as_str(), Some("0.9.5"));
-    for section in ["build", "actions", "events"] {
+    for section in ["build", "actions", "events", "startup"] {
         for item in manifest[section].as_array().unwrap() {
             let command = item["command"].as_array().unwrap();
             assert!(matches!(
@@ -25,5 +25,15 @@ fn manifest_parses_and_matches_crate() {
         .map(|event| event["on"].as_str().unwrap())
         .collect();
     assert_eq!(events, ["worktree.created", "worktree.removed"]);
+    assert_eq!(manifest["startup"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        manifest["startup"][0]["command"],
+        toml::Value::Array(
+            ["bin/herdr-shepherd", "watch", "--detach"]
+                .into_iter()
+                .map(|v| toml::Value::String(v.into()))
+                .collect()
+        )
+    );
     assert!(!manifest.contains_key("keys"));
 }

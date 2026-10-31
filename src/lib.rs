@@ -9,3 +9,4 @@ pub mod output;
 pub mod probe;
 pub mod proc;
 pub mod upkeep;
+pub mod watch;

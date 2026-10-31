@@ -33,3 +33,6 @@ command = ["bin/herdr-shepherd", "event"]
 [[events]]
 on = "worktree.removed"
 command = ["bin/herdr-shepherd", "event"]
+
+[[startup]]
+command = ["bin/herdr-shepherd", "watch", "--detach"]

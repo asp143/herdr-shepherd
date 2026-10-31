@@ -35,6 +35,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Poll linked-worktree PRs and report sidebar metadata.
+    Watch {
+        #[arg(long, conflicts_with = "detach")]
+        once: bool,
+        #[arg(long)]
+        detach: bool,
+        #[arg(long)]
+        interval: Option<u64>,
+    },
     /// Install or run the per-worktree push guard.
     Hook {
         #[command(subcommand)]
@@ -107,6 +116,27 @@ fn state_dir(cli: &Cli) -> PathBuf {
 
 fn run(cli: &Cli) -> Result<(), ShepherdError> {
     match &cli.command {
+        Commands::Watch {
+            once,
+            detach,
+            interval,
+        } => {
+            let config_dir = config::resolve_config_dir(cli.config_dir.as_deref());
+            let cfg = config::load(&config_dir, None)?;
+            let outcome = if *detach {
+                herdr_shepherd::watch::detach(&state_dir(cli), Some(&config_dir), *interval)?
+            } else {
+                herdr_shepherd::watch::run(
+                    &state_dir(cli),
+                    &CliHerdr::from_env(),
+                    &herdr_shepherd::github::gh::GhBackend,
+                    &cfg,
+                    *once,
+                    *interval,
+                )?
+            };
+            output::emit(cli.json, &outcome, || outcome.status.clone());
+        }
         Commands::Hook { command } => match command {
             HookCommand::Install { worktree, branch } => {
                 herdr_shepherd::gate::hook::install(
