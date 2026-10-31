@@ -2,6 +2,8 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 fn git(path: &Path, args: &[&str]) {
     let out = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .current_dir(path)
         .args(args)
         .output()
@@ -65,7 +67,9 @@ esac
     fs::write(&body, "ordinary body\n").unwrap();
     let command = |sub: &str| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"));
-        cmd.env("PATH", &bin)
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("PATH", &bin)
             .env("HERDR_PLUGIN_CONFIG_DIR", dir.path().join("config"))
             .env("SHEPHERD_TEST_ARGS", &args)
             .env(

@@ -40,6 +40,12 @@ impl Gate {
         Self::execute(
             Command::new("git")
                 .current_dir(&self.worktree)
+                .args([
+                    "-c",
+                    "push.followTags=false",
+                    "-c",
+                    &format!("remote.{}.mirror=false", target.remote),
+                ])
                 .arg("push")
                 .args(args),
             Duration::from_secs(120),

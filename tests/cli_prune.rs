@@ -7,7 +7,9 @@ use std::{
 
 fn command() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"));
-    cmd.env("HERDR_SOCKET_PATH", "/nonexistent/sock")
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HERDR_SOCKET_PATH", "/nonexistent/sock")
         .env("HERDR_BIN_PATH", "/nonexistent/herdr");
     cmd
 }
@@ -51,6 +53,8 @@ fn never_writes() {
     fs::create_dir_all(&git).unwrap();
     assert!(
         Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .args(["init", "--quiet", "--initial-branch", "feat/one"])
             .arg(&git)
             .status()
@@ -65,6 +69,8 @@ fn never_writes() {
         vec!["commit", "-m", "fixture"],
     ] {
         let out = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .current_dir(&git)
             .args(args)
             .output()

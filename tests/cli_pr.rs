@@ -6,6 +6,8 @@ use std::{
 
 fn git(path: &Path, args: &[&str]) -> Output {
     let out = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .current_dir(path)
         .args(args)
         .output()
@@ -53,6 +55,8 @@ fn view_without_gh_is_github_unavailable() {
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("PATH", &bin)
         .env("HERDR_PLUGIN_CONFIG_DIR", dir.path().join("config"))
         .args(["--json", "pr", "view", "--worktree"])
@@ -74,6 +78,8 @@ fn pr_push_to_protected_denied() {
     let dir = tempfile::tempdir().unwrap();
     repo(dir.path(), "main");
     let out = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("HERDR_PLUGIN_CONFIG_DIR", dir.path().join("config"))
         .args(["--json", "pr", "push", "--worktree"])
         .arg(dir.path())
@@ -157,6 +163,8 @@ esac
     fn command(&self, subcommand: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"));
         command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("PATH", &self.bin)
             .env("HERDR_PLUGIN_CONFIG_DIR", &self.config)
             .env("SHEPHERD_TEST_ARGS", &self.args)

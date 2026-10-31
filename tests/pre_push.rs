@@ -7,6 +7,8 @@ use std::{
 
 fn git(path: &Path, args: &[&str]) -> Output {
     Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .current_dir(path)
         .args(args)
         .output()
