@@ -2,6 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     os::unix::fs::OpenOptionsExt,
     path::Path,
+    time::{Duration, Instant},
 };
 
 use crate::error::ShepherdError;
@@ -12,6 +13,21 @@ pub struct LockGuard {
 
 pub fn acquire(state_dir: &Path) -> Result<Option<LockGuard>, ShepherdError> {
     acquire_named(state_dir, "watch.lock")
+}
+
+/// Re-exec startup may race the launcher's brief readiness probe lock.
+/// Only detached children use this bounded retry; foreground duplicates exit.
+pub(super) fn acquire_child(state_dir: &Path) -> Result<Option<LockGuard>, ShepherdError> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(guard) = acquire(state_dir)? {
+            return Ok(Some(guard));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 pub(super) fn acquire_named(

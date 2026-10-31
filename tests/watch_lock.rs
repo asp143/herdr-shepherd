@@ -75,3 +75,70 @@ fn detach_handshake_prevents_duplicate_pollers() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
+
+#[test]
+fn detached_child_retries_transient_parent_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(config.join("shepherd.toml"), "[upkeep]\npr_status=false\n").unwrap();
+    let guard = herdr_shepherd::watch::lock::acquire(dir.path())
+        .unwrap()
+        .unwrap();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+        .args(["--json", "--state-dir"])
+        .arg(dir.path())
+        .arg("--config-dir")
+        .arg(&config)
+        .args(["watch", "--once"])
+        .env("SHEPHERD_WATCH_DETACHED", "1")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    drop(guard);
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["data"]["status"], "completed");
+}
+
+#[test]
+fn detach_rotates_watch_log_past_five_mib() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(config.join("shepherd.toml"), "[upkeep]\npr_status=false\n").unwrap();
+    let log = std::fs::File::create(dir.path().join("watch.log")).unwrap();
+    let old_size = 5 * 1024 * 1024 + 1;
+    log.set_len(old_size).unwrap();
+    drop(log);
+    std::fs::write(dir.path().join("watch.log.1"), "older log").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+        .args(["--json", "--state-dir"])
+        .arg(dir.path())
+        .arg("--config-dir")
+        .arg(&config)
+        .args(["watch", "--detach", "--interval", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let _child = DetachedChild(value["data"]["pid"].as_u64().unwrap() as u32);
+    assert_eq!(
+        std::fs::metadata(dir.path().join("watch.log.1"))
+            .unwrap()
+            .len(),
+        old_size
+    );
+    assert!(
+        std::fs::metadata(dir.path().join("watch.log"))
+            .unwrap()
+            .len()
+            < 5 * 1024 * 1024
+    );
+}

@@ -207,7 +207,12 @@ pub fn run(
     once: bool,
     interval: Option<u64>,
 ) -> Result<WatchOutcome, ShepherdError> {
-    let Some(_guard) = lock::acquire(state_dir)? else {
+    let guard = if std::env::var_os("SHEPHERD_WATCH_DETACHED").is_some_and(|value| value == "1") {
+        lock::acquire_child(state_dir)?
+    } else {
+        lock::acquire(state_dir)?
+    };
+    let Some(_guard) = guard else {
         return Ok(already_running());
     };
     let interval = interval
@@ -265,11 +270,22 @@ pub fn detach(
             "watch interval must be positive".into(),
         ));
     }
+    // Launchers serialize this rotation with watch-launch.lock. Keep one
+    // previous log and start a fresh file for the new detached process.
+    let log_path = state_dir.join("watch.log");
+    match fs::metadata(&log_path) {
+        Ok(metadata) if metadata.len() > 5 * 1024 * 1024 => {
+            fs::rename(&log_path, state_dir.join("watch.log.1")).map_err(anyhow::Error::from)?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(anyhow::Error::from(error).into()),
+    }
     let log = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(state_dir.join("watch.log"))
+        .open(log_path)
         .map_err(anyhow::Error::from)?;
     let mut command = Command::new("setsid");
     command
@@ -284,6 +300,7 @@ pub fn detach(
         command.arg("--interval").arg(seconds.to_string());
     }
     let mut child = command
+        .env("SHEPHERD_WATCH_DETACHED", "1")
         .stdin(Stdio::null())
         .stdout(log.try_clone().map_err(anyhow::Error::from)?)
         .stderr(log)
