@@ -184,3 +184,53 @@ fn cli_comments_reply_and_revise_share_store() {
     assert_eq!(t.state, TicketState::Revising);
     assert_eq!(t.comments[0].verdict.as_deref(), Some("accepted"));
 }
+
+#[test]
+fn cli_comment_kind_selects_colliding_ids() {
+    let (dir, store) = fixture();
+    store
+        .update(|data| {
+            data.tickets[0].comments.push(CommentRecord {
+                id: 1,
+                review: false,
+                author: "issue-author".into(),
+                body: "Issue question".into(),
+                ..Default::default()
+            });
+            data.tickets[0].comments.push(CommentRecord {
+                id: 1,
+                review: false,
+                kind: Some(herdr_shepherd::github::CommentKind::ReviewBody),
+                author: "review-author".into(),
+                body: "Changes requested".into(),
+                ..Default::default()
+            });
+            Ok(())
+        })
+        .unwrap();
+    let body = dir.path().join("reply.txt");
+    fs::write(&body, "The issue is covered by the boundary test.").unwrap();
+    let result = run(
+        dir.path(),
+        &[
+            "reply",
+            "T-1",
+            "--comment",
+            "1",
+            "--kind",
+            "issue",
+            "--body-file",
+            body.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let saved = store.read().unwrap();
+    assert!(!saved.tickets[0].comments[0].triaged);
+    assert!(saved.tickets[0].comments[1].triaged);
+    assert!(!saved.tickets[0].comments[2].triaged);
+}

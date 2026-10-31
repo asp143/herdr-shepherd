@@ -100,9 +100,25 @@ impl Gate {
     fn github_command(&self, executable: &Path, args: &[&str]) -> Result<Command, ShepherdError> {
         check_gh(args)?;
         let repository = self.github_repository()?;
+        if args.iter().any(|arg| {
+            *arg == "--repo"
+                || arg.starts_with("--repo=")
+                || arg.starts_with("-R")
+                || *arg == "--hostname"
+                || arg.starts_with("--hostname=")
+        }) {
+            return Err(ShepherdError::PolicyDenied(
+                "repository and host overrides are forbidden".into(),
+            ));
+        }
         let mut scoped: Vec<String> = args.iter().map(|arg| (*arg).into()).collect();
         if args.first() == Some(&"api") {
             for arg in &mut scoped {
+                if arg.starts_with("http://") || arg.starts_with("https://") {
+                    return Err(ShepherdError::PolicyDenied(
+                        "absolute API URLs are forbidden".into(),
+                    ));
+                }
                 *arg = arg.replace("repos/{owner}/{repo}/", &format!("repos/{repository}/"));
                 if arg.starts_with("repos/") && !arg.starts_with(&format!("repos/{repository}/")) {
                     return Err(ShepherdError::PolicyDenied(
@@ -294,5 +310,22 @@ mod github_scope_tests {
             )
             .is_err()
         );
+        for args in [
+            vec!["pr", "view", "feat/test", "--repo", "evil/project"],
+            vec!["pr", "view", "feat/test", "-Revil/project"],
+            vec!["api", "https://evil.invalid/repos/trusted/project/pulls/7"],
+            vec![
+                "api",
+                "repos/trusted/project/pulls/7",
+                "--hostname",
+                "evil.invalid",
+            ],
+        ] {
+            assert!(
+                gate.gh_using(&script, &args, &gate.worktree, Duration::from_secs(2))
+                    .is_err(),
+                "{args:?}"
+            );
+        }
     }
 }

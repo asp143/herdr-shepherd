@@ -136,6 +136,7 @@ case "$1 $2" in
   'repo view') printf '%s\n' 'example/repo' ;;
   'pr comment') /bin/cat > "$SHEPHERD_TEST_INPUT" ;;
   'api user') printf '%s\n' 'fixture-author' ;;
+  'api -X') /bin/cat > "$SHEPHERD_TEST_INPUT"; printf '%s\n' '{"id":999}' ;;
   *) printf '%s\n' '{}' ;;
 esac
 "#).unwrap();
@@ -223,6 +224,23 @@ esac
             .arg(&self.repo);
         command
     }
+}
+
+#[test]
+fn backend_uses_explicit_state_directory() {
+    let fixture = FakeGh::new();
+    let out = fixture
+        .command("view")
+        .env_remove("HERDR_PLUGIN_STATE_DIR")
+        .args(["--state-dir"])
+        .arg(fixture._dir.path().join("state"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 #[test]
@@ -323,7 +341,17 @@ fn backend_reply_uses_general_and_thread_forms() {
     );
     let args = fs::read_to_string(&fixture.args).unwrap();
     assert!(args.contains("pr\ncomment\n42\n--body-file\n-\n"), "{args}");
-    assert!(args.contains("api\n-X\nPOST\nrepos/example/repo/pulls/42/comments/123/replies\n-f\nbody=A literal reply: $(unchanged) 'quoted'\nsecond line\n"),"{args}");
+    assert!(
+        args.contains(
+            "api\n-X\nPOST\nrepos/example/repo/pulls/42/comments/123/replies\n-F\nbody=@-\n"
+        ),
+        "{args}"
+    );
+    assert!(!args.contains("body=A literal reply"));
+    assert_eq!(
+        fs::read(&fixture.input).unwrap(),
+        fs::read(&fixture.body).unwrap()
+    );
 }
 
 #[test]

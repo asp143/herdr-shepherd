@@ -81,6 +81,9 @@ pub fn transition_with_limit(
             reason = Some(BlockedReason::LoopCap);
         }
     }
+    if matches!(t.state, CiWait | PrOpen) && !matches!(to, CiWait | PrOpen) {
+        t.pr_reviewers_pending.clear();
+    }
     t.history.push(crate::store::Transition {
         from: t.state,
         to,
@@ -106,6 +109,26 @@ pub fn is_active(s: TicketState) -> bool {
 mod tests {
     use super::*;
     use TicketState::*;
+
+    #[test]
+    fn pending_reviewers_clear_when_leaving_pr_wait() {
+        for (from, to) in [(CiWait, Building), (PrOpen, Revising), (PrOpen, Merged)] {
+            let mut ticket = Ticket {
+                state: from,
+                pr_reviewers_pending: vec!["owner".into()],
+                ..Ticket::default()
+            };
+            transition(&mut ticket, to, None, "now").unwrap();
+            assert!(ticket.pr_reviewers_pending.is_empty());
+        }
+        let mut ticket = Ticket {
+            state: CiWait,
+            pr_reviewers_pending: vec!["owner".into()],
+            ..Ticket::default()
+        };
+        transition(&mut ticket, PrOpen, None, "now").unwrap();
+        assert_eq!(ticket.pr_reviewers_pending, ["owner"]);
+    }
 
     #[test]
     fn happy_path_edges() {

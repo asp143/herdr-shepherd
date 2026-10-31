@@ -202,6 +202,8 @@ pub struct LeadRecord {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CommentRecord {
+    #[serde(default)]
+    pub kind: Option<crate::github::CommentKind>,
     pub id: u64,
     pub author: String,
     pub path: Option<String>,
@@ -217,6 +219,16 @@ pub struct CommentRecord {
     pub acknowledged: bool,
     #[serde(default = "review_comment")]
     pub review: bool,
+}
+
+impl CommentRecord {
+    pub fn comment_kind(&self) -> crate::github::CommentKind {
+        self.kind.unwrap_or(if self.review {
+            crate::github::CommentKind::Review
+        } else {
+            crate::github::CommentKind::Issue
+        })
+    }
 }
 
 fn review_comment() -> bool {

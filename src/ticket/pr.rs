@@ -7,7 +7,7 @@ use crate::{
     config::Config,
     error::ShepherdError,
     gate::{Gate, check_push, parse_push_args},
-    github::{PrBackend, PrStatus, codeowners},
+    github::{CommentKind, PrBackend, PrStatus, codeowners},
     store::{CommentRecord, Store, Ticket, TicketState},
 };
 
@@ -19,6 +19,7 @@ Check each comment against the actual code and reproduce the issue where possibl
 If a comment is not relevant, use ticket reply <id> --comment <cid> --body-file <p>
 with the reason and evidence. For a legitimate issue, use ticket revise <id>
 --comments <cid,cid> --task-file <p> to send the fix through the flock.
+Use --kind review|issue|review-body when numeric comment ids collide.
 After a revision is pushed, use ticket ack <id> --comment <cid> --body-file <p>
 to explain the change and include the pushed commit SHA.
 never resolve threads. Never request changes, approve, or merge.
@@ -76,12 +77,12 @@ fn authorize(ticket: &Ticket, gate: &Gate) -> Result<(), ShepherdError> {
     )
 }
 
-fn selected(ticket: &Ticket, id: u64) -> Result<usize, ShepherdError> {
+fn selected(ticket: &Ticket, id: u64, kind: Option<CommentKind>) -> Result<usize, ShepherdError> {
     let found: Vec<_> = ticket
         .comments
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.id == id)
+        .filter(|(_, c)| c.id == id && kind.is_none_or(|kind| c.comment_kind() == kind))
         .map(|(i, _)| i)
         .collect();
     match found.as_slice() {
@@ -324,7 +325,9 @@ pub fn comments(
             .expect("validated ticket");
         for c in fresh {
             if t.posted_replies.iter().any(|posted| {
-                (posted.review == c.review && posted.id == Some(c.id))
+                (posted.review == (c.comment_kind() == CommentKind::Review)
+                    && c.comment_kind() != CommentKind::ReviewBody
+                    && posted.id == Some(c.id))
                     || (posted.author.eq_ignore_ascii_case(&c.author) && posted.body == c.body)
             }) {
                 continue;
@@ -332,9 +335,10 @@ pub fn comments(
             if !t
                 .comments
                 .iter()
-                .any(|stored| stored.id == c.id && stored.review == c.review)
+                .any(|stored| stored.id == c.id && stored.comment_kind() == c.comment_kind())
             {
                 t.comments.push(CommentRecord {
+                    kind: Some(c.comment_kind()),
                     id: c.id,
                     author: c.author,
                     path: c.path,
@@ -364,6 +368,19 @@ pub fn reply(
     cid: u64,
     body: &str,
 ) -> Result<Ticket, ShepherdError> {
+    reply_with_kind(store, gh, gate, id, cid, body, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn reply_with_kind(
+    store: &Store,
+    gh: &dyn PrBackend,
+    gate: &Gate,
+    id: &str,
+    cid: u64,
+    body: &str,
+    kind: Option<CommentKind>,
+) -> Result<Ticket, ShepherdError> {
     validate_body(body)?;
     let _dispatch = super::revise::dispatch_lock(store, id)?;
     let mut snapshot = store.read()?;
@@ -374,7 +391,7 @@ pub fn reply(
         if t.state != TicketState::PrOpen {
             return Err(ShepherdError::Usage("triage requires pr_open".into()));
         }
-        let index = selected(t, cid)?;
+        let index = selected(t, cid, kind)?;
         if t.comments[index].triaged {
             return Err(ShepherdError::Usage("comment already triaged".into()));
         }
@@ -403,7 +420,7 @@ pub fn reply(
             .iter_mut()
             .find(|t| t.id == id)
             .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
-        let index = selected(t, cid)?;
+        let index = selected(t, cid, kind)?;
         t.comments[index] = updated.comments[index].clone();
         t.posted_replies = updated.posted_replies.clone();
         Ok(t.clone())
@@ -418,6 +435,19 @@ pub fn revise(
     now: &str,
     cap: u32,
 ) -> Result<Ticket, ShepherdError> {
+    revise_with_kind(store, id, cids, task, now, cap, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn revise_with_kind(
+    store: &Store,
+    id: &str,
+    cids: &[u64],
+    task: &str,
+    now: &str,
+    cap: u32,
+    kind: Option<CommentKind>,
+) -> Result<Ticket, ShepherdError> {
     if task.trim().is_empty() || task.chars().count() > 60_000 || cids.is_empty() {
         return Err(ShepherdError::Usage(
             "revision needs comments and a nonempty task of at most 60000 characters".into(),
@@ -431,7 +461,7 @@ pub fn revise(
         }
         let mut indices = Vec::new();
         for cid in cids {
-            let index = selected(t, *cid)?;
+            let index = selected(t, *cid, kind)?;
             if indices.contains(&index) || t.comments[index].triaged {
                 return Err(ShepherdError::Usage(
                     "comments must be unique and untriaged".into(),
@@ -462,6 +492,19 @@ pub fn ack(
     cid: u64,
     body: &str,
 ) -> Result<Ticket, ShepherdError> {
+    ack_with_kind(store, gh, gate, id, cid, body, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ack_with_kind(
+    store: &Store,
+    gh: &dyn PrBackend,
+    gate: &Gate,
+    id: &str,
+    cid: u64,
+    body: &str,
+    kind: Option<CommentKind>,
+) -> Result<Ticket, ShepherdError> {
     validate_body(body)?;
     let _dispatch = super::revise::dispatch_lock(store, id)?;
     let mut snapshot = store.read()?;
@@ -474,7 +517,7 @@ pub fn ack(
                 "ack requires a pushed revision".into(),
             ));
         }
-        let index = selected(t, cid)?;
+        let index = selected(t, cid, kind)?;
         let c = &t.comments[index];
         if c.verdict.as_deref() != Some("accepted")
             || c.acknowledged
@@ -511,7 +554,7 @@ pub fn ack(
             .iter_mut()
             .find(|t| t.id == id)
             .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
-        let index = selected(t, cid)?;
+        let index = selected(t, cid, kind)?;
         t.comments[index] = updated.comments[index].clone();
         t.posted_replies = updated.posted_replies.clone();
         Ok(t.clone())
@@ -686,6 +729,7 @@ mod tests {
                 line: None,
                 body: "Check".into(),
                 review: true,
+                kind: None,
             },
             crate::github::PrComment {
                 id: 2,
@@ -694,6 +738,7 @@ mod tests {
                 line: None,
                 body: "New".into(),
                 review: false,
+                kind: None,
             },
         ]);
         let new = comments(&store, &gh, "T-1", true).unwrap();
@@ -743,6 +788,7 @@ mod tests {
                     path: None,
                     line: None,
                     review: true,
+                    kind: None,
                 },
                 crate::github::PrComment {
                     id: 501,
@@ -751,6 +797,7 @@ mod tests {
                     path: None,
                     line: None,
                     review: true,
+                    kind: None,
                 },
                 crate::github::PrComment {
                     id: 502,
@@ -759,6 +806,7 @@ mod tests {
                     path: None,
                     line: None,
                     review: true,
+                    kind: None,
                 },
             ]);
             let new = comments(&store, &gh, "T-1", true).unwrap();

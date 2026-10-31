@@ -74,7 +74,7 @@ pub fn cached_protection(
             ..Default::default()
         };
     }
-    if cache.default_checked_at.is_none_or(|at| !fresh(at, now)) {
+    if cache.default_error.is_some() || cache.default_checked_at.is_none_or(|at| !fresh(at, now)) {
         cache.default_checked_at = Some(now);
         match data
             .trust
@@ -103,10 +103,14 @@ pub fn cached_protection(
     }
     let mut warnings = Vec::new();
     for branch in branches {
-        let current = cache
-            .branches
-            .iter()
-            .find(|entry| entry.branch == branch && fresh(entry.checked_at, now));
+        let current = cache.branches.iter().find(|entry| {
+            entry.branch == branch
+                && fresh(entry.checked_at, now)
+                && !entry
+                    .warning
+                    .as_ref()
+                    .is_some_and(|warning| warning.reason.starts_with("unknown:"))
+        });
         let warning = if let Some(entry) = current {
             entry.warning.clone()
         } else {
@@ -114,11 +118,16 @@ pub fn cached_protection(
                 .into_iter()
                 .next();
             cache.branches.retain(|entry| entry.branch != branch);
-            cache.branches.push(ProtectionCacheEntry {
-                branch,
-                checked_at: now,
-                warning: warning.clone(),
-            });
+            if warning
+                .as_ref()
+                .is_none_or(|warning| !warning.reason.starts_with("unknown:"))
+            {
+                cache.branches.push(ProtectionCacheEntry {
+                    branch,
+                    checked_at: now,
+                    warning: warning.clone(),
+                });
+            }
             warning
         };
         warnings.extend(warning);
@@ -359,6 +368,24 @@ mod tests {
                 .starts_with("unknown:")
         );
     }
+    #[test]
+    fn unknown_results_retry_on_next_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state"), dir.path()).unwrap();
+        let gh = backend(Err("offline"));
+        assert_eq!(
+            cached_protection(&store, &gh, "main", 100).unwrap()[0].reason,
+            "unknown: offline"
+        );
+        gh.protected.borrow_mut().insert("main".into(), Ok(true));
+        assert!(
+            cached_protection(&store, &gh, "main", 101)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(reads(&gh), 2);
+    }
+
     #[test]
     fn cached_for_24h() {
         let dir = tempfile::tempdir().unwrap();

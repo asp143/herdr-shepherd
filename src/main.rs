@@ -155,6 +155,8 @@ enum TicketCommands {
         id: String,
         #[arg(long)]
         comment: u64,
+        #[arg(long, value_enum)]
+        kind: Option<herdr_shepherd::github::CommentKind>,
         #[arg(long)]
         body_file: PathBuf,
     },
@@ -162,6 +164,8 @@ enum TicketCommands {
         id: String,
         #[arg(long, value_delimiter = ',')]
         comments: Vec<u64>,
+        #[arg(long, value_enum)]
+        kind: Option<herdr_shepherd::github::CommentKind>,
         #[arg(long)]
         task_file: PathBuf,
     },
@@ -169,6 +173,8 @@ enum TicketCommands {
         id: String,
         #[arg(long)]
         comment: u64,
+        #[arg(long, value_enum)]
+        kind: Option<herdr_shepherd::github::CommentKind>,
         #[arg(long)]
         body_file: PathBuf,
     },
@@ -334,7 +340,7 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 .map_or(0, |d| d.as_secs());
             herdr_shepherd::github::protection::refresh_status(
                 &store,
-                github_client()?.as_ref(),
+                github_client(&state)?.as_ref(),
                 now,
             )?;
             let report = herdr_shepherd::lead::status(herdr_client()?.as_ref(), &store, &cfg)?;
@@ -394,7 +400,7 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
             let h = CliHerdr::from_env();
             let preflight = herdr_shepherd::cleanup::preflight_with_state(
                 &h,
-                &herdr_shepherd::github::gh::GhBackend,
+                github_client(&state_dir(cli))?.as_ref(),
                 &cfg,
                 Path::new(&root),
                 *force_discard,
@@ -419,7 +425,7 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 herdr_shepherd::watch::run_with_config_dir(
                     &state_dir(cli),
                     &CliHerdr::from_env(),
-                    &herdr_shepherd::github::gh::GhBackend,
+                    github_client(&state_dir(cli))?.as_ref(),
                     &cfg,
                     *once,
                     *interval,
@@ -586,7 +592,7 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                     )?;
                     let result = cli_ticket::dispatch_with_backend(
                         herdr_client()?.as_ref(),
-                        github_client()?.as_ref(),
+                        github_client(&state_dir(cli))?.as_ref(),
                         &store,
                         &cfg,
                         &state_dir(cli),
@@ -882,14 +888,18 @@ fn main() {
     }
 }
 
-fn github_client() -> Result<Box<dyn herdr_shepherd::github::PrBackend>, ShepherdError> {
+fn github_client(
+    state: &Path,
+) -> Result<Box<dyn herdr_shepherd::github::PrBackend>, ShepherdError> {
     #[cfg(debug_assertions)]
     if let Some(directory) = std::env::var_os("SHEPHERD_FAKE_GITHUB") {
         return Ok(Box::new(herdr_shepherd::github::fake::DiskBackend::open(
             Path::new(&directory),
         )?));
     }
-    Ok(Box::new(herdr_shepherd::github::gh::GhBackend))
+    Ok(Box::new(herdr_shepherd::github::gh::GhBackend::with_state(
+        state,
+    )))
 }
 
 fn run_ticket_pr(
@@ -955,10 +965,11 @@ fn run_ticket_pr(
     if let TicketCommands::Revise {
         comments,
         task_file,
+        kind,
         ..
     } = command
     {
-        let t = pr::revise(
+        let t = pr::revise_with_kind(
             &store,
             id,
             comments,
@@ -967,10 +978,11 @@ fn run_ticket_pr(
             herdr_shepherd::roles::resolve(&cfg)?
                 .shepherd
                 .max_revision_rounds,
+            *kind,
         )?;
         return serde_json::to_value(t).map_err(|e| anyhow::Error::from(e).into());
     }
-    let gh = github_client()?;
+    let gh = github_client(&state)?;
     if let TicketCommands::Comments { new, .. } = command {
         return serde_json::to_value(pr::comments(&store, gh.as_ref(), id, *new)?)
             .map_err(|e| anyhow::Error::from(e).into());
@@ -996,21 +1008,23 @@ fn run_ticket_pr(
                 &herdr_shepherd::launch::now(),
             )?
         }
-        TicketCommands::Reply { comment, .. } => pr::reply(
+        TicketCommands::Reply { comment, kind, .. } => pr::reply_with_kind(
             &store,
             gh.as_ref(),
             &gate,
             id,
             *comment,
             body.as_deref().expect("read body"),
+            *kind,
         )?,
-        TicketCommands::Ack { comment, .. } => pr::ack(
+        TicketCommands::Ack { comment, kind, .. } => pr::ack_with_kind(
             &store,
             gh.as_ref(),
             &gate,
             id,
             *comment,
             body.as_deref().expect("read body"),
+            *kind,
         )?,
         _ => unreachable!("handled PR command"),
     };

@@ -9,13 +9,40 @@ use crate::{
     gate::{BranchPolicy, Gate},
 };
 
-pub struct GhBackend;
+#[derive(Default)]
+pub struct GhBackend {
+    state_dir: Option<std::path::PathBuf>,
+}
+
+// Preserve the default-backend value used by existing embedding callers.
+#[allow(non_upper_case_globals)]
+pub const GhBackend: GhBackend = GhBackend { state_dir: None };
 
 fn unavailable(error: impl std::fmt::Display) -> ShepherdError {
     ShepherdError::GithubUnavailable(error.to_string())
 }
 
 impl GhBackend {
+    pub fn with_state(state_dir: &Path) -> Self {
+        Self {
+            state_dir: Some(state_dir.into()),
+        }
+    }
+    fn state_dir(&self) -> std::path::PathBuf {
+        self.state_dir
+            .clone()
+            .unwrap_or_else(crate::gate::state_dir)
+    }
+    fn read_gate(&self, worktree: &Path) -> Result<Gate, ShepherdError> {
+        Ok(Gate {
+            policy: BranchPolicy::new(&[], None, None)?,
+            ticket_branch: String::new(),
+            worktree: worktree.into(),
+            state_dir: self.state_dir(),
+            config_dir: crate::config::resolve_config_dir(None),
+        })
+    }
+
     pub fn create_args(base: &str, title: &str, body_file: &str) -> Vec<String> {
         [
             "pr",
@@ -83,13 +110,26 @@ impl PrBackend for GhBackend {
     }
 
     fn branch_protected(&self, worktree: &Path, branch: &str) -> Result<bool, ShepherdError> {
-        super::protection::gh_branch_protected(worktree, branch)
+        let args = super::protection::protection_args(branch)?;
+        let gate = self.read_gate(worktree)?;
+        let result = gate
+            .gh(
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                worktree,
+            )
+            .map_err(unavailable)?;
+        match result.trim() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(unavailable("invalid branch protection response")),
+        }
     }
     fn default_branch(&self, worktree: &Path) -> Result<String, ShepherdError> {
-        super::protection::gh_default_branch(worktree)
+        Ok(crate::trusted::load_snapshot(&self.state_dir(), worktree)?.default_branch)
     }
     fn author(&self, worktree: &Path) -> Result<String, ShepherdError> {
-        let text = read_gate(worktree)?
+        let text = self
+            .read_gate(worktree)?
             .gh(&["api", "user", "--jq", ".login"], worktree)
             .map_err(unavailable)?;
         let author = text.trim();
@@ -103,7 +143,7 @@ impl PrBackend for GhBackend {
         worktree: &Path,
         number: u64,
     ) -> Result<Vec<super::PrComment>, ShepherdError> {
-        let gate = read_gate(worktree)?;
+        let gate = self.read_gate(worktree)?;
         let mut comments = Vec::new();
         for (kind, review) in [("pulls", true), ("issues", false)] {
             let route = format!("repos/{{owner}}/{{repo}}/{kind}/{number}/comments");
@@ -112,7 +152,33 @@ impl PrBackend for GhBackend {
                 .map_err(unavailable)?;
             comments.extend(parse_comments(&text, review)?);
         }
+        let route = format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews");
+        let text = gate
+            .gh(&["api", &route, "--paginate", "--slurp"], worktree)
+            .map_err(unavailable)?;
+        comments.extend(parse_reviews(&text)?);
         Ok(comments)
+    }
+
+    fn failed_checks(
+        &self,
+        worktree: &Path,
+        number: u64,
+    ) -> Result<Vec<super::FailedCheck>, ShepherdError> {
+        let gate = self.read_gate(worktree)?;
+        let text = gate
+            .gh(
+                &[
+                    "pr",
+                    "view",
+                    &number.to_string(),
+                    "--json",
+                    "statusCheckRollup",
+                ],
+                worktree,
+            )
+            .map_err(unavailable)?;
+        parse_failed_checks(&text)
     }
 
     fn view(&self, worktree: &Path, branch: &str) -> Result<Option<PrStatus>, ShepherdError> {
@@ -120,7 +186,7 @@ impl PrBackend for GhBackend {
             policy: BranchPolicy::new(&[], None, None)?,
             ticket_branch: branch.into(),
             worktree: worktree.into(),
-            state_dir: crate::gate::state_dir(),
+            state_dir: self.state_dir(),
             config_dir: crate::config::resolve_config_dir(None),
         };
         match gate.gh(&["pr", "view", branch, "--json", "number,url,state,mergedAt,baseRefName,headRefName,headRefOid,statusCheckRollup,reviewDecision,comments,reviews"], worktree) {
@@ -152,7 +218,8 @@ impl PrBackend for GhBackend {
             &gate.worktree,
             body.as_bytes(),
         )?;
-        self.view(&gate.worktree, &gate.ticket_branch)?
+        Self::with_state(&gate.state_dir)
+            .view(&gate.worktree, &gate.ticket_branch)?
             .ok_or_else(|| unavailable("created pull request could not be read"))
     }
 
@@ -218,9 +285,10 @@ impl GhBackend {
         if let Some(id) = comment_id {
             let repository = gate.github_repository()?;
             let path = format!("repos/{repository}/pulls/{number}/comments/{id}/replies");
-            gate.gh(
-                &["api", "-X", "POST", &path, "-f", &format!("body={body}")],
+            gate.gh_with_input(
+                &["api", "-X", "POST", &path, "-F", "body=@-"],
                 &gate.worktree,
+                body.as_bytes(),
             )
         } else {
             gate.gh_with_input(
@@ -436,16 +504,6 @@ mod tests {
     }
 }
 
-fn read_gate(worktree: &Path) -> Result<Gate, ShepherdError> {
-    Ok(Gate {
-        policy: BranchPolicy::new(&[], None, None)?,
-        ticket_branch: String::new(),
-        worktree: worktree.into(),
-        state_dir: crate::gate::state_dir(),
-        config_dir: crate::config::resolve_config_dir(None),
-    })
-}
-
 pub fn parse_comments(text: &str, review: bool) -> Result<Vec<super::PrComment>, ShepherdError> {
     let pages: Vec<Vec<Value>> = serde_json::from_str(text).map_err(unavailable)?;
     pages
@@ -453,6 +511,11 @@ pub fn parse_comments(text: &str, review: bool) -> Result<Vec<super::PrComment>,
         .flatten()
         .map(|raw| {
             Ok(super::PrComment {
+                kind: Some(if review {
+                    super::CommentKind::Review
+                } else {
+                    super::CommentKind::Issue
+                }),
                 id: raw
                     .get("id")
                     .and_then(Value::as_u64)
@@ -473,6 +536,63 @@ pub fn parse_comments(text: &str, review: bool) -> Result<Vec<super::PrComment>,
             })
         })
         .collect()
+}
+
+pub fn parse_reviews(text: &str) -> Result<Vec<super::PrComment>, ShepherdError> {
+    let pages: Vec<Vec<Value>> = serde_json::from_str(text).map_err(unavailable)?;
+    let bodies: Vec<_> = pages
+        .into_iter()
+        .flatten()
+        .filter(|review| {
+            review.get("state").and_then(Value::as_str) == Some("CHANGES_REQUESTED")
+                && review
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .is_some_and(|body| !body.trim().is_empty())
+        })
+        .collect();
+    let mut comments = parse_comments(
+        &serde_json::to_string(&vec![bodies]).map_err(unavailable)?,
+        false,
+    )?;
+    for comment in &mut comments {
+        comment.kind = Some(super::CommentKind::ReviewBody);
+    }
+    Ok(comments)
+}
+
+pub fn parse_failed_checks(text: &str) -> Result<Vec<super::FailedCheck>, ShepherdError> {
+    let raw: Value = serde_json::from_str(text).map_err(unavailable)?;
+    let checks = raw
+        .get("statusCheckRollup")
+        .and_then(Value::as_array)
+        .ok_or_else(|| unavailable("missing statusCheckRollup"))?;
+    Ok(checks
+        .iter()
+        .filter(|check| {
+            matches!(
+                check
+                    .get("conclusion")
+                    .and_then(Value::as_str)
+                    .or_else(|| check.get("state").and_then(Value::as_str)),
+                Some("FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED")
+            )
+        })
+        .map(|check| super::FailedCheck {
+            name: check
+                .get("name")
+                .or_else(|| check.get("context"))
+                .and_then(Value::as_str)
+                .unwrap_or("CI check")
+                .into(),
+            url: check
+                .get("detailsUrl")
+                .or_else(|| check.get("targetUrl"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .into(),
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -496,6 +616,29 @@ mod comment_tests {
         .unwrap();
         assert!(!issue[0].review);
         assert_eq!(issue[0].path, None);
+    }
+
+    #[test]
+    fn changes_requested_review_bodies_are_comments() {
+        let comments = parse_reviews(r#"[[{"id":11,"state":"CHANGES_REQUESTED","user":{"login":"reviewer"},"body":"Fix the missing guard"},{"id":12,"state":"APPROVED","user":{"login":"another"},"body":"Looks good"},{"id":13,"state":"CHANGES_REQUESTED","user":{"login":"reviewer"},"body":" "}]]"#).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].id, 11);
+        assert_eq!(comments[0].body, "Fix the missing guard");
+    }
+
+    #[test]
+    fn failing_checks_keep_names_and_urls() {
+        let checks = parse_failed_checks(r#"{"statusCheckRollup":[{"name":"unit","conclusion":"FAILURE","detailsUrl":"https://example.invalid/unit"},{"context":"lint","state":"ERROR","targetUrl":"https://example.invalid/lint"},{"name":"build","conclusion":"SUCCESS"}]}"#).unwrap();
+        assert_eq!(
+            checks
+                .iter()
+                .map(|check| (check.name.as_str(), check.url.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("unit", "https://example.invalid/unit"),
+                ("lint", "https://example.invalid/lint")
+            ]
+        );
     }
 
     #[test]

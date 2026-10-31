@@ -51,8 +51,18 @@ pub struct PrStatus {
     pub comment_ids: Vec<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommentKind {
+    Review,
+    Issue,
+    ReviewBody,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PrComment {
+    #[serde(default)]
+    pub kind: Option<CommentKind>,
     pub id: u64,
     pub author: String,
     pub path: Option<String>,
@@ -61,7 +71,30 @@ pub struct PrComment {
     pub review: bool,
 }
 
+impl PrComment {
+    pub fn comment_kind(&self) -> CommentKind {
+        self.kind.unwrap_or(if self.review {
+            CommentKind::Review
+        } else {
+            CommentKind::Issue
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FailedCheck {
+    pub name: String,
+    pub url: String,
+}
+
 pub trait PrBackend {
+    fn failed_checks(
+        &self,
+        _worktree: &Path,
+        _number: u64,
+    ) -> Result<Vec<FailedCheck>, ShepherdError> {
+        Ok(vec![])
+    }
     fn requested_reviewers(
         &self,
         _gate: &Gate,

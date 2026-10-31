@@ -141,7 +141,7 @@ pub fn run(
     let declared = authorized.as_ref().map(|(branch, _)| branch.as_str());
     let mut gate = gate(worktree, &cfg, base, declared, state)?;
     gate.config_dir = config_dir.into();
-    let backend = GhBackend;
+    let backend = GhBackend::with_state(state);
     let data = match command {
         PrCommand::Owners { base, .. } => {
             serde_json::to_value(owners(&gate, base)?).map_err(anyhow::Error::from)?
@@ -203,7 +203,7 @@ pub fn run(
 }
 
 fn owners(gate: &Gate, base: &str) -> Result<Vec<String>, ShepherdError> {
-    herdr_shepherd::ticket::pr::reviewers(&GhBackend, gate, base)
+    herdr_shepherd::ticket::pr::reviewers(&GhBackend::with_state(&gate.state_dir), gate, base)
 }
 
 fn ticket_branch(

@@ -113,6 +113,7 @@ impl PrBackend for FakeBackend {
             .max(1_000_000)
             + 1;
         self.comments.borrow_mut().push(PrComment {
+            kind: None,
             id,
             author: self.author.borrow().clone(),
             path: None,
@@ -148,6 +149,8 @@ struct DiskState {
     status: Option<PrStatus>,
     #[serde(default)]
     comments: Vec<PrComment>,
+    #[serde(default)]
+    failed_checks: Vec<super::FailedCheck>,
     #[serde(default)]
     author: String,
     #[serde(default)]
@@ -207,6 +210,15 @@ impl PrBackend for DiskBackend {
     fn comments(&self, _: &Path, number: u64) -> Result<Vec<PrComment>, ShepherdError> {
         self.call(format!("comments {number}"), |s| Ok(s.comments.clone()))
     }
+    fn failed_checks(
+        &self,
+        _: &Path,
+        number: u64,
+    ) -> Result<Vec<super::FailedCheck>, ShepherdError> {
+        self.call(format!("failed_checks {number}"), |state| {
+            Ok(state.failed_checks.clone())
+        })
+    }
     fn author(&self, _: &Path) -> Result<String, ShepherdError> {
         self.call("author".into(), |s| Ok(s.author.clone()))
     }
@@ -259,6 +271,7 @@ impl PrBackend for DiskBackend {
             .max(1_000_000)
             + 1;
         state.comments.push(PrComment {
+            kind: None,
             id,
             author: state.author.clone(),
             path: None,
