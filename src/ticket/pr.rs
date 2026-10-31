@@ -399,47 +399,61 @@ pub fn reply_with_kind(
 ) -> Result<Ticket, ShepherdError> {
     validate_body(body)?;
     let _dispatch = super::revise::dispatch_lock(store, id)?;
-    let mut snapshot = store.read()?;
-    let updated = (|| {
-        let data = &mut snapshot;
-        let t = ticket(data, id)?;
-        let number = require_pr(t)?;
-        if t.state != TicketState::PrOpen {
-            return Err(ShepherdError::Usage("triage requires pr_open".into()));
-        }
-        let index = selected(t, cid, kind)?;
-        if t.comments[index].triaged {
-            return Err(ShepherdError::Usage("comment already triaged".into()));
-        }
-        authorize(t, gate)?;
-        let author = gh.author(&gate.worktree)?;
-        let reply_id = gh.reply_id(gate, number, t.comments[index].review.then_some(cid), body)?;
-        let posted = crate::store::PostedReply {
-            id: reply_id,
-            author,
-            body: body.into(),
-            review: t.comments[index].review,
-        };
-        let t = data
-            .tickets
-            .iter_mut()
-            .find(|t| t.id == id)
-            .expect("validated ticket");
-        t.posted_replies.push(posted);
-        t.comments[index].triaged = true;
-        t.comments[index].verdict = Some("declined".into());
-        Ok::<_, ShepherdError>(t.clone())
-    })()?;
+    let snapshot = store.read()?;
+    let t = ticket(&snapshot, id)?;
+    let number = require_pr(t)?;
+    if t.state != TicketState::PrOpen {
+        return Err(ShepherdError::Usage("triage requires pr_open".into()));
+    }
+    let index = selected(t, cid, kind)?;
+    if t.comments[index].triaged {
+        return Err(ShepherdError::Usage("comment already triaged".into()));
+    }
+    authorize(t, gate)?;
+    let pending = crate::store::PostedReply {
+        id: None,
+        author: gh.author(&gate.worktree)?,
+        body: body.into(),
+        review: t.comments[index].review,
+    };
+    let intent = record_reply_intent(store, t, pending)?;
+    let reply_id = gh.reply_id(gate, number, t.comments[index].review.then_some(cid), body)?;
     store.update(|data| {
         let t = data
             .tickets
             .iter_mut()
             .find(|t| t.id == id)
             .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
+        t.posted_replies[intent].id = reply_id;
         let index = selected(t, cid, kind)?;
-        t.comments[index] = updated.comments[index].clone();
-        t.posted_replies = updated.posted_replies.clone();
+        t.comments[index].triaged = true;
+        t.comments[index].verdict = Some("declined".into());
         Ok(t.clone())
+    })
+}
+
+fn record_reply_intent(
+    store: &Store,
+    observed: &Ticket,
+    posted: crate::store::PostedReply,
+) -> Result<usize, ShepherdError> {
+    store.update(|data| {
+        let current = data
+            .tickets
+            .iter_mut()
+            .find(|t| t.id == observed.id)
+            .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {}", observed.id)))?;
+        if current.state != observed.state
+            || current.history.len() != observed.history.len()
+            || current.pr_number != observed.pr_number
+        {
+            return Err(ShepherdError::Usage("ticket changed before reply".into()));
+        }
+        if let Some(index) = current.posted_replies.iter().position(|old| old == &posted) {
+            return Ok(index);
+        }
+        current.posted_replies.push(posted);
+        Ok(current.posted_replies.len() - 1)
     })
 }
 
@@ -523,56 +537,45 @@ pub fn ack_with_kind(
 ) -> Result<Ticket, ShepherdError> {
     validate_body(body)?;
     let _dispatch = super::revise::dispatch_lock(store, id)?;
-    let mut snapshot = store.read()?;
-    let updated = (|| {
-        let data = &mut snapshot;
-        let t = ticket(data, id)?;
-        let number = require_pr(t)?;
-        if !matches!(t.state, TicketState::CiWait | TicketState::PrOpen) {
-            return Err(ShepherdError::Usage(
-                "ack requires a pushed revision".into(),
-            ));
-        }
-        let index = selected(t, cid, kind)?;
-        let c = &t.comments[index];
-        if c.verdict.as_deref() != Some("accepted")
-            || c.acknowledged
-            || !c
-                .ack_sha
-                .as_ref()
-                .is_some_and(|sha| !sha.is_empty() && body.contains(sha))
-        {
-            return Err(ShepherdError::Usage(
-                "ack must name the pushed commit SHA for an accepted comment".into(),
-            ));
-        }
-        authorize(t, gate)?;
-        let author = gh.author(&gate.worktree)?;
-        let reply_id = gh.reply_id(gate, number, c.review.then_some(cid), body)?;
-        let posted = crate::store::PostedReply {
-            id: reply_id,
-            author,
-            body: body.into(),
-            review: c.review,
-        };
-        let t = data
-            .tickets
-            .iter_mut()
-            .find(|t| t.id == id)
-            .expect("validated ticket");
-        t.posted_replies.push(posted);
-        t.comments[index].acknowledged = true;
-        Ok::<_, ShepherdError>(t.clone())
-    })()?;
+    let snapshot = store.read()?;
+    let t = ticket(&snapshot, id)?;
+    let number = require_pr(t)?;
+    if !matches!(t.state, TicketState::CiWait | TicketState::PrOpen) {
+        return Err(ShepherdError::Usage(
+            "ack requires a pushed revision".into(),
+        ));
+    }
+    let index = selected(t, cid, kind)?;
+    let c = &t.comments[index];
+    if c.verdict.as_deref() != Some("accepted")
+        || c.acknowledged
+        || !c
+            .ack_sha
+            .as_ref()
+            .is_some_and(|sha| !sha.is_empty() && body.contains(sha))
+    {
+        return Err(ShepherdError::Usage(
+            "ack must name the pushed commit SHA for an accepted comment".into(),
+        ));
+    }
+    authorize(t, gate)?;
+    let pending = crate::store::PostedReply {
+        id: None,
+        author: gh.author(&gate.worktree)?,
+        body: body.into(),
+        review: c.review,
+    };
+    let intent = record_reply_intent(store, t, pending)?;
+    let reply_id = gh.reply_id(gate, number, c.review.then_some(cid), body)?;
     store.update(|data| {
         let t = data
             .tickets
             .iter_mut()
             .find(|t| t.id == id)
             .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
+        t.posted_replies[intent].id = reply_id;
         let index = selected(t, cid, kind)?;
-        t.comments[index] = updated.comments[index].clone();
-        t.posted_replies = updated.posted_replies.clone();
+        t.comments[index].acknowledged = true;
         Ok(t.clone())
     })
 }
@@ -764,6 +767,99 @@ mod tests {
         let all = comments(&store, &gh, "T-1", false).unwrap();
         assert_eq!(all.len(), 2);
         assert!(all[0].seen);
+    }
+
+    struct ReplyAfterPostError {
+        gh: FakeBackend,
+    }
+    impl PrBackend for ReplyAfterPostError {
+        fn view(&self, p: &Path, b: &str) -> Result<Option<PrStatus>, ShepherdError> {
+            self.gh.view(p, b)
+        }
+        fn push(&self, g: &Gate) -> Result<(), ShepherdError> {
+            self.gh.push(g)
+        }
+        fn create(
+            &self,
+            g: &Gate,
+            b: &str,
+            t: &str,
+            body: &str,
+        ) -> Result<PrStatus, ShepherdError> {
+            self.gh.create(g, b, t, body)
+        }
+        fn add_reviewers(&self, g: &Gate, n: u64, r: &[String]) -> Result<(), ShepherdError> {
+            self.gh.add_reviewers(g, n, r)
+        }
+        fn author(&self, p: &Path) -> Result<String, ShepherdError> {
+            self.gh.author(p)
+        }
+        fn comments(
+            &self,
+            p: &Path,
+            n: u64,
+        ) -> Result<Vec<crate::github::PrComment>, ShepherdError> {
+            self.gh.comments(p, n)
+        }
+        fn reply(&self, g: &Gate, n: u64, c: Option<u64>, b: &str) -> Result<(), ShepherdError> {
+            self.gh.reply(g, n, c, b)
+        }
+        fn reply_id(
+            &self,
+            g: &Gate,
+            n: u64,
+            c: Option<u64>,
+            b: &str,
+        ) -> Result<Option<u64>, ShepherdError> {
+            self.gh.reply_id(g, n, c, b)?;
+            Err(ShepherdError::GithubUnavailable(
+                "response lost after GitHub accepted reply".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn accepted_reply_error_keeps_pending_echo_filter() {
+        for acknowledge in [false, true] {
+            let (dir, store) = fixture(TicketState::PrOpen);
+            store
+                .update(|data| {
+                    let t = &mut data.tickets[0];
+                    t.branch = "feat/t-1".into();
+                    t.base = "main".into();
+                    t.worktree = Some(dir.path().into());
+                    t.comments.push(comment(1));
+                    if acknowledge {
+                        t.comments[0].triaged = true;
+                        t.comments[0].verdict = Some("accepted".into());
+                        t.comments[0].ack_sha = Some("abc123".into());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let gh = ReplyAfterPostError {
+                gh: FakeBackend::new(vec![]),
+            };
+            let body = "Covered by the parser boundary test in abc123.";
+            let result = if acknowledge {
+                ack(&store, &gh, &gate(dir.path()), "T-1", 1, body)
+            } else {
+                reply(&store, &gh, &gate(dir.path()), "T-1", 1, body)
+            };
+            assert_eq!(result.unwrap_err().code(), "github_unavailable");
+            let listed = comments(&store, &gh, "T-1", true).unwrap();
+            assert!(
+                listed
+                    .iter()
+                    .all(|listed| listed.comment.author != "fixture-author"),
+                "accepted shepherd reply was re-ingested after a backend error"
+            );
+            let saved = store.read().unwrap();
+            assert_eq!(saved.tickets[0].posted_replies.len(), 1);
+            assert_eq!(saved.tickets[0].posted_replies[0].id, None);
+            assert_eq!(saved.tickets[0].posted_replies[0].body, body);
+            assert!(!saved.tickets[0].comments[0].acknowledged);
+        }
     }
 
     #[test]
