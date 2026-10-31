@@ -8,6 +8,22 @@ use herdr_shepherd::{
 };
 use std::path::Path;
 
+fn ci_retry_marker(ticket: &herdr_shepherd::store::Ticket) -> String {
+    use sha2::{Digest, Sha256};
+    let identity = format!(
+        "{}\0{}\0{}",
+        ticket.ci_failure_task.as_deref().unwrap_or_default(),
+        ticket.updated_at,
+        ticket.history.len(),
+    );
+    format!(
+        "CI retry {} round {} task {:x}",
+        ticket.id,
+        ticket.revision_round,
+        Sha256::digest(identity.as_bytes()),
+    )
+}
+
 #[cfg(test)]
 pub fn dispatch(
     h: &dyn Herdr,
@@ -138,24 +154,46 @@ pub fn dispatch_with_backend(
                     return Ok(None);
                 }
                 scheduler::Action::ResumeCiBuild(id) => {
-                    let ticket = store
-                        .read()?
+                    let data = store.read()?;
+                    let ticket = data
                         .tickets
-                        .into_iter()
+                        .iter()
                         .find(|ticket| ticket.id == id && ticket.state == TicketState::Building)
-                        .ok_or_else(|| {
-                            ShepherdError::Usage("CI retry no longer building".into())
+                        .ok_or_else(|| ShepherdError::Usage("CI retry no longer building".into()))?
+                        .clone();
+                    if ticket.ci_failure_task.is_none() {
+                        return Ok(None);
+                    }
+                    let marker = ci_retry_marker(&ticket);
+                    if data.agents.iter().any(|agent| {
+                        agent.ticket == id
+                            && agent.status != AgentStatus::LaunchFailed
+                            && agent.task.contains(&marker)
+                    }) {
+                        store.update(|data| {
+                            if let Some(current) =
+                                data.tickets.iter_mut().find(|current| current.id == id)
+                            {
+                                current.ci_failure_task = None;
+                            }
+                            Ok(())
                         })?;
+                        return Ok(None);
+                    }
                     entered_stage = Some(TicketState::Building);
                     (ticket, "coder", "")
                 }
             };
             let task = if ci_build {
-                ticket.ci_failure_task.as_deref().unwrap_or(task)
+                format!(
+                    "{}\n{}",
+                    ci_retry_marker(&ticket),
+                    ticket.ci_failure_task.as_deref().unwrap_or(task)
+                )
             } else {
-                task
+                task.to_owned()
             };
-            let rec = crate::cli_flock::spawn_task(h, store, cfg, state, &ticket, role, task)?;
+            let rec = crate::cli_flock::spawn_task(h, store, cfg, state, &ticket, role, &task)?;
             if rec.status == AgentStatus::LaunchFailed {
                 return Err(ShepherdError::Runtime(anyhow::anyhow!(
                     "all configured runners failed to launch"
@@ -549,6 +587,43 @@ mod dispatch_tests {
                 .state
         }
     }
+    #[test]
+    fn dispatch_recovers_ci_launch_before_task_clear() {
+        let f = Fixture::new(1);
+        f.ticket("ci", TicketState::Building);
+        let task = "Fix unit: https://example.invalid/check/1";
+        f.store
+            .update(|data| {
+                data.tickets[0].pr_number = Some(7);
+                data.tickets[0].ci_failure_task = Some(task.into());
+                Ok(())
+            })
+            .unwrap();
+        f.dispatch();
+        f.store
+            .update(|data| {
+                // A launcher can persist the agent before its caller clears the
+                // task. The completed report must recover that same launch.
+                data.tickets[0].ci_failure_task = Some(task.into());
+                data.agents[0].status = AgentStatus::Reported;
+                Ok(())
+            })
+            .unwrap();
+        f.dispatch();
+        let data = f.store.read().unwrap();
+        assert_eq!(data.agents.len(), 1);
+        assert!(data.tickets[0].ci_failure_task.is_none());
+        f.store
+            .update(|data| {
+                data.tickets[0].revision_round = 1;
+                data.tickets[0].ci_failure_task = Some(task.into());
+                Ok(())
+            })
+            .unwrap();
+        f.dispatch();
+        assert_eq!(f.store.read().unwrap().agents.len(), 2);
+    }
+
     #[test]
     fn dispatch_starts_ci_fix_once_on_existing_ticket() {
         let f = Fixture::new(1);
