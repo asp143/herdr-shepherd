@@ -33,6 +33,12 @@ in `projects/<sha256 of canonical project path>/state.json`, with a per-project
 lock covering each update and a synced atomic replacement. Ticket inspection
 does not change stored ticket data.
 
+The library's ticket state machine includes `ci_wait`, which consumes a ticket
+slot. Review, QA, and red CI bounces share a revision counter; exceeding the cap
+blocks the ticket with `loop_cap`. `transition` uses the default cap of three;
+`transition_with_limit` accepts the project's resolved cap. Blocked tickets may
+resume only their recorded prior state, or be cancelled.
+
 Regroup preserves user labels such as `fix/foo`, skips children whose parent workspace is absent, and is idempotent. Nested generated prefixes are stripped in one run so another invocation does not rename again. Explicit `regroup` always runs; `[upkeep] regroup` controls automatic event handling.
 
 Prune defaults to `~/.herdr/worktrees` and reports `MERGED`, `CLOSED`, `ORPHAN`, `STRAY`, `NO-PR`, and `OPEN`, plus optional size, `DIRTY`, `AGENTS=n`, and `BRANCH-SWITCHED` flags. Missing `gh`, unsupported remotes, failed lookups, or timeouts yield `NO-PR`. Probe calls time out after 20 seconds, except size probes after 120 seconds; at most eight entries are probed concurrently. If herdr is unavailable, the report still runs with warnings and no workspace or agent annotations. Prune never deletes, moves, or writes anything.
