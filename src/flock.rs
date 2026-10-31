@@ -289,12 +289,24 @@ pub fn cancel(
     })
 }
 
+/// An operation releases its OS lock even when a concurrent fork inherited
+/// the file description and has not reached close-on-exec yet.
+pub struct AgentOperationGuard {
+    file: std::fs::File,
+}
+
+impl Drop for AgentOperationGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 /// A live launcher owns its intent until it finishes or its process exits.
 /// Recovery skips busy records instead of mistaking in-flight admission for loss.
 pub fn try_agent_operation(
     store: &crate::store::Store,
     name: &str,
-) -> Result<Option<std::fs::File>, ShepherdError> {
+) -> Result<Option<AgentOperationGuard>, ShepherdError> {
     std::fs::create_dir_all(store.root()).map_err(anyhow::Error::from)?;
     let hash = crate::store::project_hash(std::path::Path::new(name));
     let lock = std::fs::OpenOptions::new()
@@ -305,7 +317,7 @@ pub fn try_agent_operation(
         .open(store.root().join(format!("agent-{}.lock", &hash[..16])))
         .map_err(anyhow::Error::from)?;
     match lock.try_lock() {
-        Ok(()) => Ok(Some(lock)),
+        Ok(()) => Ok(Some(AgentOperationGuard { file: lock })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(error)) => Err(anyhow::Error::from(error).into()),
     }
@@ -422,6 +434,69 @@ mod tests {
             state_dir: state.into(),
         }
     }
+    #[test]
+    fn agent_operation_unlocks_before_inherited_fd_closes() {
+        use std::{
+            io::{Read, Write},
+            os::{
+                fd::AsRawFd,
+                unix::{net::UnixStream, process::CommandExt},
+            },
+            process::Command,
+            time::Duration,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("state"), dir.path()).unwrap();
+        let operation = try_agent_operation(&store, "sh-fixture-coder-1")
+            .unwrap()
+            .unwrap();
+        assert!(
+            try_agent_operation(&store, "sh-fixture-coder-1")
+                .unwrap()
+                .is_none()
+        );
+        let (mut parent, child) = UnixStream::pair().unwrap();
+        parent
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        std::thread::scope(|scope| {
+            let spawned = scope.spawn(move || {
+                let fd = child.as_raw_fd();
+                let mut command = Command::new("/bin/true");
+                // Hold all inherited file descriptions across the parent's
+                // guard drop. Only async-signal-safe syscalls run after fork.
+                unsafe {
+                    command.pre_exec(move || {
+                        let mut byte = 1_u8;
+                        if nix::libc::write(fd, (&byte as *const u8).cast(), 1) != 1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if nix::libc::read(fd, (&mut byte as *mut u8).cast(), 1) != 1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let status = command.spawn().and_then(|mut process| process.wait());
+                drop(child);
+                status
+            });
+            let ready = parent.read_exact(&mut [0_u8]);
+            drop(operation);
+            let next = try_agent_operation(&store, "sh-fixture-coder-1");
+            // Release the child before asserting, including on regression.
+            let released = parent.write_all(&[1]);
+            let status = spawned.join().unwrap();
+            ready.unwrap();
+            released.unwrap();
+            assert!(status.unwrap().success());
+            assert!(
+                next.unwrap().is_some(),
+                "completed operation remained locked by inherited fd"
+            );
+        });
+    }
+
     #[test]
     fn reconcile_waits_for_readiness_before_pending_delivery() {
         let dir = tempfile::tempdir().unwrap();
