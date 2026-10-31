@@ -925,6 +925,7 @@ pub fn sweep_projects(h: &dyn Herdr, state_dir: &Path, global: &Config, now: u64
                 report.projects += outcome.projects;
                 report.observed += outcome.observed;
                 report.acted += outcome.acted;
+                report.errors.extend(outcome.errors);
             }
             Ok(None) => {}
             Err(error) => report.errors.push(error.to_string()),
@@ -1539,6 +1540,24 @@ mod tests {
                 .unwrap();
         assert_eq!(observed["actions"].as_array().unwrap().len(), 1);
     }
+    #[test]
+    fn periodic_sweep_preserves_agent_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cfg, h) = fixture(dir.path());
+        h.read_errors
+            .borrow_mut()
+            .insert("sh-owned-coder-1".into(), "fixture screen failure".into());
+        let report = sweep_projects(&h, &dir.path().join("state"), &cfg, 1);
+        assert_eq!(report.observed, 1);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("fixture screen failure")),
+            "{report:?}"
+        );
+    }
+
     #[test]
     fn corrupt_and_missing_projects_do_not_stop_healthy_sweeps() {
         let dir = tempfile::tempdir().unwrap();
