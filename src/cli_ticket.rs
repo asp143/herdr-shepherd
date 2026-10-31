@@ -8,8 +8,27 @@ use herdr_shepherd::{
 };
 use std::path::Path;
 
+#[cfg(test)]
 pub fn dispatch(
     h: &dyn Herdr,
+    store: &Store,
+    cfg: &Config,
+    state: &Path,
+    config_dir: &Path,
+) -> Result<serde_json::Value, ShepherdError> {
+    dispatch_with_backend(
+        h,
+        &herdr_shepherd::github::fake::FakeBackend::new(vec![]),
+        store,
+        cfg,
+        state,
+        config_dir,
+    )
+}
+
+pub fn dispatch_with_backend(
+    h: &dyn Herdr,
+    gh: &dyn herdr_shepherd::github::PrBackend,
     store: &Store,
     cfg: &Config,
     state: &Path,
@@ -50,8 +69,9 @@ pub fn dispatch(
         let attempt = (|| {
             let (ticket, role, task) = match action {
                 scheduler::Action::StartTicket(id) => {
-                    let ticket = intake::start_ticket(
+                    let ticket = intake::start_ticket_with_backend(
                         h,
+                        gh,
                         store,
                         &id,
                         &intake::StartTicketOptions {
@@ -61,6 +81,7 @@ pub fn dispatch(
                             settings: &resolved.shepherd,
                             now: &launch::now(),
                         },
+                        cfg.upkeep.notifications,
                     )?;
                     entered_stage = Some(ticket.state);
                     herdr_shepherd::hooks::emit(
@@ -75,27 +96,40 @@ pub fn dispatch(
                     )
                 }
                 scheduler::Action::ResumeRevising(id) => {
-                    let ticket = store.update(|data| {
-                        let t = data
-                            .tickets
-                            .iter_mut()
-                            .find(|t| t.id == id)
-                            .ok_or_else(|| ShepherdError::Usage("ticket disappeared".into()))?;
-                        transition_with_limit(
-                            t,
-                            TicketState::Building,
-                            None,
-                            &launch::now(),
-                            resolved.shepherd.max_revision_rounds,
-                        )?;
-                        Ok(t.clone())
-                    })?;
-                    entered_stage = Some(ticket.state);
-                    (
-                        ticket,
-                        "coder",
-                        "Revise the implementation using the ticket findings and latest plan. Commit the fix, run relevant checks and report.",
-                    )
+                    let ticket = store
+                        .read()?
+                        .tickets
+                        .into_iter()
+                        .find(|ticket| ticket.id == id)
+                        .ok_or_else(|| ShepherdError::Usage("ticket disappeared".into()))?;
+                    let path = ticket
+                        .worktree
+                        .as_deref()
+                        .ok_or_else(|| ShepherdError::Usage("ticket has no worktree".into()))?;
+                    let mut gate = crate::cli_pr::gate(
+                        path,
+                        cfg,
+                        Some(&ticket.base),
+                        Some(&ticket.branch),
+                        state,
+                    )?;
+                    gate.config_dir = config_dir.into();
+                    entered_stage = Some(TicketState::Revising);
+                    let outcome =
+                        scheduler::resume_revising(h, gh, store, cfg, &gate, &id, &launch::now())?;
+                    if let herdr_shepherd::ticket::revise::RevisionOutcome::Started {
+                        agent, ..
+                    } = &outcome
+                        && store.read()?.agents.iter().any(|rec| {
+                            rec.name == *agent && rec.status == AgentStatus::LaunchFailed
+                        })
+                    {
+                        return Err(ShepherdError::Runtime(anyhow::anyhow!(
+                            "all configured runners failed to launch"
+                        )));
+                    }
+                    started.push(serde_json::json!({"ticket":id,"revision":outcome}));
+                    return Ok(None);
                 }
             };
             let rec = crate::cli_flock::spawn_task(h, store, cfg, state, &ticket, role, task)?;
@@ -104,10 +138,11 @@ pub fn dispatch(
                     "all configured runners failed to launch"
                 )));
             }
-            Ok(rec)
+            Ok(Some(rec))
         })();
         match attempt {
-            Ok(rec) => {
+            Ok(None) => {}
+            Ok(Some(rec)) => {
                 started.push(serde_json::json!({"ticket":id,"agent":rec}));
                 results.push(serde_json::json!({"ticket":id,"status":"started","agent":rec.name}));
             }
@@ -372,6 +407,7 @@ mod dispatch_tests {
             .unwrap();
             let cfg = config::load(&config_dir, None).unwrap();
             let store = Store::open(&state, &root).unwrap();
+            herdr_shepherd::trusted::ensure_snapshot(&state, &root).unwrap();
             Self {
                 _dir: dir,
                 root,
@@ -401,6 +437,7 @@ mod dispatch_tests {
                     "main",
                 ],
             );
+            let head = git(&path, &["rev-parse", "HEAD"]);
             self.store
                 .update(|d| {
                     d.tickets.push(Ticket {
@@ -411,6 +448,17 @@ mod dispatch_tests {
                         base: "main".into(),
                         state,
                         created_at: id.into(),
+                        pr_number: (state == TicketState::Revising).then_some(7),
+                        revision_task: (state == TicketState::Revising)
+                            .then(|| "Apply review feedback".into()),
+                        revision_run: (state == TicketState::Revising).then_some(
+                            herdr_shepherd::ticket::revise::RevisionRun {
+                                base_sha: head,
+                                stage: herdr_shepherd::ticket::revise::RevisionStage::Coder,
+                                agent: None,
+                                tested_sha: None,
+                            },
+                        ),
                         worktree: (state != TicketState::Queued).then_some(path),
                         workspace_id: (state != TicketState::Queued)
                             .then(|| format!("prepared-{id}")),

@@ -11,7 +11,7 @@ use super::{
     model::{AgentInfo, Workspace},
 };
 
-pub type StartObserver = Box<dyn Fn(&str)>;
+pub type StartObserver = Box<dyn Fn(&str) + Send>;
 
 pub struct FakeHerdr {
     pub on_start: RefCell<Option<StartObserver>>,

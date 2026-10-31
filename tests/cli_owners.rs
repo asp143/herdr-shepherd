@@ -24,16 +24,57 @@ fn create_requests_only_missing_codeowners() {
     git(&repo, &["config", "user.name", "Fixture"]);
     git(&repo, &["config", "user.email", "fixture@example.invalid"]);
     git(&repo, &["commit", "--quiet", "--allow-empty", "-m", "base"]);
-    git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
     fs::create_dir(repo.join(".github")).unwrap();
     fs::write(
         repo.join(".github/CODEOWNERS"),
         "* @fixture-author @already @new @org/team @org/other\n",
     )
     .unwrap();
+    git(&repo, &["add", ".github/CODEOWNERS"]);
+    git(&repo, &["commit", "--quiet", "-m", "owners"]);
+    git(&repo, &["branch", "main"]);
     fs::write(repo.join("ordinary.txt"), "changed\n").unwrap();
-    git(&repo, &["add", ".github/CODEOWNERS", "ordinary.txt"]);
+    git(&repo, &["add", "ordinary.txt"]);
     git(&repo, &["commit", "--quiet", "-m", "change"]);
+    let state = dir.path().join("state");
+    let remote = dir.path().join("remote.git");
+    git(
+        &repo,
+        &[
+            "clone",
+            "--bare",
+            "--quiet",
+            repo.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+    );
+    let store = herdr_shepherd::store::Store::open(&state, &repo).unwrap();
+    store
+        .update(|data| {
+            data.trust = Some(herdr_shepherd::store::ProjectTrust {
+                project_root: repo.clone(),
+                common_git_dir: repo.join(".git"),
+                origin_url: "https://github.com/example/project.git".into(),
+                push_url: remote.to_string_lossy().into_owned(),
+                default_branch: "main".into(),
+                config_commit: None,
+                config_blob: None,
+                config_text: None,
+                trusted_at: "fixture".into(),
+                global_config: None,
+                object_format: "sha1".into(),
+            });
+            data.tickets.push(herdr_shepherd::store::Ticket {
+                id: "T1".into(),
+                branch: "feat/test".into(),
+                base: "main".into(),
+                worktree: Some(repo.clone()),
+                ..Default::default()
+            });
+            Ok(())
+        })
+        .unwrap();
     let bin = dir.path().join("bin");
     fs::create_dir(&bin).unwrap();
     let git_bin = Command::new("sh")
@@ -71,6 +112,8 @@ esac
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("PATH", &bin)
             .env("HERDR_PLUGIN_CONFIG_DIR", dir.path().join("config"))
+            .env("HERDR_PLUGIN_STATE_DIR", &state)
+            .env("SHEPHERD_TEST_ALLOW_LOCAL_ORIGIN", "allow-local-in-tmp")
             .env("SHEPHERD_TEST_ARGS", &args)
             .env(
                 "SHEPHERD_TEST_FIXTURE",

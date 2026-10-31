@@ -29,6 +29,9 @@ pub struct WatchState {
     /// Older state files cannot prove ownership of any particular name.
     #[serde(default)]
     pub owned_tokens: HashMap<String, String>,
+    /// Runtime location; never persist the caller's state directory.
+    #[serde(skip)]
+    pub state_dir: Option<std::path::PathBuf>,
 }
 
 impl WatchState {
@@ -126,6 +129,18 @@ pub fn tick(
         report.polled += 1;
         match gh.view(path, &branch) {
             Ok(Some(status)) => {
+                match crate::ticket::merge::handle_workspace_pr_state(
+                    h,
+                    gh,
+                    cfg,
+                    &ws,
+                    &status,
+                    &st.state_dir.clone().unwrap_or_else(crate::gate::state_dir),
+                ) {
+                    Ok(crate::ticket::merge::MergeOutcome::CleanedUp) => continue,
+                    Err(error) => report.errors.push(format!("{}: {error}", ws.workspace_id)),
+                    _ => {}
+                }
                 let value = pr_token_value(&status);
                 let value_changed = st.last.get(&ws.workspace_id).is_none_or(|old| old != value);
                 let owned = st.owned_tokens.get(&ws.workspace_id);
@@ -248,10 +263,12 @@ pub fn run_with_config_dir(
     }
     let mut worker = PrWorker::default();
     let mut next_pr = Instant::now();
+
     loop {
         let mut report = TickReport::default();
         if once {
             let mut state = WatchState::load(state_dir)?;
+            state.state_dir = Some(state_dir.into());
             report = tick(
                 h,
                 gh,
@@ -407,6 +424,7 @@ pub fn run_pr_once(
     };
     parent_monitor();
     let mut state = WatchState::load(state_dir)?;
+    state.state_dir = Some(state_dir.into());
     let report = tick(
         h,
         gh,

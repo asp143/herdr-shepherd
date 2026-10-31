@@ -1,6 +1,9 @@
 pub mod children;
 pub mod intake;
+pub mod merge;
+pub mod pr;
 pub mod pr_body;
+pub mod revise;
 pub mod scheduler;
 pub mod source;
 pub mod state;

@@ -59,6 +59,8 @@ pub struct Ticket {
     pub revision_round: u32,
     pub findings: Vec<Finding>,
     pub pr_number: Option<u64>,
+    #[serde(default)]
+    pub pr_reviewers_pending: Vec<String>,
     pub children: Vec<ChildWorktree>,
     #[serde(default)]
     pub integration_ranges: Vec<String>,
@@ -67,6 +69,14 @@ pub struct Ticket {
     pub updated_at: String,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default)]
+    pub comments: Vec<CommentRecord>,
+    #[serde(default)]
+    pub revision_task: Option<String>,
+    #[serde(default)]
+    pub revision_run: Option<crate::ticket::revise::RevisionRun>,
+    #[serde(default)]
+    pub protection_warnings: Vec<crate::github::protection::ProtectionWarning>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -168,6 +178,8 @@ pub struct StoreData {
     pub agents: Vec<AgentRecord>,
     #[serde(default)]
     pub pending_pings: Vec<String>,
+    #[serde(default)]
+    pub protection_cache: crate::github::protection::ProtectionCache,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -176,4 +188,27 @@ pub struct LeadRecord {
     pub tab_id: Option<String>,
     pub pane_id: Option<String>,
     pub started_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CommentRecord {
+    pub id: u64,
+    pub author: String,
+    pub path: Option<String>,
+    pub line: Option<u64>,
+    pub body: String,
+    #[serde(default)]
+    pub triaged: bool,
+    #[serde(default)]
+    pub verdict: Option<String>,
+    #[serde(default)]
+    pub ack_sha: Option<String>,
+    #[serde(default)]
+    pub acknowledged: bool,
+    #[serde(default = "review_comment")]
+    pub review: bool,
+}
+
+fn review_comment() -> bool {
+    true
 }

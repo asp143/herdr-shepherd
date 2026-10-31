@@ -424,7 +424,7 @@ mod tests {
         let state = dir.path().join("state");
         let store = Store::open(&state, dir.path()).unwrap();
         let h = FakeHerdr::new(vec![]);
-        let event_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let event_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = event_count.clone();
         let observed_store = store.clone();
         *h.on_start.borrow_mut() = Some(Box::new(move |name| {
@@ -448,14 +448,14 @@ mod tests {
                     workspace_id: Some("w1".into()),
                 });
             crate::flock::reconcile(&event, &observed_store).unwrap();
-            count.set(
-                count.get()
-                    + event
-                        .calls
-                        .borrow()
-                        .iter()
-                        .filter(|c| c.starts_with("prompt_agent"))
-                        .count(),
+            count.fetch_add(
+                event
+                    .calls
+                    .borrow()
+                    .iter()
+                    .filter(|c| c.starts_with("prompt_agent"))
+                    .count(),
+                std::sync::atomic::Ordering::SeqCst,
             );
         }));
         launch(&h, &store, req(dir.path(), &state)).unwrap();
@@ -466,7 +466,7 @@ mod tests {
             .filter(|c| c.starts_with("prompt_agent"))
             .count();
         assert_eq!(
-            event_count.get() + normal,
+            event_count.load(std::sync::atomic::Ordering::SeqCst) + normal,
             1,
             "startup events must not duplicate the initial task"
         );

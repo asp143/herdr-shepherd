@@ -59,13 +59,6 @@ pub fn integration_branch(repo: &Path, setting: &str) -> String {
     {
         return "development".into();
     }
-    if let Ok(name) = git(
-        repo,
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    ) && let Some(branch) = name.strip_prefix("origin/")
-    {
-        return branch.into();
-    }
     // A fresh local repository may have no remote HEAD yet.
     git(repo, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|_| "main".into())
 }
@@ -94,11 +87,24 @@ pub fn add(
         ));
     }
     let id = request.id.clone().unwrap_or_else(|| slug.clone());
-    let project = store.read()?.project_root;
-    let base = request
-        .base
-        .clone()
-        .unwrap_or_else(|| integration_branch(&project, integration_setting));
+    let data = store.read()?;
+    let project = data.project_root;
+    let base = request.base.clone().unwrap_or_else(|| {
+        if integration_setting != "auto" {
+            return integration_setting.into();
+        }
+        if let Some(trust) = data.trust {
+            // The default was captured before agents could change remote HEAD.
+            let development = trust.common_git_dir.join("refs/remotes/origin/development");
+            if development.is_file() {
+                "development".into()
+            } else {
+                trust.default_branch
+            }
+        } else {
+            integration_branch(&project, integration_setting)
+        }
+    });
     if base.trim().is_empty() || base.starts_with('-') || base.contains(['\n', '\r']) {
         return Err(ShepherdError::Usage("invalid integration branch".into()));
     }
@@ -174,6 +180,18 @@ pub fn start_ticket(
     store: &Store,
     id: &str,
     options: &StartTicketOptions<'_>,
+) -> Result<Ticket, ShepherdError> {
+    start_ticket_with_backend(h, &crate::github::gh::GhBackend, store, id, options, true)
+}
+
+/// Start with an injectable read-only GitHub backend for protection warnings.
+pub fn start_ticket_with_backend(
+    h: &dyn crate::herdr::Herdr,
+    gh: &dyn crate::github::PrBackend,
+    store: &Store,
+    id: &str,
+    options: &StartTicketOptions<'_>,
+    notifications: bool,
 ) -> Result<Ticket, ShepherdError> {
     use crate::store::{BlockedReason, TicketState};
 
@@ -320,6 +338,22 @@ pub fn start_ticket(
             .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))
     };
     let result = setup();
+    if result.is_ok() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        if let Err(error) =
+            crate::github::protection::check_started_ticket(store, gh, h, id, now, notifications)
+        {
+            eprintln!("shepherd: branch protection warning: {error}");
+        }
+        return store
+            .read()?
+            .tickets
+            .into_iter()
+            .find(|ticket| ticket.id == id)
+            .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")));
+    }
     if result.is_err() {
         store.update(|data| {
             let ticket = data
@@ -496,10 +530,30 @@ mod tests {
             settings: &settings,
             now: "after",
         };
-        let started = start_ticket(&h, &store, "T1", &options).unwrap();
+        let backend = crate::github::fake::FakeBackend::new(vec![]);
+        let started =
+            start_ticket_with_backend(&h, &backend, &store, "T1", &options, true).unwrap();
         assert_eq!(started.state, crate::store::TicketState::Planning);
         assert_eq!(started.worktree, Some(path.clone()));
         assert_eq!(started.workspace_id.as_deref(), Some("fake-w1"));
+        assert!(!started.protection_warnings.is_empty());
+        assert!(
+            started
+                .protection_warnings
+                .iter()
+                .all(|warning| warning.reason.starts_with("unknown:"))
+        );
+        assert_eq!(
+            store.read().unwrap().tickets[0].protection_warnings,
+            started.protection_warnings
+        );
+        assert!(
+            h.calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("notify ")
+                    && call.contains("branch protection unknown:"))
+        );
         assert_eq!(
             git(
                 &path,
@@ -511,7 +565,7 @@ mod tests {
             std::fs::read_to_string(path.join("node_modules/fixture.txt")).unwrap(),
             "fixture"
         );
-        assert!(start_ticket(&h, &store, "T1", &options).is_err());
+        assert!(start_ticket_with_backend(&h, &backend, &store, "T1", &options, true).is_err());
         assert_eq!(h.workspaces.borrow().len(), 1);
         let hook = std::fs::read_to_string(state_dir.join("hooks/pre-push")).unwrap();
         assert!(hook.contains(&format!(

@@ -171,6 +171,7 @@ pub fn flush_pings(h: &dyn Herdr, store: &Store) -> Result<usize, ShepherdError>
 
 #[derive(Debug, Serialize)]
 pub struct StatusReport {
+    pub protection_warnings: Vec<String>,
     pub project_root: PathBuf,
     pub lead: Option<LeadRecord>,
     pub tickets: Vec<Ticket>,
@@ -201,6 +202,7 @@ pub fn status(h: &dyn Herdr, store: &Store, cfg: &Config) -> Result<StatusReport
     };
     crate::notify::Notifier::new(h, cfg.upkeep.notifications).send("Shepherd status", &summary);
     Ok(StatusReport {
+        protection_warnings: crate::github::protection::status_warnings(&data),
         project_root: data.project_root,
         lead: data.lead,
         tickets: data.tickets,

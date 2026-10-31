@@ -203,39 +203,7 @@ pub fn run(
 }
 
 fn owners(gate: &Gate, base: &str) -> Result<Vec<String>, ShepherdError> {
-    use herdr_shepherd::github::codeowners;
-    git(&gate.worktree, &["check-ref-format", "--branch", base])?;
-    let root = git(&gate.worktree, &["rev-parse", "--show-toplevel"])?;
-    let Some(path) = codeowners::find_codeowners(Path::new(&root)) else {
-        return Ok(Vec::new());
-    };
-    let rules = codeowners::parse(&read_text(&path)?);
-    if rules.is_empty() {
-        return Ok(Vec::new());
-    }
-    let changed = git(
-        &gate.worktree,
-        &[
-            "diff",
-            "--name-only",
-            "-z",
-            &format!("origin/{base}...HEAD"),
-            "--",
-        ],
-    )?;
-    let changed: Vec<_> = changed
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned)
-        .collect();
-    let author = gate.gh(&["api", "user", "-q", ".login"], &gate.worktree)?;
-    let author = author.trim();
-    if author.is_empty() {
-        return Err(ShepherdError::GithubUnavailable(
-            "GitHub returned an empty author".into(),
-        ));
-    }
-    Ok(codeowners::owners_for(&rules, &changed, Some(author)))
+    herdr_shepherd::ticket::pr::reviewers(&GhBackend, gate, base)
 }
 
 fn ticket_branch(

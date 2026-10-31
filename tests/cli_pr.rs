@@ -144,6 +144,46 @@ esac
         let input = dir.path().join("input.txt");
         let body = dir.path().join("body.txt");
         let config = dir.path().join("config");
+        let state = dir.path().join("state");
+        let store = herdr_shepherd::store::Store::open(&state, &repo_dir).unwrap();
+        let remote = dir.path().join("remote.git");
+        git(&repo_dir, &["branch", "main"]);
+        git(
+            &repo_dir,
+            &[
+                "clone",
+                "--bare",
+                "--quiet",
+                repo_dir.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ],
+        );
+        store
+            .update(|data| {
+                data.trust = Some(herdr_shepherd::store::ProjectTrust {
+                    project_root: repo_dir.clone(),
+                    common_git_dir: repo_dir.join(".git"),
+                    origin_url: "https://github.com/example/repo.git".into(),
+                    push_url: remote.to_string_lossy().into_owned(),
+                    default_branch: "main".into(),
+                    config_commit: None,
+                    config_blob: None,
+                    config_text: None,
+                    trusted_at: "fixture".into(),
+                    global_config: None,
+                    object_format: "sha1".into(),
+                });
+                data.tickets.push(herdr_shepherd::store::Ticket {
+                    id: "T1".into(),
+                    branch: "feat/test".into(),
+                    base: "main".into(),
+                    worktree: Some(repo_dir.clone()),
+                    ..Default::default()
+                });
+                Ok(())
+            })
+            .unwrap();
+
         fs::write(
             &body,
             "A literal reply: $(unchanged) 'quoted'\nsecond line\n",
@@ -167,6 +207,8 @@ esac
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("PATH", &self.bin)
             .env("HERDR_PLUGIN_CONFIG_DIR", &self.config)
+            .env("HERDR_PLUGIN_STATE_DIR", self._dir.path().join("state"))
+            .env("SHEPHERD_TEST_ALLOW_LOCAL_ORIGIN", "allow-local-in-tmp")
             .env("SHEPHERD_TEST_ARGS", &self.args)
             .env("SHEPHERD_TEST_INPUT", &self.input)
             .env(

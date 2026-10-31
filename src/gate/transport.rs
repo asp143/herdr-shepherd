@@ -410,7 +410,7 @@ impl PushTransport {
             .collect())
     }
 
-    fn execute(&self, args: &[&str]) -> Result<String, ShepherdError> {
+    pub(crate) fn execute(&self, args: &[&str]) -> Result<String, ShepherdError> {
         let output = proc::capture(self.command()?.args(args), Duration::from_secs(120), None)?;
         if !output.status.success() {
             return Err(ShepherdError::Runtime(anyhow::anyhow!(

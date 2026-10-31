@@ -934,7 +934,11 @@ pub fn sweep_projects(h: &dyn Herdr, state_dir: &Path, global: &Config, now: u64
     report
 }
 
-fn config_for(global: &Config, root: &Path, state: &Path) -> Result<Config, ShepherdError> {
+pub(crate) fn config_for(
+    global: &Config,
+    root: &Path,
+    state: &Path,
+) -> Result<Config, ShepherdError> {
     let dir = match &global.source {
         config::ConfigSource::Global(path) => {
             path.parent().map(Path::to_path_buf).unwrap_or_default()

@@ -90,6 +90,7 @@ impl Store {
             tickets: Vec::new(),
             agents: Vec::new(),
             pending_pings: Vec::new(),
+            protection_cache: Default::default(),
         }
     }
 
