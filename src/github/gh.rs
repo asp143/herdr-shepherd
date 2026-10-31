@@ -83,6 +83,8 @@ impl PrBackend for GhBackend {
             policy: BranchPolicy::new(&[], None, None)?,
             ticket_branch: branch.into(),
             worktree: worktree.into(),
+            state_dir: crate::gate::state_dir(),
+            config_dir: crate::config::resolve_config_dir(None),
         };
         match gate.gh(&["pr", "view", branch, "--json", "number,url,state,mergedAt,baseRefName,headRefName,headRefOid,statusCheckRollup,reviewDecision,comments,reviews"], worktree) {
             Ok(text) => parse_view(&text).map(Some),

@@ -165,10 +165,12 @@ fn main_checkout_install_refused() {
 fn invalid_protected_branches_type_blocks_direct_push() {
     let repo = Repo::new();
     fs::write(
-        repo.worktree.join(".shepherd.toml"),
+        repo.main.join(".shepherd.toml"),
         "[shepherd]\nprotected_branches = 'feat/t'\n",
     )
     .unwrap();
+    ok(&repo.main, &["add", ".shepherd.toml"]);
+    ok(&repo.main, &["commit", "-m", "trusted protection fixture"]);
     repo.blocked(&["push", "origin", "feat/t"]);
 }
 
@@ -176,9 +178,202 @@ fn invalid_protected_branches_type_blocks_direct_push() {
 fn mixed_protected_branches_array_blocks_direct_push() {
     let repo = Repo::new();
     fs::write(
-        repo.worktree.join(".shepherd.toml"),
+        repo.main.join(".shepherd.toml"),
         "[shepherd]\nprotected_branches = ['other/*', 1]\n",
     )
     .unwrap();
+    ok(&repo.main, &["add", ".shepherd.toml"]);
+    ok(&repo.main, &["commit", "-m", "trusted protection fixture"]);
+    repo.blocked(&["push", "origin", "feat/t"]);
+}
+
+#[test]
+fn missing_ticket_marker_fails_closed() {
+    let repo = Repo::new();
+    ok(
+        &repo.worktree,
+        &["config", "--worktree", "--unset", "shepherd.ticketBranch"],
+    );
+    repo.blocked(&["push", "origin", "feat/t"]);
+}
+
+#[test]
+fn linked_config_redirect_without_marker_is_blocked() {
+    let repo = Repo::new();
+    let remote = repo._dir.path().join("remote.git");
+    let before = ok(
+        &repo.main,
+        &["--git-dir", remote.to_str().unwrap(), "rev-parse", "main"],
+    );
+    ok(
+        &repo.worktree,
+        &["config", "--worktree", "--unset", "shepherd.ticketBranch"],
+    );
+    ok(
+        &repo.worktree,
+        &[
+            "config",
+            "remote.origin.push",
+            "+refs/heads/feat/t:refs/heads/main",
+        ],
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["--json", "--state-dir"])
+        .arg(&repo.state)
+        .args(["pr", "push", "--worktree"])
+        .arg(&repo.worktree)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        before,
+        ok(
+            &repo.main,
+            &["--git-dir", remote.to_str().unwrap(), "rev-parse", "main"]
+        )
+    );
+    ok(
+        &repo.worktree,
+        &["config", "--worktree", "--unset", "core.hooksPath"],
+    );
+    let again = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["--json", "--state-dir"])
+        .arg(&repo.state)
+        .args(["pr", "push", "--worktree"])
+        .arg(&repo.worktree)
+        .output()
+        .unwrap();
+    assert_eq!(again.status.code(), Some(4));
+    assert_eq!(
+        before,
+        ok(
+            &repo.main,
+            &["--git-dir", remote.to_str().unwrap(), "rev-parse", "main"]
+        )
+    );
+}
+
+#[test]
+fn worktree_remote_and_url_redirects_are_ignored() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = Repo::new();
+    let remote = repo._dir.path().join("remote.git");
+    let redirected = repo._dir.path().join("redirected.git");
+    ok(
+        repo._dir.path(),
+        &["init", "--bare", redirected.to_str().unwrap()],
+    );
+    let before = ok(
+        &repo.main,
+        &["--git-dir", remote.to_str().unwrap(), "rev-parse", "main"],
+    );
+    let bin = repo._dir.path().join("fake-bin");
+    fs::create_dir(&bin).unwrap();
+    fs::write(
+        bin.join("gh"),
+        "#!/bin/sh\necho 'no pull requests found for branch feat/t' >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("gh"), fs::Permissions::from_mode(0o700)).unwrap();
+    ok(
+        &repo.worktree,
+        &[
+            "config",
+            "--worktree",
+            "remote.origin.pushurl",
+            redirected.to_str().unwrap(),
+        ],
+    );
+    ok(
+        &repo.worktree,
+        &[
+            "config",
+            "--worktree",
+            &format!("url.{}.insteadOf", redirected.display()),
+            remote.to_str().unwrap(),
+        ],
+    );
+    ok(
+        &repo.worktree,
+        &["config", "--worktree", "--unset", "core.hooksPath"],
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "PATH",
+            std::env::join_paths([bin, "/usr/bin".into(), "/bin".into()]).unwrap(),
+        )
+        .args(["--json", "--state-dir"])
+        .arg(&repo.state)
+        .args(["--config-dir"])
+        .arg(repo._dir.path().join("cfg"))
+        .args(["pr", "push", "--branch", "feat/t", "--worktree"])
+        .arg(&repo.worktree)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        before,
+        ok(
+            &repo.main,
+            &["--git-dir", remote.to_str().unwrap(), "rev-parse", "main"]
+        )
+    );
+    assert!(
+        ok(
+            &repo.main,
+            &["--git-dir", redirected.to_str().unwrap(), "for-each-ref"]
+        )
+        .is_empty()
+    );
+    assert!(
+        !ok(
+            &repo.main,
+            &["--git-dir", remote.to_str().unwrap(), "rev-parse", "feat/t"]
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn installed_hook_keeps_custom_config_and_state() {
+    let repo = Repo::new();
+    let cfg = repo._dir.path().join("custom-config");
+    fs::create_dir(&cfg).unwrap();
+    fs::write(
+        cfg.join("shepherd.toml"),
+        "[shepherd]\nprotected_branches=['feat/t']\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["--state-dir"])
+        .arg(&repo.state)
+        .args(["--config-dir"])
+        .arg(&cfg)
+        .args(["hook", "install", "--branch", "feat/t", "--worktree"])
+        .arg(&repo.worktree)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     repo.blocked(&["push", "origin", "feat/t"]);
 }

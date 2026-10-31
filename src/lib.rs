@@ -15,5 +15,6 @@ pub mod proc;
 pub mod roles;
 pub mod store;
 pub mod ticket;
+pub mod trusted;
 pub mod upkeep;
 pub mod watch;

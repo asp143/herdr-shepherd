@@ -34,7 +34,7 @@ fn ticket_fetch_json_envelope_without_store() {
         )])),
     )]);
     std::fs::write(
-        project.path().join(".shepherd.toml"),
+        global.path().join("shepherd.toml"),
         toml::to_string(&source).unwrap(),
     )
     .unwrap();
@@ -80,7 +80,7 @@ fn invalid_source_output_exits_1() {
                 toml::Value::Array(["sh", "-c", "printf '%s' \"$1\"", "source", &fixture].into_iter().map(|arg| toml::Value::String(arg.into())).collect()),
             )])),
         )]);
-        std::fs::write(project.path().join(".shepherd.toml"), toml::to_string(&source).unwrap()).unwrap();
+        std::fs::write(global.path().join("shepherd.toml"), toml::to_string(&source).unwrap()).unwrap();
         let output = run(project.path(), global.path(), "SYM-7");
         assert_eq!(output.status.code(), Some(1));
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

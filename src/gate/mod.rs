@@ -14,6 +14,8 @@ pub struct Gate {
     pub policy: BranchPolicy,
     pub ticket_branch: String,
     pub worktree: PathBuf,
+    pub state_dir: PathBuf,
+    pub config_dir: PathBuf,
 }
 
 impl Gate {
@@ -37,17 +39,44 @@ impl Gate {
             }
         }
         check_push(&target, &self.ticket_branch, &self.policy)?;
+        if target.remote != "origin" {
+            return Err(ShepherdError::PolicyDenied(
+                "gated pushes require origin".into(),
+            ));
+        }
+        // Never execute the parsed command verbatim: destination-less refs let
+        // remote push mappings replace the destination (and add force).
+        let main = crate::trusted::main_checkout(&self.worktree)?;
+        let url = trusted_push_url(&main)?;
+        let state = &self.state_dir;
+        let hooks = hook::prepare_configured(
+            state,
+            &std::env::current_exe().map_err(anyhow::Error::from)?,
+            &self.config_dir,
+        )?;
+        let reference = format!("refs/heads/{}", self.ticket_branch);
         Self::execute(
             Command::new("git")
-                .current_dir(&self.worktree)
+                .current_dir(&main)
                 .args([
                     "-c",
                     "push.followTags=false",
                     "-c",
-                    &format!("remote.{}.mirror=false", target.remote),
+                    "remote.origin.mirror=false",
+                    "-c",
+                    "push.recurseSubmodules=no",
                 ])
+                .arg("-c")
+                .arg(format!("remote.origin.push={reference}:{reference}"))
+                .arg("-c")
+                .arg(format!("core.hooksPath={}", hooks.display()))
+                .arg("-c")
+                .arg(format!("shepherd.ticketBranch={}", self.ticket_branch))
                 .arg("push")
-                .args(args),
+                .arg("--porcelain")
+                .arg("--")
+                .arg(url)
+                .arg(format!("{reference}:{reference}")),
             Duration::from_secs(120),
             None,
         )
@@ -142,13 +171,12 @@ impl Gate {
         }
         proof.authorize(self, branch)?;
         let reference = format!("refs/heads/{branch}");
+        let main = crate::trusted::main_checkout(&self.worktree)?;
+        let url = trusted_push_url(&main)?;
         let remote = Self::execute(
-            Command::new("git").current_dir(&self.worktree).args([
-                "ls-remote",
-                "--heads",
-                "origin",
-                &reference,
-            ]),
+            Command::new("git")
+                .current_dir(&main)
+                .args(["ls-remote", "--heads", &url, &reference]),
             Duration::from_secs(60),
             None,
         )?;
@@ -166,24 +194,60 @@ impl Gate {
                 "remote branch changed since merge proof".into(),
             ));
         }
-        Self::execute(
-            Command::new("git")
-                .current_dir(&self.worktree)
-                .args([
-                    "-c",
-                    "push.followTags=false",
-                    "-c",
-                    "remote.origin.mirror=false",
-                ])
-                .args([
-                    "push",
-                    &format!("--force-with-lease={reference}:{}", proof.tip()),
-                    "origin",
-                    &format!(":{reference}"),
-                ]),
-            Duration::from_secs(120),
-            None,
-        )?;
+        let mut command = Command::new("git");
+        command.current_dir(&main).args([
+            "-c",
+            "push.followTags=false",
+            "-c",
+            "remote.origin.mirror=false",
+            "-c",
+            "push.recurseSubmodules=no",
+            "push",
+            &format!("--force-with-lease={reference}:{}", proof.tip()),
+        ]);
+        // A trusted MAIN receive-pack setting remains part of the transport;
+        // using an explicit URL otherwise drops that remote-specific setting.
+        if let Some(receivepack) = proc::run(
+            Command::new("git").current_dir(&main).args([
+                "config",
+                "--get",
+                "remote.origin.receivepack",
+            ]),
+            Duration::from_secs(20),
+        )? {
+            command.arg(format!("--receive-pack={}", receivepack.trim()));
+        }
+        command.arg("--").arg(&url).arg(format!(":{reference}"));
+        Self::execute(&mut command, Duration::from_secs(120), None)?;
         Ok(())
     }
+}
+
+/// Keep push authorization independent of worktree-editable remote settings.
+fn trusted_push_url(main: &Path) -> Result<String, ShepherdError> {
+    let url = Gate::execute(
+        Command::new("git")
+            .current_dir(main)
+            .args(["remote", "get-url", "--push", "--all", "origin"]),
+        Duration::from_secs(20),
+        None,
+    )?;
+    let urls: Vec<_> = url.lines().filter(|s| !s.is_empty()).collect();
+    if urls.len() != 1 || urls[0].starts_with('-') {
+        return Err(ShepherdError::PolicyDenied(
+            "origin must have one explicit push URL".into(),
+        ));
+    }
+    Ok(urls[0].into())
+}
+
+pub fn state_dir() -> PathBuf {
+    std::env::var_os("HERDR_PLUGIN_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(".local/state/herdr/plugins/herdr-shepherd")
+        })
 }

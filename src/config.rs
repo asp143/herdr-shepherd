@@ -100,6 +100,38 @@ fn read_table(path: &Path) -> Result<Option<toml::Table>, ShepherdError> {
 pub fn load(config_dir: &Path, project_root: Option<&Path>) -> Result<Config, ShepherdError> {
     let global_path = config_dir.join("shepherd.toml");
     let global = read_table(&global_path)?;
+    let project_path = project_root.map(|root| root.join(".shepherd.toml"));
+    let project = project_path
+        .as_deref()
+        .map(read_table)
+        .transpose()?
+        .flatten();
+    from_tables(global_path, global, project_path, project)
+}
+
+/// Parse only a project configuration whose bytes came from a trusted commit.
+pub(crate) fn load_committed(
+    config_dir: &Path,
+    project_path: &Path,
+    text: Option<&str>,
+) -> Result<Config, ShepherdError> {
+    let global_path = config_dir.join("shepherd.toml");
+    let global = read_table(&global_path)?;
+    let project = text
+        .map(|text| {
+            text.parse::<toml::Table>()
+                .map_err(|err| invalid(project_path, err))
+        })
+        .transpose()?;
+    from_tables(global_path, global, Some(project_path.into()), project)
+}
+
+fn from_tables(
+    global_path: PathBuf,
+    global: Option<toml::Table>,
+    project_path: Option<PathBuf>,
+    project: Option<toml::Table>,
+) -> Result<Config, ShepherdError> {
     if let Some(table) = &global
         && table
             .get("schema_version")
@@ -114,12 +146,6 @@ pub fn load(config_dir: &Path, project_root: Option<&Path>) -> Result<Config, Sh
             .map_err(|err| invalid(&global_path, err))?,
         None => Upkeep::default(),
     };
-    let project_path = project_root.map(|root| root.join(".shepherd.toml"));
-    let project = project_path
-        .as_deref()
-        .map(read_table)
-        .transpose()?
-        .flatten();
     let (raw, source, path) = match (project, global) {
         (Some(project), _) => {
             let path = project_path.expect("project table has a project path");

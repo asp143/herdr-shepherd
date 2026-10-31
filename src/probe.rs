@@ -31,6 +31,8 @@ fn pr_state_with(bin: &Path, p: &Path, branch: &str, timeout: Duration) -> Optio
         policy: BranchPolicy::new(&[], None, None).ok()?,
         ticket_branch: branch.into(),
         worktree: p.into(),
+        state_dir: crate::gate::state_dir(),
+        config_dir: crate::config::resolve_config_dir(None),
     };
     gate.gh_using(
         bin,

@@ -172,9 +172,11 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
             let payload = serde_json::from_str(&cli_pr::read_text(json_file)?)
                 .map_err(|error| ShepherdError::Usage(format!("invalid event JSON: {error}")))?;
             let root = resolve_project_root(None)?;
-            let cfg = config::load(
+            let cfg = herdr_shepherd::trusted::committed_config(
                 &config::resolve_config_dir(cli.config_dir.as_deref()),
-                Some(&root),
+                &root,
+                None,
+                &state_dir(cli),
             )?;
             herdr_shepherd::hooks::emit(&cfg, event, &payload);
             output::emit(cli.json, &serde_json::json!({"event":event}), || {
@@ -187,9 +189,11 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
             force_discard,
         } => {
             let root = cli_pr::git(worktree, &["rev-parse", "--show-toplevel"])?;
-            let cfg = config::load(
+            let cfg = herdr_shepherd::trusted::committed_config(
                 &config::resolve_config_dir(cli.config_dir.as_deref()),
-                Some(Path::new(&root)),
+                Path::new(&root),
+                None,
+                &state_dir(cli),
             )?;
             let h = CliHerdr::from_env();
             let preflight = herdr_shepherd::cleanup::preflight(
@@ -228,11 +232,12 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
         }
         Commands::Hook { command } => match command {
             HookCommand::Install { worktree, branch } => {
-                herdr_shepherd::gate::hook::install(
+                herdr_shepherd::gate::hook::install_configured(
                     worktree,
                     branch,
                     &state_dir(cli),
                     &std::env::current_exe().map_err(anyhow::Error::from)?,
+                    &config::resolve_config_dir(cli.config_dir.as_deref()),
                 )?;
                 output::emit(cli.json, &serde_json::json!({"installed":true}), || {
                     "shepherd: pre-push hook installed".into()
@@ -244,9 +249,11 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 std::io::stdin()
                     .read_to_string(&mut input)
                     .map_err(anyhow::Error::from)?;
-                if let Err(error) = herdr_shepherd::gate::hook::pre_push(
+                if let Err(error) = herdr_shepherd::gate::hook::pre_push_configured(
                     &std::env::current_dir().map_err(anyhow::Error::from)?,
                     &input,
+                    &state_dir(cli),
+                    &config::resolve_config_dir(cli.config_dir.as_deref()),
                 ) {
                     eprintln!("shepherd: push blocked: {error}");
                     std::process::exit(1);
@@ -256,6 +263,7 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
         Commands::Pr { command } => cli_pr::run(
             command,
             &config::resolve_config_dir(cli.config_dir.as_deref()),
+            &state_dir(cli),
             cli.json,
         )?,
         Commands::Shim {
@@ -300,9 +308,11 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                     });
                 }
                 TicketCommands::Fetch { id } => {
-                    let cfg = config::load(
+                    let cfg = herdr_shepherd::trusted::committed_config(
                         &config::resolve_config_dir(cli.config_dir.as_deref()),
-                        Some(&project),
+                        &project,
+                        None,
+                        &state_dir(cli),
                     )?;
                     let ticket = herdr_shepherd::ticket::source::fetch(&cfg, id)?;
                     output::emit(cli.json, &ticket, || {

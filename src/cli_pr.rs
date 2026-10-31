@@ -1,6 +1,6 @@
 use clap::Subcommand;
 use herdr_shepherd::{
-    config::{self, Config},
+    config::Config,
     error::ShepherdError,
     gate::{BranchPolicy, Gate},
     github::{PrBackend, gh::GhBackend},
@@ -27,6 +27,8 @@ pub enum PrCommand {
     Push {
         #[arg(long)]
         worktree: PathBuf,
+        #[arg(long)]
+        branch: Option<String>,
     },
     Create {
         #[arg(long)]
@@ -65,35 +67,31 @@ pub fn git(worktree: &Path, args: &[&str]) -> Result<String, ShepherdError> {
     Ok(result.stdout.trim().to_owned())
 }
 
-pub fn gate(worktree: &Path, cfg: &Config, base: Option<&str>) -> Result<Gate, ShepherdError> {
+pub fn gate(
+    worktree: &Path,
+    cfg: &Config,
+    base: Option<&str>,
+    declared: Option<&str>,
+    state: &Path,
+) -> Result<Gate, ShepherdError> {
     let branch = git(worktree, &["branch", "--show-current"])?;
     if branch.is_empty() {
         return Err(ShepherdError::Usage("worktree must be on a branch".into()));
     }
-    let declared = git(
-        worktree,
-        &["config", "--worktree", "--get", "shepherd.ticketBranch"],
-    )
-    .unwrap_or_else(|_| branch.clone());
+    let declared = declared.unwrap_or(&branch).to_owned();
     if branch != declared {
         return Err(ShepherdError::PolicyDenied(
-            "worktree is not on its declared ticket branch".into(),
+            "worktree is not on the authorized ticket branch".into(),
         ));
     }
-    let default = git(
-        worktree,
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    )
-    .ok();
+    let default = herdr_shepherd::trusted::default_branch(worktree, state)?;
     let extra = herdr_shepherd::gate::policy::extra_patterns(cfg)?;
     Ok(Gate {
-        policy: BranchPolicy::new(
-            &extra,
-            default.as_deref().and_then(|s| s.strip_prefix("origin/")),
-            base,
-        )?,
+        policy: BranchPolicy::new(&extra, default.as_deref(), base)?,
         ticket_branch: declared,
         worktree: worktree.into(),
+        state_dir: state.into(),
+        config_dir: herdr_shepherd::config::resolve_config_dir(None),
     })
 }
 
@@ -113,21 +111,31 @@ pub fn read_text(path: &Path) -> Result<String, ShepherdError> {
     std::fs::read_to_string(actual).map_err(|e| ShepherdError::Runtime(e.into()))
 }
 
-pub fn run(command: &PrCommand, config_dir: &Path, json: bool) -> Result<(), ShepherdError> {
+pub fn run(
+    command: &PrCommand,
+    config_dir: &Path,
+    state: &Path,
+    json: bool,
+) -> Result<(), ShepherdError> {
     let worktree = match command {
         PrCommand::Owners { worktree, .. }
         | PrCommand::View { worktree }
-        | PrCommand::Push { worktree }
+        | PrCommand::Push { worktree, .. }
         | PrCommand::Create { worktree, .. }
         | PrCommand::Reply { worktree, .. } => worktree,
     };
-    let root = git(worktree, &["rev-parse", "--show-toplevel"])?;
-    let cfg = config::load(config_dir, Some(Path::new(&root)))?;
+    let cfg = herdr_shepherd::trusted::committed_config(config_dir, worktree, None, state)?;
     let base = match command {
         PrCommand::Create { base, .. } | PrCommand::Owners { base, .. } => Some(base.as_str()),
         _ => None,
     };
-    let mut gate = gate(worktree, &cfg, base)?;
+    let declared = if let PrCommand::Push { branch, .. } = command {
+        Some(ticket_branch(worktree, state, branch.as_deref())?)
+    } else {
+        None
+    };
+    let mut gate = gate(worktree, &cfg, base, declared.as_deref(), state)?;
+    gate.config_dir = config_dir.into();
     let backend = GhBackend;
     let data = match command {
         PrCommand::Owners { base, .. } => {
@@ -144,7 +152,14 @@ pub fn run(command: &PrCommand, config_dir: &Path, json: bool) -> Result<(), She
                 &gate.policy,
             )?;
             if let Some(status) = backend.view(worktree, &gate.ticket_branch)? {
-                gate = self::gate(worktree, &cfg, Some(&status.base))?;
+                gate = self::gate(
+                    worktree,
+                    &cfg,
+                    Some(&status.base),
+                    declared.as_deref(),
+                    state,
+                )?;
+                gate.config_dir = config_dir.into();
             }
             backend.push(&gate)?;
             serde_json::json!({"pushed":true, "branch":gate.ticket_branch})
@@ -226,4 +241,35 @@ fn owners(gate: &Gate, base: &str) -> Result<Vec<String>, ShepherdError> {
         ));
     }
     Ok(codeowners::owners_for(&rules, &changed, Some(author)))
+}
+
+fn ticket_branch(
+    worktree: &Path,
+    state: &Path,
+    explicit: Option<&str>,
+) -> Result<String, ShepherdError> {
+    let main = herdr_shepherd::trusted::main_checkout(worktree)?;
+    let path = worktree.canonicalize().map_err(anyhow::Error::from)?;
+    let data = herdr_shepherd::store::Store::open(state, &main)?.read()?;
+    let stored = data.tickets.iter().find_map(|t| {
+        if t.worktree.as_ref() == Some(&path) {
+            Some(t.branch.as_str())
+        } else {
+            t.children
+                .iter()
+                .find(|c| c.path == path)
+                .map(|c| c.branch.as_str())
+        }
+    });
+    if let Some(stored) = stored {
+        if explicit.is_some_and(|branch| branch != stored) {
+            return Err(ShepherdError::PolicyDenied(
+                "explicit branch differs from ticket store".into(),
+            ));
+        }
+        return Ok(stored.into());
+    }
+    explicit.map(str::to_owned).ok_or_else(|| {
+        ShepherdError::PolicyDenied("push requires a stored ticket or explicit --branch".into())
+    })
 }

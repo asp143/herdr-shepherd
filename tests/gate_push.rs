@@ -67,7 +67,7 @@ impl Repo {
         self.command(env!("CARGO_BIN_EXE_herdr-shepherd"))
             .env("PATH", path)
             .env("HERDR_PLUGIN_CONFIG_DIR", self._dir.path().join("config"))
-            .args(["--json", "pr", "push", "--worktree"])
+            .args(["--json", "pr", "push", "--branch", "feat/t", "--worktree"])
             .arg(&self.root)
             .output()
             .unwrap()
@@ -115,4 +115,81 @@ fn push_disables_remote_mirror_and_preserves_refs() {
         repo.remote_refs(),
         ["refs/heads/feat/t", "refs/heads/main", "refs/tags/existing"]
     );
+}
+
+#[test]
+fn config_redirect_without_explicit_ticket_is_blocked() {
+    let repo = Repo::new();
+    let before = repo.git(&[
+        "--git-dir",
+        repo.remote.to_str().unwrap(),
+        "rev-parse",
+        "main",
+    ]);
+    repo.git(&[
+        "config",
+        "remote.origin.push",
+        "+refs/heads/feat/t:refs/heads/main",
+    ]);
+    repo.git(&["commit", "--allow-empty", "-m", "attacker"]);
+    let out = repo
+        .command(env!("CARGO_BIN_EXE_herdr-shepherd"))
+        .env(
+            "PATH",
+            std::env::join_paths([repo.bin.clone(), "/usr/bin".into(), "/bin".into()]).unwrap(),
+        )
+        .env("HERDR_PLUGIN_CONFIG_DIR", repo._dir.path().join("config"))
+        .args(["--json", "pr", "push", "--worktree"])
+        .arg(&repo.root)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        before,
+        repo.git(&[
+            "--git-dir",
+            repo.remote.to_str().unwrap(),
+            "rev-parse",
+            "main"
+        ])
+    );
+}
+
+#[test]
+fn config_redirect_cannot_rewrite_main_with_explicit_branch() {
+    let repo = Repo::new();
+    let before = repo.git(&[
+        "--git-dir",
+        repo.remote.to_str().unwrap(),
+        "rev-parse",
+        "main",
+    ]);
+    repo.git(&[
+        "config",
+        "remote.origin.push",
+        "+refs/heads/feat/t:refs/heads/main",
+    ]);
+    repo.git(&["config", "core.hooksPath", "/dev/null"]);
+    repo.git(&["commit", "--allow-empty", "-m", "ticket"]);
+    let out = repo.push();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        before,
+        repo.git(&[
+            "--git-dir",
+            repo.remote.to_str().unwrap(),
+            "rev-parse",
+            "main"
+        ])
+    );
+    assert!(repo.remote_refs().contains(&"refs/heads/feat/t".to_owned()));
 }

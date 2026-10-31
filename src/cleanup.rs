@@ -377,13 +377,9 @@ pub fn preflight<'a>(
                 "merged PR does not match the ticket branch".into(),
             ));
         }
-        let default = git(
-            &worktree,
-            &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-        )
-        .ok()
-        .and_then(|value| value.strip_prefix("origin/").map(str::to_owned));
-        let base = default.clone().unwrap_or_else(|| status.base.clone());
+        let default =
+            crate::trusted::default_branch(&worktree, &crate::trusted::default_state_dir())?;
+        let base = status.base.clone();
         git(&worktree, &["check-ref-format", "--branch", &base])?;
         let policy = BranchPolicy::new(
             &crate::gate::policy::extra_patterns(cfg)?,
@@ -633,6 +629,8 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
                 policy: p.policy,
                 ticket_branch: p.target.branch.clone(),
                 worktree: p.main.clone(),
+                state_dir: crate::gate::state_dir(),
+                config_dir: crate::config::resolve_config_dir(None),
             };
             gate.delete_remote_branch(&p.target.branch, &p.proof)?;
         }
