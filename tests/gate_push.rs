@@ -10,6 +10,7 @@ struct Repo {
     root: PathBuf,
     remote: PathBuf,
     bin: PathBuf,
+    state: PathBuf,
 }
 impl Repo {
     fn command(&self, program: &str) -> Command {
@@ -37,6 +38,7 @@ impl Repo {
         let root = dir.path().join("repo");
         let remote = dir.path().join("remote.git");
         let bin = dir.path().join("bin");
+        let state = dir.path().join("state");
         fs::create_dir(&root).unwrap();
         fs::create_dir(&bin).unwrap();
         let repo = Self {
@@ -44,6 +46,7 @@ impl Repo {
             root,
             remote,
             bin,
+            state,
         };
         repo.git(&["init", "-b", "feat/t"]);
         repo.git(&["config", "user.name", "Fixture"]);
@@ -59,6 +62,24 @@ impl Repo {
         )
         .unwrap();
         fs::set_permissions(repo.bin.join("gh"), fs::Permissions::from_mode(0o700)).unwrap();
+        let store = herdr_shepherd::store::Store::open(&repo.state, &repo.root).unwrap();
+        store
+            .update(|data| {
+                data.tickets.push(herdr_shepherd::store::Ticket {
+                    id: "T".into(),
+                    branch: "feat/t".into(),
+                    base: "main".into(),
+                    worktree: Some(repo.root.clone()),
+                    ..Default::default()
+                });
+                Ok(())
+            })
+            .unwrap();
+        let file = store.root().join("state.json");
+        let mut data: serde_json::Value =
+            serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        data["trust"] = serde_json::json!({"project_root":repo.root,"common_git_dir":repo.root.join(".git"),"origin_url":repo.remote.to_str().unwrap(),"push_url":repo.remote.to_str().unwrap(),"default_branch":"main","config_commit":null,"config_blob":null,"config_text":null,"trusted_at":"fixture","global_config":"/dev/null","object_format":"sha1"});
+        fs::write(file, serde_json::to_vec(&data).unwrap()).unwrap();
         repo
     }
     fn push(&self) -> Output {
@@ -67,6 +88,9 @@ impl Repo {
         self.command(env!("CARGO_BIN_EXE_herdr-shepherd"))
             .env("PATH", path)
             .env("HERDR_PLUGIN_CONFIG_DIR", self._dir.path().join("config"))
+            .env("SHEPHERD_TEST_ALLOW_LOCAL_ORIGIN", "allow-local-in-tmp")
+            .arg("--state-dir")
+            .arg(&self.state)
             .args(["--json", "pr", "push", "--branch", "feat/t", "--worktree"])
             .arg(&self.root)
             .output()
@@ -120,6 +144,13 @@ fn push_disables_remote_mirror_and_preserves_refs() {
 #[test]
 fn config_redirect_without_explicit_ticket_is_blocked() {
     let repo = Repo::new();
+    herdr_shepherd::store::Store::open(&repo.state, &repo.root)
+        .unwrap()
+        .update(|data| {
+            data.tickets.clear();
+            Ok(())
+        })
+        .unwrap();
     let before = repo.git(&[
         "--git-dir",
         repo.remote.to_str().unwrap(),
@@ -139,6 +170,8 @@ fn config_redirect_without_explicit_ticket_is_blocked() {
             std::env::join_paths([repo.bin.clone(), "/usr/bin".into(), "/bin".into()]).unwrap(),
         )
         .env("HERDR_PLUGIN_CONFIG_DIR", repo._dir.path().join("config"))
+        .arg("--state-dir")
+        .arg(&repo.state)
         .args(["--json", "pr", "push", "--worktree"])
         .arg(&repo.root)
         .output()

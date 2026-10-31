@@ -139,9 +139,30 @@ pub enum Severity {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProjectTrust {
+    pub project_root: PathBuf,
+    pub common_git_dir: PathBuf,
+    pub origin_url: String,
+    pub push_url: String,
+    pub default_branch: String,
+    pub config_commit: Option<String>,
+    pub config_blob: Option<String>,
+    pub config_text: Option<String>,
+    pub trusted_at: String,
+    pub global_config: Option<PathBuf>,
+    #[serde(default = "default_object_format")]
+    pub object_format: String,
+}
+fn default_object_format() -> String {
+    "sha1".into()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StoreData {
     pub schema_version: u32,
     pub project_root: PathBuf,
+    #[serde(default)]
+    pub trust: Option<ProjectTrust>,
     pub lead: Option<LeadRecord>,
     pub tickets: Vec<Ticket>,
     pub agents: Vec<AgentRecord>,

@@ -78,6 +78,7 @@ impl Repo {
 #[test]
 fn committed_base_blocks_ticket_config_hook_injection() {
     let repo = Repo::new("[shepherd]\nprotected_branches=['stable']\n");
+    trusted::ensure_snapshot(&repo.state, &repo.root).unwrap();
     let marker = repo._dir.path().join("injected");
     let evil = format!(
         "[shepherd]\nprotected_branches=[]\n[[hooks]]\non='ticket.queued'\ncommand=['touch','{}']\n",
@@ -109,7 +110,7 @@ fn cached_provider_default_survives_mutable_origin_head() {
         "https://github.com/fixture/repository",
     ]);
     let fake = repo._dir.path().join("gh");
-    fs::write(&fake,format!("#!/bin/sh\n[ \"$PWD\" = '{}' ] || exit 7\nprintf '%s\\n' '{{\"defaultBranchRef\":{{\"name\":\"stable\"}}}}'\n",repo.root.display())).unwrap();
+    fs::write(&fake,format!("#!/bin/sh\n[ \"$PWD\" != '{}' ] || exit 7\nprintf '%s\\n' '{{\"defaultBranchRef\":{{\"name\":\"stable\"}}}}'\n",repo.wt.display())).unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(
         trusted::default_branch_using(&repo.wt, &repo.state, &fake)
@@ -149,6 +150,7 @@ fn cached_provider_default_survives_mutable_origin_head() {
 #[test]
 fn missing_committed_config_retains_global_hooks() {
     let repo = Repo::new("");
+    trusted::ensure_snapshot(&repo.state, &repo.root).unwrap();
     let good = repo._dir.path().join("global-hook");
     fs::write(
         repo.config.join("shepherd.toml"),
@@ -180,6 +182,7 @@ fn committed_project_hooks_remain_available() {
     repo.git(&["add", ".shepherd.toml"]);
     repo.git(&["commit", "-m", "trusted hook"]);
     repo.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    trusted::ensure_snapshot(&repo.state, &repo.root).unwrap();
     let cfg = trusted::committed_config(&repo.config, &repo.wt, None, &repo.state).unwrap();
     hooks::emit(&cfg, "ticket.queued", &serde_json::json!({}));
     assert!(good.exists());

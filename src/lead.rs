@@ -54,8 +54,11 @@ fn launch_lead(
             "invoking workspace is required".into(),
         ));
     }
-    let resolved = roles::resolve(cfg)?;
     let data = store.read()?;
+    if crate::trusted::main_checkout(&data.project_root).is_ok() {
+        crate::trusted::ensure_snapshot(ctx.state_dir, &data.project_root)?;
+    }
+    let resolved = roles::resolve(cfg)?;
     let role = Role {
         name: "lead".into(),
         description: "Coordinates the flock and speaks to the user".into(),
@@ -266,6 +269,10 @@ pub struct InitReport {
 }
 
 pub fn init(project_root: &Path) -> Result<InitReport, ShepherdError> {
+    init_with_state(project_root, &crate::trusted::default_state_dir())
+}
+
+pub fn init_with_state(project_root: &Path, state_dir: &Path) -> Result<InitReport, ShepherdError> {
     if !project_root.is_dir() {
         return Err(ShepherdError::Usage(
             "project root must be a directory".into(),
@@ -285,6 +292,9 @@ pub fn init(project_root: &Path) -> Result<InitReport, ShepherdError> {
         })?;
     file.write_all(DEFAULT_CONFIG.as_bytes())
         .map_err(anyhow::Error::from)?;
+    if crate::trusted::main_checkout(project_root).is_ok() {
+        crate::trusted::snapshot_initialized_config(state_dir, project_root, DEFAULT_CONFIG)?;
+    }
     Ok(InitReport {
         path,
         recommendation:

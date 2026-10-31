@@ -283,3 +283,64 @@ fn backend_reply_uses_general_and_thread_forms() {
     assert!(args.contains("pr\ncomment\n42\n--body-file\n-\n"), "{args}");
     assert!(args.contains("api\n-X\nPOST\nrepos/example/repo/pulls/42/comments/123/replies\n-f\nbody=A literal reply: $(unchanged) 'quoted'\nsecond line\n"),"{args}");
 }
+
+#[test]
+fn pr_push_requires_ticket_even_with_explicit_branch() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    repo(&root, "trunk");
+    let origin = dir.path().join("origin.git");
+    git(&root, &["init", "--bare", origin.to_str().unwrap()]);
+    git(
+        &root,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&root, &["push", "origin", "trunk"]);
+    let before = git(&origin, &["rev-parse", "trunk"]).stdout;
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "change",
+        ],
+    );
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::write(
+        bin.join("gh"),
+        "#!/bin/sh\necho 'no pull requests found' >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("gh"), fs::Permissions::from_mode(0o700)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "PATH",
+            std::env::join_paths([bin, "/usr/bin".into(), "/bin".into()]).unwrap(),
+        )
+        .args(["--json", "--state-dir"])
+        .arg(dir.path().join("state"))
+        .args(["--config-dir"])
+        .arg(dir.path().join("cfg"))
+        .args(["pr", "push", "--worktree"])
+        .arg(&root)
+        .args(["--branch", "trunk"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(before, git(&origin, &["rev-parse", "trunk"]).stdout);
+}

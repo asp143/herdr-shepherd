@@ -37,6 +37,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     Init {
         #[arg(long)]
         project_root: Option<PathBuf>,
@@ -170,6 +174,14 @@ enum TicketCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum ConfigCommand {
+    Trust {
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+}
+
 #[derive(serde::Serialize)]
 struct ValidatedConfig {
     #[serde(flatten)]
@@ -217,9 +229,30 @@ fn state_dir(cli: &Cli) -> PathBuf {
 
 fn run(cli: &Cli) -> Result<(), ShepherdError> {
     match &cli.command {
+        Commands::Config {
+            command: ConfigCommand::Trust { project_root },
+        } => {
+            let root = resolve_project_root(project_root.as_deref())?;
+            let state = state_dir(cli);
+            let main = herdr_shepherd::trusted::main_checkout(&root)?;
+            let data = herdr_shepherd::store::Store::open(&state, &main)?.read()?;
+            if let Ok(pane) = std::env::var("HERDR_PANE_ID")
+                && data
+                    .agents
+                    .iter()
+                    .any(|a| a.pane_id.as_deref() == Some(pane.as_str()))
+            {
+                return Err(ShepherdError::PolicyDenied(
+                    "config trust requires a user outside managed agent panes".into(),
+                ));
+            }
+            let report = herdr_shepherd::trusted::refresh_snapshot(&state, &root)?;
+            output::emit(cli.json, &report, || report.diff.clone());
+        }
+
         Commands::Init { project_root } => {
             let project = resolve_project_root(project_root.as_deref())?;
-            let report = herdr_shepherd::lead::init(&project)?;
+            let report = herdr_shepherd::lead::init_with_state(&project, &state_dir(cli))?;
             output::emit(cli.json, &report, || {
                 format!(
                     "Initialized {}\n{}",
@@ -232,6 +265,7 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
             let root = resolve_project_root(project_root.as_deref())?;
             let state = state_dir(cli);
             let dir = config::resolve_config_dir(cli.config_dir.as_deref());
+            herdr_shepherd::trusted::ensure_snapshot(&state, &root)?;
             let cfg = herdr_shepherd::trusted::committed_config(&dir, &root, None, &state)?;
             let store = herdr_shepherd::store::Store::open(&state, &root)?;
             let h = herdr_client()?;
@@ -488,6 +522,7 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 TicketCommands::Dispatch => {
                     let store = herdr_shepherd::store::Store::open(&state_dir(cli), &project)?;
                     let dir = config::resolve_config_dir(cli.config_dir.as_deref());
+                    herdr_shepherd::trusted::ensure_snapshot(&state_dir(cli), &project)?;
                     let cfg = herdr_shepherd::trusted::committed_config(
                         &dir,
                         &project,

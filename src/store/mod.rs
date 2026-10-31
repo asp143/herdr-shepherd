@@ -85,6 +85,7 @@ impl Store {
         StoreData {
             schema_version: 1,
             project_root: self.project_root.clone(),
+            trust: None,
             lead: None,
             tickets: Vec::new(),
             agents: Vec::new(),

@@ -68,6 +68,24 @@ impl Repo {
             Path::new(env!("CARGO_BIN_EXE_herdr-shepherd")),
         )
         .unwrap();
+        let store = herdr_shepherd::store::Store::open(&state, &main).unwrap();
+        herdr_shepherd::trusted::ensure_snapshot(&state, &main).unwrap();
+        store
+            .update(|data| {
+                if let Some(trust) = data.trust.as_mut() {
+                    trust.global_config = Some("/dev/null".into());
+                }
+                data.tickets.push(herdr_shepherd::store::Ticket {
+                    id: "T-1".into(),
+                    branch: "feat/t".into(),
+                    base: "main".into(),
+                    state: herdr_shepherd::store::TicketState::Building,
+                    worktree: Some(worktree.clone()),
+                    ..Default::default()
+                });
+                Ok(())
+            })
+            .unwrap();
         Self {
             _dir: dir,
             main,
@@ -171,6 +189,7 @@ fn invalid_protected_branches_type_blocks_direct_push() {
     .unwrap();
     ok(&repo.main, &["add", ".shepherd.toml"]);
     ok(&repo.main, &["commit", "-m", "trusted protection fixture"]);
+    herdr_shepherd::trusted::refresh_snapshot(&repo.state, &repo.main).unwrap();
     repo.blocked(&["push", "origin", "feat/t"]);
 }
 
@@ -184,6 +203,7 @@ fn mixed_protected_branches_array_blocks_direct_push() {
     .unwrap();
     ok(&repo.main, &["add", ".shepherd.toml"]);
     ok(&repo.main, &["commit", "-m", "trusted protection fixture"]);
+    herdr_shepherd::trusted::refresh_snapshot(&repo.state, &repo.main).unwrap();
     repo.blocked(&["push", "origin", "feat/t"]);
 }
 
@@ -200,6 +220,13 @@ fn missing_ticket_marker_fails_closed() {
 #[test]
 fn linked_config_redirect_without_marker_is_blocked() {
     let repo = Repo::new();
+    herdr_shepherd::store::Store::open(&repo.state, &repo.main)
+        .unwrap()
+        .update(|data| {
+            data.tickets.clear();
+            Ok(())
+        })
+        .unwrap();
     let remote = repo._dir.path().join("remote.git");
     let before = ok(
         &repo.main,
@@ -307,6 +334,7 @@ fn worktree_remote_and_url_redirects_are_ignored() {
         &["config", "--worktree", "--unset", "core.hooksPath"],
     );
     let out = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+        .env("SHEPHERD_TEST_ALLOW_LOCAL_ORIGIN", "allow-local-in-tmp")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env(
