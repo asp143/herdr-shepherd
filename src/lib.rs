@@ -1,5 +1,6 @@
 pub mod config;
 pub mod error;
+pub mod gate;
 pub mod herdr;
 pub mod output;
 pub mod probe;
