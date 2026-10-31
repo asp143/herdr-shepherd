@@ -349,13 +349,14 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 &state_dir(cli),
             )?;
             let h = CliHerdr::from_env();
-            let preflight = herdr_shepherd::cleanup::preflight(
+            let preflight = herdr_shepherd::cleanup::preflight_with_state(
                 &h,
                 &herdr_shepherd::github::gh::GhBackend,
                 &cfg,
                 Path::new(&root),
                 *force_discard,
                 *dry_run,
+                &state_dir(cli),
             )?;
             let report = herdr_shepherd::cleanup::run(preflight, *dry_run)?;
             output::emit(cli.json, &report, || {

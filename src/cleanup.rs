@@ -26,13 +26,30 @@ pub struct MergeProof {
     tip: String,
     base: String,
     origin: String,
+    project_root: PathBuf,
+    state_dir: PathBuf,
+    base_tip: String,
+    allow_local_for_tests: bool,
 }
 
 impl MergeProof {
+    pub(crate) fn transport(&self) -> Result<crate::gate::transport::PushTransport, ShepherdError> {
+        crate::gate::transport::PushTransport::open_with_options(
+            &self.state_dir,
+            &self.project_root,
+            crate::gate::transport::TransportOptions {
+                allow_local_for_tests: self.allow_local_for_tests,
+            },
+        )
+    }
     fn validate_repository(&self, path: &Path) -> Result<(), ShepherdError> {
-        if repo_id(path)? != self.repo || origin_identity(path)? != self.origin {
+        let transport = self.transport()?;
+        if transport.trust.common_git_dir != self.repo
+            || transport.trust.push_url != self.origin
+            || !transport.matches_repository(path)?
+        {
             return Err(ShepherdError::PolicyDenied(
-                "cleanup repository or origin changed after merge proof".into(),
+                "cleanup repository or trusted origin changed after merge proof".into(),
             ));
         }
         Ok(())
@@ -45,16 +62,14 @@ impl MergeProof {
         if branch != self.branch || branch != gate.ticket_branch || self.merged_at.is_empty() {
             return Err(denied());
         }
-        let local = capture(
-            &gate.worktree,
-            &["rev-parse", "--verify", "--quiet", &branch_ref(branch)],
-        )?;
-        if (!local.status.success() && local.status.code() != Some(1))
-            || (local.status.success() && local.stdout.trim() != self.tip)
+        let transport = self.transport()?;
+        if transport
+            .read_ref(&branch_ref(branch))?
+            .is_some_and(|tip| tip != self.tip)
         {
             return Err(denied());
         }
-        if !ancestor(&gate.worktree, &self.tip, &base_ref(&self.base))? {
+        if !transport.is_ancestor(&self.tip, &self.base_tip)? {
             return Err(denied());
         }
         Ok(())
@@ -135,10 +150,6 @@ fn branch_ref(branch: &str) -> String {
     format!("refs/heads/{branch}")
 }
 
-fn base_ref(base: &str) -> String {
-    format!("refs/remotes/origin/{base}")
-}
-
 fn repo_id(path: &Path) -> Result<PathBuf, ShepherdError> {
     let common = git(
         path,
@@ -148,17 +159,6 @@ fn repo_id(path: &Path) -> Result<PathBuf, ShepherdError> {
         .canonicalize()
         .map_err(|error| error.into())
         .map_err(ShepherdError::Runtime)
-}
-
-fn origin_identity(path: &Path) -> Result<String, ShepherdError> {
-    let fetch = git(path, &["remote", "get-url", "--all", "origin"])?;
-    let push = git(path, &["remote", "get-url", "--push", "--all", "origin"])?;
-    if fetch.lines().count() != 1 || fetch.is_empty() || push != fetch {
-        return Err(ShepherdError::PolicyDenied(
-            "cleanup requires one identical origin fetch and push URL".into(),
-        ));
-    }
-    Ok(fetch)
 }
 
 fn ancestor(path: &Path, source: &str, base: &str) -> Result<bool, ShepherdError> {
@@ -171,11 +171,6 @@ fn ancestor(path: &Path, source: &str, base: &str) -> Result<bool, ShepherdError
             out.stderr.trim()
         ))),
     }
-}
-
-fn patch_equivalent(path: &Path, branch: &str, base: &str) -> Result<bool, ShepherdError> {
-    let out = git(path, &["cherry", base, &branch_ref(branch)])?;
-    Ok(out.lines().all(|line| line.starts_with("- ")))
 }
 
 fn check_caller(workspace: &str, caller: Option<&str>) -> Result<(), ShepherdError> {
@@ -348,6 +343,46 @@ pub fn preflight<'a>(
     force_discard: bool,
     dry_run: bool,
 ) -> Result<Preflight<'a>, ShepherdError> {
+    preflight_with_state(
+        h,
+        backend,
+        cfg,
+        worktree,
+        force_discard,
+        dry_run,
+        &crate::gate::state_dir(),
+    )
+}
+
+pub fn preflight_with_state<'a>(
+    h: &'a dyn Herdr,
+    backend: &dyn PrBackend,
+    cfg: &'a Config,
+    worktree: &Path,
+    force_discard: bool,
+    dry_run: bool,
+    state_dir: &Path,
+) -> Result<Preflight<'a>, ShepherdError> {
+    preflight_with_transport(
+        h,
+        backend,
+        cfg,
+        worktree,
+        force_discard,
+        dry_run,
+        crate::gate::transport::PushTransport::open(state_dir, worktree)?,
+    )
+}
+
+pub fn preflight_with_transport<'a>(
+    h: &'a dyn Herdr,
+    backend: &dyn PrBackend,
+    cfg: &'a Config,
+    worktree: &Path,
+    force_discard: bool,
+    dry_run: bool,
+    transport: crate::gate::transport::PushTransport,
+) -> Result<Preflight<'a>, ShepherdError> {
     let result = (|| {
         let worktree = worktree.canonicalize().map_err(anyhow::Error::from)?;
         let branch = git(&worktree, &["branch", "--show-current"])?;
@@ -359,7 +394,19 @@ pub fn preflight<'a>(
         git(&worktree, &["check-ref-format", "--branch", &branch])?;
         let workspaces = h.workspaces()?;
         let target = owned_target(&worktree, &branch, &workspaces, force_discard)?;
-        let origin = origin_identity(&worktree)?;
+        if transport.trust.origin_url != transport.trust.push_url {
+            return Err(ShepherdError::PolicyDenied(
+                "cleanup requires one snapshotted fetch/push origin".into(),
+            ));
+        }
+        let origin = transport.trust.push_url.clone();
+        let project_root = transport.trust.project_root.clone();
+        let safe_tip = transport.verified_ticket_head(&branch)?;
+        if safe_tip != target.tip {
+            return Err(ShepherdError::PolicyDenied(
+                "ticket HEAD changed during cleanup".into(),
+            ));
+        }
         let status = backend
             .view(&worktree, &branch)?
             .ok_or_else(|| ShepherdError::Usage("not merged: no PR".into()))?;
@@ -378,8 +425,7 @@ pub fn preflight<'a>(
                 "merged PR does not match the ticket branch".into(),
             ));
         }
-        let default =
-            crate::trusted::default_branch(&worktree, &crate::trusted::default_state_dir())?;
+        let default = Some(transport.trust.default_branch.clone());
         let base = status.base.clone();
         git(&worktree, &["check-ref-format", "--branch", &base])?;
         let policy = BranchPolicy::new(
@@ -392,17 +438,15 @@ pub fn preflight<'a>(
                 "cleanup cannot remove a protected branch".into(),
             ));
         }
-        if !dry_run {
-            git(&worktree, &["fetch", "--prune", "origin"])?;
-        }
-        git(&worktree, &["rev-parse", "--verify", &base_ref(&base)])?;
-        if origin_identity(&worktree)? != origin {
-            return Err(ShepherdError::PolicyDenied(
-                "origin changed during merge verification".into(),
-            ));
-        }
-        if !ancestor(&worktree, &target.tip, &base_ref(&base))?
-            && !patch_equivalent(&worktree, &branch, &base_ref(&base))?
+        let base_tip = if dry_run {
+            transport
+                .remote_tip(&base)?
+                .ok_or_else(|| ShepherdError::Usage("remote base is missing".into()))?
+        } else {
+            transport.fetch_branch(&base)?
+        };
+        if !transport.is_ancestor(&target.tip, &base_tip)?
+            && !transport.patch_equivalent(&target.tip, &base_tip)?
             && status.head_oid.as_deref() != Some(target.tip.as_str())
         {
             return Err(ShepherdError::Usage(
@@ -445,8 +489,8 @@ pub fn preflight<'a>(
             }
             let child = owned_target(&path, child_branch, &workspaces, force_discard)?;
             if !ancestor(&path, &child.tip, &target.tip)?
-                && !ancestor(&path, &child.tip, &base_ref(&base))?
-                && !patch_equivalent(&path, child_branch, &base_ref(&base))?
+                && !transport.is_ancestor(&child.tip, &base_tip)?
+                && !transport.patch_equivalent(&child.tip, &base_tip)?
             {
                 return Err(ShepherdError::Usage(
                     "child commits are not contained in ticket or base".into(),
@@ -476,6 +520,10 @@ pub fn preflight<'a>(
                 tip,
                 base,
                 origin,
+                project_root,
+                state_dir: transport.state_dir().into(),
+                allow_local_for_tests: transport.allow_local_for_tests(),
+                base_tip,
             },
             policy,
             force_discard,
@@ -509,19 +557,16 @@ fn base_sync_status(main: &Path, base: &str) -> Result<(), String> {
 }
 
 fn remote_state(
-    main: &Path,
+    proof: &MergeProof,
     branch: &str,
     tip: &str,
     contained: bool,
 ) -> Result<RemoteBranch, ShepherdError> {
-    let remote = git(
-        main,
-        &["ls-remote", "--heads", "origin", &branch_ref(branch)],
-    )?;
-    if remote.is_empty() {
+    let transport = proof.transport()?;
+    let Some(remote) = transport.remote_tip(branch)? else {
         return Ok(RemoteBranch::AlreadyGone);
-    }
-    if remote.split_whitespace().next() != Some(tip) {
+    };
+    if remote != tip {
         return Ok(RemoteBranch::Skipped("remote_branch_advanced".into()));
     }
     if !contained {
@@ -535,7 +580,7 @@ fn delete_local(main: &Path, branch: &str, tip: &str, base: &str) -> Result<bool
     if git(main, &["rev-parse", "--verify", &reference])? != tip {
         return Err(ShepherdError::Usage("branch changed during cleanup".into()));
     }
-    if !ancestor(main, tip, &base_ref(base))? {
+    if !ancestor(main, tip, base)? {
         return Ok(false);
     }
     if worktrees(main)?
@@ -560,7 +605,10 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
     }
     let result = (|| {
         p.proof.validate_repository(&p.main)?;
-        let contained = ancestor(&p.main, &p.proof.tip, &base_ref(&p.proof.base))?;
+        let contained = {
+            let transport = p.proof.transport()?;
+            transport.is_ancestor(&p.proof.tip, &p.proof.base_tip)?
+        };
         let mut report = CleanupReport {
             worktree: p.target.path.clone(),
             branch: p.target.branch.clone(),
@@ -569,7 +617,7 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
             workspace_removed: true,
             local_branch_deleted: contained,
             local_branch_kept_reason: (!contained).then(|| "branch_not_contained".into()),
-            remote_branch: remote_state(&p.main, &p.target.branch, &p.proof.tip, contained)?,
+            remote_branch: remote_state(&p.proof, &p.target.branch, &p.proof.tip, contained)?,
             base_synced: base_sync_status(&p.main, &p.proof.base),
             children_removed: p.children.iter().map(|child| child.path.clone()).collect(),
             ignored_files: p
@@ -635,28 +683,40 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
         }
         git(&p.main, &["worktree", "prune"])?;
         for child in &p.children {
-            let _ = delete_local(&p.main, &child.branch, &child.tip, &p.proof.base)?;
+            let _ = delete_local(&p.main, &child.branch, &child.tip, &p.proof.base_tip)?;
         }
         report.local_branch_deleted =
-            delete_local(&p.main, &p.target.branch, &p.proof.tip, &p.proof.base)?;
+            delete_local(&p.main, &p.target.branch, &p.proof.tip, &p.proof.base_tip)?;
         report.local_branch_kept_reason =
             (!report.local_branch_deleted).then(|| "branch_not_contained".into());
-        report.remote_branch = remote_state(&p.main, &p.target.branch, &p.proof.tip, contained)?;
+        report.remote_branch = remote_state(&p.proof, &p.target.branch, &p.proof.tip, contained)?;
         if report.remote_branch == RemoteBranch::Deleted {
             let gate = Gate {
                 policy: p.policy,
                 ticket_branch: p.target.branch.clone(),
                 worktree: p.main.clone(),
-                state_dir: crate::gate::state_dir(),
+                state_dir: p.proof.state_dir.clone(),
                 config_dir: crate::config::resolve_config_dir(None),
             };
             gate.delete_remote_branch(&p.target.branch, &p.proof)?;
         }
         report.base_synced = base_sync_status(&p.main, &p.proof.base);
         if report.base_synced.is_ok() {
-            report.base_synced = git(&p.main, &["pull", "--ff-only", "origin", &p.proof.base])
-                .map(|_| ())
-                .map_err(|error| error.to_string());
+            report.base_synced = git(
+                &p.main,
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "merge",
+                    "--ff-only",
+                    "--no-verify-signatures",
+                    &p.proof.base_tip,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string());
         }
         if p.cfg.upkeep.regroup {
             regroup::apply(p.herdr, &regroup::plan_regroup(&p.herdr.workspaces()?))?;

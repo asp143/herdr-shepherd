@@ -56,6 +56,7 @@ struct LocalHerdr {
     agents: RefCell<Vec<AgentInfo>>,
     notifications: RefCell<Vec<String>>,
     rewrite_after_remove: RefCell<Option<(String, String)>>,
+    require_object_before_remove: RefCell<Option<String>>,
 }
 impl Herdr for LocalHerdr {
     fn workspaces(&self) -> Result<Vec<Workspace>, ShepherdError> {
@@ -93,6 +94,12 @@ impl Herdr for LocalHerdr {
         Ok(())
     }
     fn remove_worktree(&self, ws: &str, force: bool) -> Result<(), ShepherdError> {
+        if let Some(sha) = self.require_object_before_remove.borrow().as_ref() {
+            assert!(
+                git(&self.main, &["cat-file", "-e", sha]).status.success(),
+                "verified remote objects were missing before removal"
+            );
+        }
         let path = self
             .workspaces
             .borrow()
@@ -134,6 +141,7 @@ struct Repo {
     h: LocalHerdr,
     backend: Backend,
     cfg: Config,
+    state: PathBuf,
 }
 impl Repo {
     fn new() -> Self {
@@ -203,6 +211,7 @@ impl Repo {
             agents: RefCell::new(vec![]),
             notifications: RefCell::new(vec![]),
             rewrite_after_remove: RefCell::new(None),
+            require_object_before_remove: RefCell::new(None),
         };
         let backend = Backend(PrStatus {
             number: 1,
@@ -217,6 +226,26 @@ impl Repo {
             head_oid: Some(ok(&ticket, &["rev-parse", "HEAD"]).trim().into()),
         });
         let cfg = config::load(&dir.path().join("config"), None).unwrap();
+        let state = dir.path().join("state");
+        let store = herdr_shepherd::store::Store::open(&state, &main).unwrap();
+        store
+            .update(|data| {
+                data.tickets.push(herdr_shepherd::store::Ticket {
+                    id: "T".into(),
+                    branch: "feat/t".into(),
+                    base: "main".into(),
+                    worktree: Some(ticket.clone()),
+                    workspace_id: Some("ticket".into()),
+                    ..Default::default()
+                });
+                Ok(())
+            })
+            .unwrap();
+        let file = store.root().join("state.json");
+        let mut data: serde_json::Value =
+            serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        data["trust"] = serde_json::json!({"project_root":main,"common_git_dir":main.join(".git"),"origin_url":remote.to_str().unwrap(),"push_url":remote.to_str().unwrap(),"default_branch":"main","config_commit":null,"config_blob":null,"config_text":null,"trusted_at":"fixture","global_config":"/dev/null","object_format":"sha1"});
+        fs::write(file, serde_json::to_vec(&data).unwrap()).unwrap();
         Self {
             _dir: dir,
             main,
@@ -224,16 +253,28 @@ impl Repo {
             h,
             backend,
             cfg,
+            state,
         }
     }
+    fn transport(&self) -> herdr_shepherd::gate::transport::PushTransport {
+        herdr_shepherd::gate::transport::PushTransport::open_with_options(
+            &self.state,
+            &self.ticket,
+            herdr_shepherd::gate::transport::TransportOptions {
+                allow_local_for_tests: true,
+            },
+        )
+        .unwrap()
+    }
     fn preflight(&self, dry_run: bool) -> Result<cleanup::Preflight<'_>, ShepherdError> {
-        cleanup::preflight(
+        cleanup::preflight_with_transport(
             &self.h,
             &self.backend,
             &self.cfg,
             &self.ticket,
             false,
             dry_run,
+            self.transport(),
         )
     }
     fn merge(&self) {
@@ -396,8 +437,16 @@ fn force_discard_is_explicit() {
     let repo = Repo::new();
     repo.merge();
     fs::write(repo.ticket.join("dirty"), "discard this fixture").unwrap();
-    let preflight =
-        cleanup::preflight(&repo.h, &repo.backend, &repo.cfg, &repo.ticket, true, false).unwrap();
+    let preflight = cleanup::preflight_with_transport(
+        &repo.h,
+        &repo.backend,
+        &repo.cfg,
+        &repo.ticket,
+        true,
+        false,
+        repo.transport(),
+    )
+    .unwrap();
     let report = cleanup::run(preflight, false).unwrap();
     assert!(report.workspace_removed);
     assert!(!repo.ticket.exists());
@@ -547,7 +596,7 @@ fn new_commits_after_merge_block_cleanup() {
 }
 
 #[test]
-fn remote_reassociation_stops_before_removal() {
+fn shared_origin_change_cannot_redirect_cleanup() {
     let repo = Repo::new();
     repo.merge();
     let preflight = repo.preflight(false).unwrap();
@@ -565,18 +614,27 @@ fn remote_reassociation_stops_before_removal() {
         &repo.main,
         &["remote", "set-url", "origin", other.to_str().unwrap()],
     );
-    let result = cleanup::run(preflight, false);
-    assert!(result.is_err());
+    let result = cleanup::run(preflight, false).unwrap();
+    assert!(result.workspace_removed);
+    assert!(!repo.h.removals.borrow().is_empty());
     assert!(
-        repo.h.removals.borrow().is_empty(),
-        "removed={:?}; target_exists={}",
-        repo.h.removals.borrow(),
-        repo.ticket.exists()
+        !git(
+            &repo._dir.path().join("remote.git"),
+            &["show-ref", "--verify", "refs/heads/feat/t"]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        git(&other, &["show-ref", "--verify", "refs/heads/feat/t"])
+            .status
+            .success(),
+        "untrusted replacement remote was changed"
     );
 }
 
 #[test]
-fn remote_tip_advanced_before_push_advertisement_is_kept() {
+fn remote_tip_advanced_during_receive_is_kept() {
     use std::os::unix::fs::PermissionsExt;
     let repo = Repo::new();
     repo.merge();
@@ -599,17 +657,9 @@ fn remote_tip_advanced_before_push_advertisement_is_kept() {
     )
     .trim()
     .to_owned();
-    let wrapper = repo._dir.path().join("receive-wrapper");
-    fs::write(&wrapper,format!("#!/bin/sh\ngit --git-dir=\"$1\" update-ref refs/heads/feat/t {advanced} {old_tip} || exit 8\nexec git receive-pack \"$@\"\n")).unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
-    ok(
-        &repo.main,
-        &[
-            "config",
-            "remote.origin.receivepack",
-            wrapper.to_str().unwrap(),
-        ],
-    );
+    let hook = remote.join("hooks/pre-receive");
+    fs::write(&hook,format!("#!/bin/sh\ngit --git-dir='{}' update-ref refs/heads/feat/t {advanced} {old_tip} || exit 8\n",remote.display())).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
     let result = cleanup::run(repo.preflight(false).unwrap(), false);
     assert!(
         result.is_err(),
@@ -650,7 +700,15 @@ fn force_discard_does_not_remove_unowned_nested_worktree() {
             "main",
         ],
     );
-    let result = cleanup::preflight(&repo.h, &repo.backend, &repo.cfg, &repo.ticket, true, false);
+    let result = cleanup::preflight_with_transport(
+        &repo.h,
+        &repo.backend,
+        &repo.cfg,
+        &repo.ticket,
+        true,
+        false,
+        repo.transport(),
+    );
     assert!(result.is_err());
     assert!(repo.h.removals.borrow().is_empty());
     assert!(nested.exists());
@@ -743,4 +801,72 @@ fn dry_run_lists_ignored_files_before_removal() {
             .contains(&repo.ticket.join(" ignored-cache"))
     );
     assert!(repo.ticket.join(" ignored-cache").exists());
+}
+
+#[test]
+fn remote_only_merge_objects_exist_before_cleanup_mutates_worktrees() {
+    let repo = Repo::new();
+    let remote = repo._dir.path().join("remote.git");
+    let other = repo._dir.path().join("other-clone");
+    ok(
+        repo._dir.path(),
+        &[
+            "clone",
+            "--no-checkout",
+            remote.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    ok(&other, &["config", "user.name", "Fixture"]);
+    ok(&other, &["config", "user.email", "fixture@example.invalid"]);
+    ok(&other, &["config", "commit.gpgsign", "false"]);
+    ok(&other, &["symbolic-ref", "HEAD", "refs/heads/merge-work"]);
+    ok(&other, &["reset", "--hard", "origin/main"]);
+    ok(
+        &other,
+        &["merge", "--no-ff", "origin/feat/t", "-m", "remote merge"],
+    );
+    let remote_base = ok(&other, &["rev-parse", "HEAD"]).trim().to_owned();
+    ok(&other, &["push", "origin", "HEAD:refs/heads/main"]);
+    assert!(
+        !git(&repo.main, &["cat-file", "-e", &remote_base])
+            .status
+            .success()
+    );
+    let global = repo._dir.path().join("transport-global.gitconfig");
+    fs::write(&global, "[fetch]\nunpackLimit = 1\n").unwrap();
+    herdr_shepherd::store::Store::open(&repo.state, &repo.main)
+        .unwrap()
+        .update(|data| {
+            data.trust.as_mut().unwrap().global_config = Some(global);
+            Ok(())
+        })
+        .unwrap();
+    *repo.h.require_object_before_remove.borrow_mut() = Some(remote_base.clone());
+    let preflight = repo.preflight(false).unwrap();
+    let pack_dir = repo
+        .state
+        .join("push")
+        .join(format!(
+            "{}.git",
+            herdr_shepherd::store::project_hash(&repo.main)
+        ))
+        .join("objects/pack");
+    assert!(
+        fs::read_dir(pack_dir).unwrap().any(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "pack")),
+        "fixture must exercise packed-object import"
+    );
+    let report = cleanup::run(preflight, false).unwrap();
+    assert!(report.workspace_removed);
+    assert!(report.base_synced.is_ok(), "{:?}", report.base_synced);
+    assert!(
+        git(&repo.main, &["cat-file", "-e", &remote_base])
+            .status
+            .success()
+    );
+    assert_eq!(ok(&repo.main, &["rev-parse", "HEAD"]).trim(), remote_base);
 }
