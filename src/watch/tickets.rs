@@ -116,27 +116,30 @@ fn poll_ticket(
                 ticket.id, status.url, details,
             );
             let cap = crate::roles::resolve(cfg)?.shepherd.max_revision_rounds;
-            let changed = store.update(|data| {
-                let Some(current) = data
-                    .tickets
-                    .iter_mut()
-                    .find(|current| same_ci_generation(current, ticket))
-                else {
-                    return Ok(false);
-                };
-                crate::ticket::state::transition_with_limit(
-                    current,
-                    TicketState::Building,
-                    None,
-                    &now.to_string(),
-                    cap,
-                )?;
-                current.ci_none_since = None;
-                if current.state == TicketState::Building {
-                    current.ci_failure_task = Some(task.clone());
-                }
-                Ok(true)
-            })?;
+            let changed = {
+                let _dispatch = crate::ticket::revise::dispatch_lock(store, &ticket.id)?;
+                store.update(|data| {
+                    let Some(current) = data
+                        .tickets
+                        .iter_mut()
+                        .find(|current| same_ci_generation(current, ticket))
+                    else {
+                        return Ok(false);
+                    };
+                    crate::ticket::state::transition_with_limit(
+                        current,
+                        TicketState::Building,
+                        None,
+                        &now.to_string(),
+                        cap,
+                    )?;
+                    current.ci_none_since = None;
+                    if current.state == TicketState::Building {
+                        current.ci_failure_task = Some(task.clone());
+                    }
+                    Ok(true)
+                })?
+            };
             if changed {
                 let state = store
                     .read()?
@@ -496,8 +499,19 @@ mod tests {
         store: Store,
         fail_comments: std::cell::Cell<bool>,
         pickup_states: std::cell::RefCell<Vec<TicketState>>,
+        checks_observed: Option<std::sync::mpsc::Sender<()>>,
     }
     impl PrBackend for CommentFailureBackend {
+        fn failed_checks(
+            &self,
+            _path: &Path,
+            _number: u64,
+        ) -> Result<Vec<crate::github::FailedCheck>, ShepherdError> {
+            if let Some(sender) = &self.checks_observed {
+                sender.send(()).unwrap();
+            }
+            Ok(vec![])
+        }
         fn view(&self, path: &Path, branch: &str) -> Result<Option<PrStatus>, ShepherdError> {
             self.fake.view(path, branch)
         }
@@ -548,6 +562,56 @@ mod tests {
     }
 
     #[test]
+    fn ci_failure_waits_for_dispatch_and_rechecks_generation() {
+        use std::{sync::mpsc, time::Duration};
+        let fixture = Fixture::new(TicketState::CiWait);
+        let store = fixture.store.clone();
+        let dispatch = crate::ticket::revise::dispatch_lock(&store, "T1").unwrap();
+        let (checks_tx, checks_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let gh = CommentFailureBackend {
+                fake: FakeBackend::new(vec![Ok(Some(Fixture::status(Checks::Failing)))]),
+                store: fixture.store.clone(),
+                fail_comments: std::cell::Cell::new(false),
+                pickup_states: Default::default(),
+                checks_observed: Some(checks_tx),
+            };
+            let result = tick_tickets(&fixture.h, &gh, &fixture.cfg, &fixture.state, 100);
+            finished_tx.send(()).unwrap();
+            (fixture, result)
+        });
+        checks_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let waiting = matches!(
+            finished_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        let before_release = store.read().unwrap().tickets[0].state;
+        if before_release == TicketState::CiWait {
+            store
+                .update(|data| {
+                    let ticket = &mut data.tickets[0];
+                    crate::ticket::state::transition(ticket, TicketState::PrOpen, None, "101")?;
+                    crate::ticket::state::transition(ticket, TicketState::Revising, None, "102")?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        drop(dispatch);
+        let (fixture, result) = worker.join().unwrap();
+        assert!(waiting);
+        assert_eq!(
+            before_release,
+            TicketState::CiWait,
+            "red CI changed state without the dispatch lock"
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.updated, 0);
+        assert_eq!(fixture.ticket().state, TicketState::Revising);
+        assert_eq!(fixture.ticket().revision_round, 0);
+    }
+
+    #[test]
     fn comment_outage_does_not_block_ci_and_retries_pickup() {
         for (checks, expected, round) in [
             (Checks::Passing, TicketState::PrOpen, 0),
@@ -568,6 +632,7 @@ mod tests {
                 store: fixture.store.clone(),
                 fail_comments: std::cell::Cell::new(true),
                 pickup_states: Default::default(),
+                checks_observed: None,
             };
             let report = tick_tickets(&fixture.h, &gh, &fixture.cfg, &fixture.state, 100);
             assert!(report.errors.is_empty(), "{:?}", report.errors);

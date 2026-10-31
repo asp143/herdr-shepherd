@@ -107,7 +107,8 @@ pub fn open(
     let _dispatch = super::revise::dispatch_lock(store, id)?;
     let cap = crate::roles::resolve(cfg)?.shepherd.max_revision_rounds;
     let mut snapshot = store.read()?;
-    let (result, opened) = (|| {
+    let observed = ticket(&snapshot, id)?.clone();
+    let (mut result, opened) = (|| {
         let data = &mut snapshot;
         let t = ticket(data, id)?;
         let retry = matches!(t.state, TicketState::CiWait | TicketState::PrOpen)
@@ -186,20 +187,46 @@ pub fn open(
         super::state::transition_with_limit(t, TicketState::CiWait, None, now, cap)?;
         Ok((t.clone(), true))
     })()?;
-    store.update(|data| {
-        let current = data
+    let unchanged = |current: &Ticket| {
+        current.history.len() == observed.history.len()
+            && current.state == observed.state
+            && current.pr_number == observed.pr_number
+            && current.updated_at == observed.updated_at
+    };
+    if opened {
+        result = store.update(|data| {
+            let current = data
+                .tickets
+                .iter_mut()
+                .find(|t| t.id == id)
+                .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
+            if !unchanged(current) {
+                return Err(ShepherdError::Usage(
+                    "ticket changed while opening PR".into(),
+                ));
+            }
+            current.pr_number = result.pr_number;
+            current.ci_head_sha = result.ci_head_sha.clone();
+            current.pr_reviewers_pending = result.pr_reviewers_pending.clone();
+            current.state = result.state;
+            current.updated_at = result.updated_at.clone();
+            current.history = result.history.clone();
+            Ok(current.clone())
+        })?;
+    } else {
+        let current = store
+            .read()?
             .tickets
-            .iter_mut()
+            .into_iter()
             .find(|t| t.id == id)
             .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
-        current.pr_number = result.pr_number;
-        current.ci_head_sha = result.ci_head_sha.clone();
-        current.pr_reviewers_pending = result.pr_reviewers_pending.clone();
-        current.state = result.state;
-        current.updated_at = result.updated_at.clone();
-        current.history = result.history.clone();
-        Ok(())
-    })?;
+        if !unchanged(&current) {
+            return Err(ShepherdError::Usage(
+                "ticket changed while retrying PR reviewers".into(),
+            ));
+        }
+        result = current;
+    }
     if opened {
         crate::hooks::emit(
             cfg,
@@ -1313,6 +1340,144 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    struct ConcurrentPrView {
+        gh: FakeBackend,
+        store: Store,
+        to: TicketState,
+    }
+    impl PrBackend for ConcurrentPrView {
+        fn view(&self, p: &Path, b: &str) -> Result<Option<PrStatus>, ShepherdError> {
+            let status = self.gh.view(p, b)?;
+            self.store.update(|data| {
+                let t = &mut data.tickets[0];
+                let reason = (self.to == TicketState::Blocked)
+                    .then_some(crate::store::BlockedReason::Escalated);
+                super::super::state::transition(t, self.to, reason, "concurrent")?;
+                Ok(())
+            })?;
+            Ok(status)
+        }
+        fn push(&self, g: &Gate) -> Result<(), ShepherdError> {
+            self.gh.push(g)
+        }
+        fn push_expected(&self, g: &Gate, sha: &str) -> Result<(), ShepherdError> {
+            self.gh.push_expected(g, sha)
+        }
+        fn create(
+            &self,
+            g: &Gate,
+            b: &str,
+            t: &str,
+            body: &str,
+        ) -> Result<PrStatus, ShepherdError> {
+            self.gh.create(g, b, t, body)
+        }
+        fn add_reviewers(&self, g: &Gate, n: u64, r: &[String]) -> Result<(), ShepherdError> {
+            self.gh.add_reviewers(g, n, r)
+        }
+        fn author(&self, p: &Path) -> Result<String, ShepherdError> {
+            self.gh.author(p)
+        }
+        fn reply(&self, g: &Gate, n: u64, c: Option<u64>, b: &str) -> Result<(), ShepherdError> {
+            self.gh.reply(g, n, c, b)
+        }
+    }
+
+    #[test]
+    fn reviewer_retry_preserves_concurrent_lifecycle_change() {
+        for to in [TicketState::Revising, TicketState::Blocked] {
+            let (dir, store) = ready_fixture();
+            let cfg = crate::config::load(&dir.path().join("cfg"), None).unwrap();
+            let initial = ReviewerFailure {
+                gh: FakeBackend::new(vec![Ok(Some(pr_status()))]),
+                fail: std::cell::Cell::new(true),
+                requested: vec![],
+            };
+            assert!(
+                open(
+                    &store,
+                    &initial,
+                    &gate(dir.path()),
+                    &cfg,
+                    "T-1",
+                    "Fix boundary",
+                    &["Check input".into()],
+                    &["cargo test".into()],
+                    "2"
+                )
+                .is_err()
+            );
+            store
+                .update(|data| {
+                    super::super::state::transition(
+                        &mut data.tickets[0],
+                        TicketState::PrOpen,
+                        None,
+                        "3",
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            let before = store.read().unwrap().tickets[0].history.len();
+            let gh = ConcurrentPrView {
+                gh: FakeBackend::new(vec![Ok(Some(pr_status()))]),
+                store: store.clone(),
+                to,
+            };
+            let result = open(
+                &store,
+                &gh,
+                &gate(dir.path()),
+                &cfg,
+                "T-1",
+                "Fix boundary",
+                &["Check input".into()],
+                &["cargo test".into()],
+                "4",
+            );
+            let current = store.read().unwrap().tickets[0].clone();
+            assert_eq!(current.state, to, "retry overwrote concurrent state");
+            assert_eq!(current.history.len(), before + 1);
+            assert!(result.is_err());
+            assert!(
+                !gh.gh
+                    .calls
+                    .borrow()
+                    .iter()
+                    .any(|call| call.starts_with("reviewers "))
+            );
+        }
+    }
+
+    #[test]
+    fn initial_open_preserves_concurrent_block() {
+        let (dir, store) = ready_fixture();
+        let cfg = crate::config::load(&dir.path().join("cfg"), None).unwrap();
+        let gh = ConcurrentPrView {
+            gh: FakeBackend::new(vec![Ok(Some(pr_status()))]),
+            store: store.clone(),
+            to: TicketState::Blocked,
+        };
+        assert!(
+            open(
+                &store,
+                &gh,
+                &gate(dir.path()),
+                &cfg,
+                "T-1",
+                "Fix boundary",
+                &["Check input".into()],
+                &["cargo test".into()],
+                "4"
+            )
+            .is_err()
+        );
+        let current = store.read().unwrap().tickets[0].clone();
+        assert_eq!(current.state, TicketState::Blocked);
+        assert_eq!(current.history.len(), 1);
+        assert_eq!(current.history[0].to, TicketState::Blocked);
     }
 
     #[test]
