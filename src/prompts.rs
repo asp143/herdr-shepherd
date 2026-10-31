@@ -33,13 +33,21 @@ pub fn lead_prompt(
         .iter()
         .map(|ticket| {
             format!(
-                "- {}: {:?}{}",
+                "- {}: {:?}{}{}",
                 ticket.id,
                 ticket.state,
                 ticket
                     .blocked_reason
                     .map(|reason| format!(" ({reason:?})"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                ticket
+                    .protection_warnings
+                    .iter()
+                    .map(|warning| format!(
+                        "\n  {}",
+                        crate::github::protection::warning_line(project_root, warning)
+                    ))
+                    .collect::<String>()
             )
         })
         .collect::<Vec<_>>()
@@ -47,7 +55,7 @@ pub fn lead_prompt(
     format!(
         r#"You are the shepherd for project {root}. Only you talk to the user. Report progress and blockers by ticket ID.
 You must never edit repository code yourself. Delegate all code changes through {command} agent spawn. You may write task-description and ticket-intake metadata files for these CLI commands.
-You must never merge PRs, approve PRs, force-push, or push protected branches ({protected}). Flock agents never push, open PRs, or call GitHub. PR commands arrive in a later phase; this phase stops at ready_for_pr after QA passes.
+You must never merge PRs, approve PRs, force-push, or push protected branches ({protected}). Flock agents never push, open PRs, or call GitHub. Use the gated ticket PR commands after QA passes.
 Never read .env*, Credentials/, *.pem, *.key, or other secret files. Findings use High (Blocker) | Mid | Low | Wish.
 
 Use only the public CLI to orchestrate state. Available commands:
@@ -60,9 +68,13 @@ Use only the public CLI to orchestrate state. Available commands:
 Inspect command --help for exact arguments. Never edit state files directly. Agent report commands carry the inherited project and state-directory identity.
 
 Honor explicit role stage mappings (review maps to reviewing). At each stage run every configured role mapped to that stage, along with its required built-in role.
-For a new ticket: add it with title, body, and acceptance criteria, then dispatch the queue. Dispatch creates a ticket worktree and launches planner. Read the planner's report using agent status; its summary is the plan. Use researching and a researcher only when the ticket needs investigation, otherwise transition planning to building. Write a task file with the complete ticket context and plan, then spawn coder. Once all coders report, integrate child worktrees before transitioning to reviewing and spawning reviewer. Read every report before advancing. Address High (Blocker) findings and failed checks by transitioning reviewing or qa back to building, then delegate a coder fix; the configured revision cap is {cap}. Once review has no blockers, transition to qa and spawn qa. After QA reports all acceptance checks passed, transition to ready_for_pr and stop. Never skip review or QA. Reported agents no longer consume agent capacity. Use ticket dispatch whenever a ticket frees a slot; revising tickets have priority over queued tickets. Use agent cancel for a stuck owned agent; keep its worktree and commits.
+For a new ticket: add it with title, body, and acceptance criteria, then dispatch the queue. Dispatch creates a ticket worktree and launches planner. Read the planner's report using agent status; its summary is the plan. Use researching and a researcher only when the ticket needs investigation, otherwise transition planning to building. Write a task file with the complete ticket context and plan, then spawn coder. Once all coders report, integrate child worktrees before transitioning to reviewing and spawning reviewer. Read every report before advancing. Address High (Blocker) findings and failed checks by transitioning reviewing or qa back to building, then delegate a coder fix; the configured revision cap is {cap}. Once review has no blockers, transition to qa and spawn qa. After QA reports all acceptance checks passed, transition to ready_for_pr, prepare the summary, changes, and testing files, then run ticket pr to push and open the PR. CI and comment pickup are driven by the watcher. When red CI returns the ticket to building, inspect the stored ci_failure_task and its check names and URLs, then dispatch the coder, review, and QA again. Never skip review or QA. Reported agents no longer consume agent capacity. Use ticket dispatch whenever a ticket frees a slot; revising tickets have priority over queued tickets. Use agent cancel for a stuck owned agent; keep its worktree and commits.
 For a blocked ticket, inspect history and return only to its recorded prior state using ticket transition before assigning a resolver. For child conflicts, give the resolver both recorded ranges and have it merge the child branches locally into the ticket branch with any conflicts resolved; then rerun ticket integrate to recognize contained commits and clean up.
 When supervision sends a dialog, answer from the ticket context or deny it. Never approve a gate-forbidden action. Do not prompt a blocked agent; safe dialog keys go through supervision. Unresolved blocks should be escalated to the user.
+
+PR commands and comment triage:
+{pr_commands}
+Call these commands through {command}. After ticket revise, run ticket dispatch until the revision returns to ci_wait; every revision runs coder, reviewer, and QA. A later dispatch advances a revision when its agent has reported. Never bypass these stages. When the watcher hands off pr_open, retire any remaining reported flock agents and keep the worktree and PR.
 
 Configured role catalog:
 {roles}
@@ -72,7 +84,8 @@ Current tickets:
 "#,
         root = project_root.display(),
         protected = resolved.shepherd.protected_branches.join(", "),
-        cap = resolved.shepherd.max_revision_rounds
+        cap = resolved.shepherd.max_revision_rounds,
+        pr_commands = crate::ticket::pr::LEAD_PR_COMMANDS,
     )
 }
 
@@ -150,6 +163,47 @@ After a successful report, remove only your report file with rm -- {quoted_repor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lead_prompt_has_triage_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::load(&dir.path().join("cfg"), None).unwrap();
+        let resolved = crate::roles::resolve(&cfg).unwrap();
+        let mut data = crate::store::Store::open(&dir.path().join("state"), dir.path())
+            .unwrap()
+            .read()
+            .unwrap();
+        data.tickets.push(crate::store::Ticket {
+            id: "T-4".into(),
+            state: crate::store::TicketState::PrOpen,
+            protection_warnings: vec![crate::github::protection::ProtectionWarning {
+                branch: "trunk".into(),
+                reason: "unprotected".into(),
+            }],
+            ..Default::default()
+        });
+        let prompt = lead_prompt(
+            Path::new("/tmp/bin/herdr-shepherd"),
+            dir.path(),
+            &resolved,
+            &data,
+        );
+        for required in [
+            "ticket reply",
+            "ticket revise",
+            "never resolve",
+            "actual code",
+            "reproduce",
+            "ticket fetch <id>",
+            "paste the ticket",
+            "trunk has no branch protection",
+            "user's voice",
+        ] {
+            assert!(prompt.contains(required), "missing {required}");
+        }
+        assert!(!prompt.contains("PR commands arrive in a later phase"));
+        assert!(!prompt.contains("ready_for_pr and stop"));
+    }
 
     #[test]
     fn lead_prompt_includes_stage_mapped_roles() {
