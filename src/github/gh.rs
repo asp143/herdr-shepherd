@@ -204,6 +204,11 @@ impl PrBackend for GhBackend {
             .map(|_| ())
     }
 
+    fn push_expected(&self, gate: &Gate, expected: &str) -> Result<(), ShepherdError> {
+        gate.git_push_expected(&["-u", "origin", &gate.ticket_branch], expected)
+            .map(|_| ())
+    }
+
     fn create(
         &self,
         gate: &Gate,

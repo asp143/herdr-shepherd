@@ -69,6 +69,13 @@ impl PrBackend for FakeBackend {
         Ok(())
     }
 
+    fn push_expected(&self, gate: &Gate, expected: &str) -> Result<(), ShepherdError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("push {} {expected}", gate.ticket_branch));
+        Ok(())
+    }
+
     fn create(
         &self,
         gate: &Gate,
@@ -292,6 +299,18 @@ impl PrBackend for DiskBackend {
             Ok(())
         })
     }
+    fn push_expected(&self, gate: &Gate, expected: &str) -> Result<(), ShepherdError> {
+        let _ = Self::local_head(gate)?;
+        gate.git_push_expected(&["origin", &gate.ticket_branch], expected)?;
+        self.update(format!("push {}", gate.ticket_branch), |state| {
+            if let Some(status) = &mut state.status {
+                status.head_oid = Some(expected.into());
+                status.checks = super::Checks::Pending;
+            }
+            Ok(())
+        })
+    }
+
     fn create(
         &self,
         gate: &Gate,

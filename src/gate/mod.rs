@@ -21,6 +21,22 @@ pub struct Gate {
 
 impl Gate {
     pub fn git_push(&self, args: &[&str]) -> Result<String, ShepherdError> {
+        self.validate_push(args)?;
+        transport::PushTransport::open(&self.state_dir, &self.worktree)?
+            .push_ticket(&self.ticket_branch)
+    }
+
+    pub fn git_push_expected(
+        &self,
+        args: &[&str],
+        expected: &str,
+    ) -> Result<String, ShepherdError> {
+        self.validate_push(args)?;
+        transport::PushTransport::open(&self.state_dir, &self.worktree)?
+            .push_ticket_expected(&self.ticket_branch, expected)
+    }
+
+    fn validate_push(&self, args: &[&str]) -> Result<(), ShepherdError> {
         let mut target = parse_push_args(args);
         for refspec in &mut target.refspecs {
             if refspec == "HEAD" {
@@ -33,8 +49,7 @@ impl Gate {
                 "gated pushes require origin".into(),
             ));
         }
-        transport::PushTransport::open(&self.state_dir, &self.worktree)?
-            .push_ticket(&self.ticket_branch)
+        Ok(())
     }
 
     pub fn gh(&self, args: &[&str], cwd: &Path) -> Result<String, ShepherdError> {

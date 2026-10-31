@@ -769,6 +769,38 @@ fn missing_sync_snapshot_blocks_push() {
 }
 
 #[test]
+fn local_commit_during_pr_view_never_pushes_untested_sha() {
+    if !local_transport_enabled("local_commit_during_pr_view_never_pushes_untested_sha") {
+        return;
+    }
+    let repo = Repo::new();
+    let store = stored_revision(&repo);
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+    let gh = PushBackend::new(&repo);
+    let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+    complete_revision_agents(&repo, &store, &h, &gh);
+    let tested = git(&repo.root, &["rev-parse", "HEAD"]);
+    let remote = git(&repo.remote, &["rev-parse", "refs/heads/fix/ticket"]);
+    gh.move_local_on_view.set(true);
+    let outcome = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later").unwrap();
+    assert_ne!(git(&repo.root, &["rev-parse", "HEAD"]), tested);
+    assert_eq!(
+        git(&repo.remote, &["rev-parse", "refs/heads/fix/ticket"]),
+        remote,
+        "an untested local commit reached the remote"
+    );
+    assert_eq!(
+        outcome,
+        herdr_shepherd::ticket::revise::RevisionOutcome::Blocked
+    );
+    assert_eq!(
+        store.read().unwrap().tickets[0].blocked_reason,
+        Some(herdr_shepherd::store::BlockedReason::Conflict)
+    );
+    assert_eq!(gh.pushes.get(), 0);
+}
+
+#[test]
 fn merged_pr_cannot_receive_revision_push() {
     if !local_transport_enabled("merged_pr_cannot_receive_revision_push") {
         return;
@@ -957,6 +989,7 @@ struct PushBackend {
     bin: PathBuf,
     user: PathBuf,
     move_remote_on_push: std::cell::Cell<bool>,
+    move_local_on_view: std::cell::Cell<bool>,
     push_error: std::cell::RefCell<Option<String>>,
 }
 impl PushBackend {
@@ -979,6 +1012,7 @@ impl PushBackend {
             bin,
             user: repo.user.clone(),
             move_remote_on_push: std::cell::Cell::new(false),
+            move_local_on_view: std::cell::Cell::new(false),
             push_error: std::cell::RefCell::new(None),
         }
     }
@@ -990,6 +1024,17 @@ impl herdr_shepherd::github::PrBackend for PushBackend {
         _branch: &str,
     ) -> Result<Option<herdr_shepherd::github::PrStatus>, herdr_shepherd::error::ShepherdError>
     {
+        if self.move_local_on_view.replace(false) {
+            git(
+                &self.root,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "untested local commit after QA",
+                ],
+            );
+        }
         Ok(Some(herdr_shepherd::github::PrStatus {
             number: 7,
             url: "https://example.invalid/pr/7".into(),
@@ -1041,6 +1086,26 @@ impl herdr_shepherd::github::PrBackend for PushBackend {
         self.pushes.set(self.pushes.get() + 1);
         Ok(())
     }
+    fn push_expected(
+        &self,
+        gate: &Gate,
+        expected: &str,
+    ) -> Result<(), herdr_shepherd::error::ShepherdError> {
+        if let Some(error) = self.push_error.borrow().as_ref() {
+            return Err(anyhow::anyhow!("{error}").into());
+        }
+        if self.move_remote_on_push.replace(false) {
+            git(
+                &self.user,
+                &["commit", "--allow-empty", "-m", "racing user commit"],
+            );
+            git(&self.user, &["push", "origin", "fix/ticket"]);
+        }
+        gate.git_push_expected(&["origin", &gate.ticket_branch], expected)?;
+        self.pushes.set(self.pushes.get() + 1);
+        Ok(())
+    }
+
     fn create(
         &self,
         _gate: &Gate,

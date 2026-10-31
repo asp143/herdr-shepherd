@@ -568,6 +568,29 @@ impl PushTransport {
             &format!("{tip}:refs/heads/{branch}"),
         ])
     }
+    /// Bind a revision push to the exact commit that passed QA. Changes to
+    /// the branch after authorization cannot change the explicit source SHA.
+    pub fn push_ticket_expected(
+        &self,
+        branch: &str,
+        expected: &str,
+    ) -> Result<String, ShepherdError> {
+        self.check_destination(branch)?;
+        if !oid(expected) || self.verified_ticket_head(branch)? != expected {
+            return Err(ShepherdError::Conflict {
+                unit: 0,
+                range: "ticket HEAD differs from the QA-tested commit".into(),
+            });
+        }
+        self.execute(&[
+            "push",
+            "--porcelain",
+            "--",
+            self.url()?,
+            &format!("{expected}:refs/heads/{branch}"),
+        ])
+    }
+
     pub fn remote_tip(&self, branch: &str) -> Result<Option<String>, ShepherdError> {
         let reference = format!("refs/heads/{branch}");
         let out = self.execute(&["ls-remote", "--heads", "--", self.url()?, &reference])?;

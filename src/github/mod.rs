@@ -127,6 +127,13 @@ pub trait PrBackend {
 
     fn view(&self, worktree: &Path, branch: &str) -> Result<Option<PrStatus>, ShepherdError>;
     fn push(&self, gate: &Gate) -> Result<(), ShepherdError>;
+    /// Backends must bind the explicit push source to the QA-tested commit.
+    /// Legacy adapters fail closed until they implement that contract.
+    fn push_expected(&self, _gate: &Gate, _expected: &str) -> Result<(), ShepherdError> {
+        Err(ShepherdError::PolicyDenied(
+            "backend cannot bind a revision push to its QA-tested commit".into(),
+        ))
+    }
     fn create(
         &self,
         gate: &Gate,

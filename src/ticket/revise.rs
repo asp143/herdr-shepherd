@@ -404,12 +404,13 @@ fn finish_revision(
     }
     // The dispatch lock prevents merge handling from retiring this revision.
     // The gated transport must be able to acquire its own shared store lock.
-    if let Err(error) = gh.push(gate) {
+    if let Err(error) = gh.push_expected(gate, &head) {
         let moved = crate::gate::transport::PushTransport::open(&gate.state_dir, &gate.worktree)?
             .remote_tip(&initial.branch)
             .is_ok_and(|tip| tip.as_deref() != synced_sha);
         let rejection = error.to_string().to_ascii_lowercase();
         if moved
+            || error.code() == "conflict"
             || rejection.contains("non-fast-forward")
             || rejection.contains("fetch first")
             || rejection.contains("remote contains work")
@@ -420,7 +421,7 @@ fn finish_revision(
                 cfg,
                 id,
                 now,
-                "remote branch rejected the revision fast-forward",
+                "the ticket branch changed or rejected the tested revision",
             );
         }
         return Err(error);
