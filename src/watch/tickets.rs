@@ -6,7 +6,7 @@ use crate::{
     error::ShepherdError,
     github::{Checks, PrBackend, PrState},
     herdr::Herdr,
-    store::{Store, TicketState},
+    store::{Store, Ticket, TicketState},
 };
 
 pub fn tick_tickets(
@@ -62,7 +62,7 @@ fn poll_ticket(
     gh: &dyn PrBackend,
     store: &Store,
     cfg: &Config,
-    ticket: &crate::store::Ticket,
+    ticket: &Ticket,
     now: u64,
 ) -> Result<bool, ShepherdError> {
     let path = ticket
@@ -105,26 +105,27 @@ fn poll_ticket(
             ticket.id, status.url, details,
         );
         let cap = crate::roles::resolve(cfg)?.shepherd.max_revision_rounds;
-        let changed =
-            store.update(|data| {
-                let Some(current) = data.tickets.iter_mut().find(|current| {
-                    current.id == ticket.id && current.state == TicketState::CiWait
-                }) else {
-                    return Ok(false);
-                };
-                crate::ticket::state::transition_with_limit(
-                    current,
-                    TicketState::Building,
-                    None,
-                    &now.to_string(),
-                    cap,
-                )?;
-                current.ci_none_since = None;
-                if current.state == TicketState::Building {
-                    current.ci_failure_task = Some(task.clone());
-                }
-                Ok(true)
-            })?;
+        let changed = store.update(|data| {
+            let Some(current) = data
+                .tickets
+                .iter_mut()
+                .find(|current| same_ci_generation(current, ticket))
+            else {
+                return Ok(false);
+            };
+            crate::ticket::state::transition_with_limit(
+                current,
+                TicketState::Building,
+                None,
+                &now.to_string(),
+                cap,
+            )?;
+            current.ci_none_since = None;
+            if current.state == TicketState::Building {
+                current.ci_failure_task = Some(task.clone());
+            }
+            Ok(true)
+        })?;
         if changed {
             let state = store
                 .read()?
@@ -161,43 +162,45 @@ fn poll_ticket(
         notify_comments(h, store, cfg, &ticket.id)?;
         return Ok(changed);
     }
-    let no_checks_ready =
-        if ticket.state == TicketState::CiWait {
-            store.update(|data| {
-                let Some(current) = data.tickets.iter_mut().find(|current| {
-                    current.id == ticket.id && current.state == TicketState::CiWait
-                }) else {
-                    return Ok(false);
+    let no_checks_ready = if ticket.state == TicketState::CiWait {
+        store.update(|data| {
+            let Some(current) = data
+                .tickets
+                .iter_mut()
+                .find(|current| same_ci_generation(current, ticket))
+            else {
+                return Ok(false);
+            };
+            if status.checks == Checks::None {
+                let since = current
+                    .ci_none_since
+                    .as_deref()
+                    .and_then(|value| value.parse::<u64>().ok());
+                let since = match since {
+                    Some(since) => since,
+                    None => {
+                        current.ci_none_since = Some(now.to_string());
+                        now
+                    }
                 };
-                if status.checks == Checks::None {
-                    let since = current
-                        .ci_none_since
-                        .as_deref()
-                        .and_then(|value| value.parse::<u64>().ok());
-                    let since = match since {
-                        Some(since) => since,
-                        None => {
-                            current.ci_none_since = Some(now.to_string());
-                            now
-                        }
-                    };
-                    Ok(now.saturating_sub(since) >= 600)
-                } else {
-                    current.ci_none_since = None;
-                    Ok(false)
-                }
-            })?
-        } else {
-            false
-        };
+                Ok(now.saturating_sub(since) >= 600)
+            } else {
+                current.ci_none_since = None;
+                Ok(false)
+            }
+        })?
+    } else {
+        false
+    };
     if ticket.state == TicketState::CiWait && (status.checks == Checks::Passing || no_checks_ready)
     {
         let _dispatch = crate::ticket::revise::dispatch_lock(store, &ticket.id)?;
-        if !store.read()?.tickets.iter().any(|current| {
-            current.id == ticket.id
-                && current.state == TicketState::CiWait
-                && current.pr_number == Some(status.number)
-        }) {
+        if !store
+            .read()?
+            .tickets
+            .iter()
+            .any(|current| same_ci_generation(current, ticket))
+        {
             return Ok(false);
         }
         crate::ticket::merge::retire_flock(store, h, &ticket.id)?;
@@ -205,7 +208,7 @@ fn poll_ticket(
             let Some(current) = data
                 .tickets
                 .iter_mut()
-                .find(|current| current.id == ticket.id && current.state == TicketState::CiWait)
+                .find(|current| same_ci_generation(current, ticket))
             else {
                 return Ok(false);
             };
@@ -229,6 +232,14 @@ fn poll_ticket(
     }
     notify_comments(h, store, cfg, &ticket.id)?;
     Ok(false)
+}
+
+fn same_ci_generation(current: &Ticket, observed: &Ticket) -> bool {
+    current.id == observed.id
+        && current.state == TicketState::CiWait
+        && current.pr_number == observed.pr_number
+        && current.history.len() == observed.history.len()
+        && current.updated_at == observed.updated_at
 }
 
 fn notify_comments(
@@ -457,6 +468,40 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn newer_ci_generation_ignores_old_pass() {
+        newer_ci_generation_ignores_observation(Checks::Passing);
+    }
+
+    #[test]
+    fn newer_ci_generation_ignores_old_failure() {
+        newer_ci_generation_ignores_observation(Checks::Failing);
+    }
+
+    fn newer_ci_generation_ignores_observation(checks: Checks) {
+        let fixture = Fixture::new(TicketState::CiWait);
+        let stale = fixture.ticket();
+        fixture.reported_agent();
+        fixture
+            .store
+            .update(|data| {
+                let ticket = &mut data.tickets[0];
+                crate::ticket::state::transition(ticket, TicketState::PrOpen, None, "101")?;
+                crate::ticket::state::transition(ticket, TicketState::Revising, None, "102")?;
+                crate::ticket::state::transition(ticket, TicketState::CiWait, None, "103")?;
+                Ok(())
+            })
+            .unwrap();
+        let current = fixture.ticket();
+        let gh = FakeBackend::new(vec![Ok(Some(Fixture::status(checks)))]);
+        assert!(!poll_ticket(&fixture.h, &gh, &fixture.store, &fixture.cfg, &stale, 104).unwrap());
+        assert_eq!(fixture.ticket(), current);
+        assert_eq!(
+            fixture.store.read().unwrap().agents[0].status,
+            crate::store::AgentStatus::Reported
+        );
     }
 
     #[test]
