@@ -71,13 +71,13 @@ pub fn check_gh(args: &[&str]) -> Result<(), ShepherdError> {
     };
     if !matches!(
         *command,
-        "pr" | "api" | "repo" | "issue" | "search" | "run" | "workflow" | "auth" | "version"
+        "pr" | "api" | "repo" | "issue" | "search" | "run" | "workflow" | "version"
     ) {
         return deny("unsupported gh command or global option");
     }
     if args
         .iter()
-        .any(|arg| arg.contains("auto-merge") || *arg == "--auto")
+        .any(|arg| (arg.starts_with('-') && arg.contains("auto-merge")) || *arg == "--auto")
     {
         return deny("automatic merge is forbidden");
     }
@@ -112,6 +112,21 @@ pub fn check_gh(args: &[&str]) -> Result<(), ShepherdError> {
                 || (path.ends_with("/merge") && method.eq_ignore_ascii_case("PUT"))
             {
                 return deny("merge API is forbidden");
+            }
+            // Review bodies can also be supplied in opaque --input files.
+            // Refuse review mutations as a group rather than inspect those files.
+            if (path.ends_with("/reviews") || path.ends_with("/events"))
+                && (method != "GET"
+                    || args.iter().any(|arg| {
+                        matches!(*arg, "-f" | "-F" | "--field" | "--raw-field" | "--input")
+                            || arg.starts_with("-f")
+                            || arg.starts_with("-F")
+                            || arg.starts_with("--input=")
+                            || arg.starts_with("--field=")
+                            || arg.starts_with("--raw-field=")
+                    }))
+            {
+                return deny("review API mutations are forbidden");
             }
             // The review API can approve without going through `gh pr review`.
             if arg.eq_ignore_ascii_case("event=APPROVE") || arg.contains("\"event\":\"APPROVE\"") {
@@ -177,6 +192,12 @@ mod tests {
             vec!["api", "repos/o/r/merges", "-f", "base=main"],
             vec!["pr", "edit", "12", "--enable-auto-merge"],
             vec!["pr", "review", "12", "-a"],
+            vec![
+                "api",
+                "repos/o/r/pulls/12/reviews",
+                "--input",
+                "fixture.json",
+            ],
         ] {
             assert!(
                 matches!(check_gh(&args), Err(ShepherdError::PolicyDenied(_))),
@@ -186,6 +207,7 @@ mod tests {
         for args in [
             vec!["pr", "view", "12", "--json", "state"],
             vec!["pr", "create", "--title", "t", "--body", "b"],
+            vec!["pr", "create", "--body", "Explain auto-merge policy"],
             vec![
                 "api",
                 "repos/o/r/pulls/12/comments/9/replies",

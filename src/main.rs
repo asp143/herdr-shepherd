@@ -34,6 +34,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Install or run the per-worktree push guard.
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
     /// Gate gh calls from agent panes.
     Shim {
         #[command(subcommand)]
@@ -74,6 +79,20 @@ enum ShimCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum HookCommand {
+    Install {
+        #[arg(long)]
+        worktree: PathBuf,
+        #[arg(long)]
+        branch: String,
+    },
+    PrePush {
+        remote: Option<String>,
+        url: Option<String>,
+    },
+}
+
 fn state_dir(cli: &Cli) -> PathBuf {
     cli.state_dir
         .clone()
@@ -82,6 +101,33 @@ fn state_dir(cli: &Cli) -> PathBuf {
 
 fn run(cli: &Cli) -> Result<(), ShepherdError> {
     match &cli.command {
+        Commands::Hook { command } => match command {
+            HookCommand::Install { worktree, branch } => {
+                herdr_shepherd::gate::hook::install(
+                    worktree,
+                    branch,
+                    &state_dir(cli),
+                    &std::env::current_exe().map_err(anyhow::Error::from)?,
+                )?;
+                output::emit(cli.json, &serde_json::json!({"installed":true}), || {
+                    "shepherd: pre-push hook installed".into()
+                });
+            }
+            HookCommand::PrePush { .. } => {
+                use std::io::Read;
+                let mut input = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut input)
+                    .map_err(anyhow::Error::from)?;
+                if let Err(error) = herdr_shepherd::gate::hook::pre_push(
+                    &std::env::current_dir().map_err(anyhow::Error::from)?,
+                    &input,
+                ) {
+                    eprintln!("shepherd: push blocked: {error}");
+                    std::process::exit(1);
+                }
+            }
+        },
         Commands::Shim {
             command: ShimCommand::Gh { args },
         } => {
