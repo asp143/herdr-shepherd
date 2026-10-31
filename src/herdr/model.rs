@@ -18,17 +18,41 @@ pub struct WorktreeInfo {
     pub is_linked_worktree: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct AgentInfo {
     pub name: Option<String>,
-    #[serde(default, deserialize_with = "null_string")]
     pub agent: String,
-    #[serde(default, deserialize_with = "null_string")]
     pub agent_status: String,
     pub cwd: Option<PathBuf>,
-    #[serde(default, deserialize_with = "null_string")]
     pub pane_id: String,
     pub workspace_id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for AgentInfo {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            name: Option<String>,
+            #[serde(default, deserialize_with = "null_string")]
+            agent: String,
+            #[serde(default, deserialize_with = "null_string")]
+            agent_status: String,
+            cwd: Option<PathBuf>,
+            foreground_cwd: Option<PathBuf>,
+            #[serde(default, deserialize_with = "null_string")]
+            pane_id: String,
+            workspace_id: Option<String>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            name: wire.name,
+            agent: wire.agent,
+            agent_status: wire.agent_status,
+            cwd: wire.foreground_cwd.or(wire.cwd),
+            pane_id: wire.pane_id,
+            workspace_id: wire.workspace_id,
+        })
+    }
 }
 
 fn null_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -105,5 +129,17 @@ mod tests {
             parse_agent_list(include_str!("../../tests/fixtures/agent_list.json")).unwrap();
         assert!(!agents.is_empty());
         assert_eq!(agents[0].name, None);
+    }
+    #[test]
+    fn agent_foreground_cwd_takes_precedence_over_shell() {
+        let agents=parse_agent_list(r#"{"result":{"agents":[{"name":"sh-owned","cwd":"/tmp/owned","foreground_cwd":"/tmp/outside"},{"cwd":"/tmp/fallback","foreground_cwd":null}]}}"#).unwrap();
+        assert_eq!(
+            agents[0].cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/outside"))
+        );
+        assert_eq!(
+            agents[1].cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/fallback"))
+        );
     }
 }

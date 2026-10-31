@@ -79,6 +79,9 @@ pub fn reconcile(
             AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
         )
     }) {
+        let Some(_operation) = try_agent_operation(store, &rec.name)? else {
+            continue;
+        };
         let live = h.agent_get(&rec.name)?;
         let send_pending = store.update(|data| {
             let Some(current) = data
@@ -92,9 +95,6 @@ pub fn reconcile(
                 && live
                     .as_ref()
                     .is_some_and(|info| matches!(info.agent_status.as_str(), "idle" | "done"));
-            if send_pending {
-                current.prompt_pending = false;
-            }
             match &live {
                 Some(info) => {
                     current.pane_id = Some(info.pane_id.clone());
@@ -138,7 +138,7 @@ pub fn reconcile(
                 .zip(rec.worktree.canonicalize().ok())
                 .is_some_and(|(cwd, root)| cwd.starts_with(root));
             let delivery = if inside {
-                h.prompt_agent(&rec.name, &rec.task, true)
+                deliver_pending_prompt(h, store, &rec.name).map(|_| ())
             } else {
                 Err(ShepherdError::PolicyDenied(
                     "recovered agent is outside its worktree".into(),
@@ -287,6 +287,83 @@ pub fn cancel(
         rec.status = AgentStatus::Retired;
         Ok(rec.clone())
     })
+}
+
+/// A live launcher owns its intent until it finishes or its process exits.
+/// Recovery skips busy records instead of mistaking in-flight admission for loss.
+pub fn try_agent_operation(
+    store: &crate::store::Store,
+    name: &str,
+) -> Result<Option<std::fs::File>, ShepherdError> {
+    std::fs::create_dir_all(store.root()).map_err(anyhow::Error::from)?;
+    let hash = crate::store::project_hash(std::path::Path::new(name));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(store.root().join(format!("agent-{}.lock", &hash[..16])))
+        .map_err(anyhow::Error::from)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(anyhow::Error::from(error).into()),
+    }
+}
+
+/// Serialize an initial task submission with recovery and pane-event senders.
+/// Keep the durable intent pending until herdr acknowledges submission; a
+/// process crash releases the lock without stranding an unsent task.
+pub fn deliver_pending_prompt(
+    h: &dyn crate::herdr::Herdr,
+    store: &crate::store::Store,
+    name: &str,
+) -> Result<bool, ShepherdError> {
+    use crate::store::AgentStatus;
+    std::fs::create_dir_all(store.root()).map_err(anyhow::Error::from)?;
+    let hash = crate::store::project_hash(std::path::Path::new(name));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(store.root().join(format!("prompt-{}.lock", &hash[..16])))
+        .map_err(anyhow::Error::from)?;
+    lock.lock().map_err(anyhow::Error::from)?;
+    let data = store.read()?;
+    let Some(current) = data.agents.iter().find(|a| {
+        a.name == name
+            && a.prompt_pending
+            && a.report.is_none()
+            && matches!(
+                a.status,
+                AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
+            )
+    }) else {
+        return Ok(false);
+    };
+    let delivery = h.prompt_agent(name, &current.task, true);
+    if delivery.is_ok()
+        || delivery
+            .as_ref()
+            .is_err_and(|error| error.prompt_was_submitted())
+    {
+        store.update(|data| {
+            if let Some(current) = data.agents.iter_mut().find(|a| {
+                a.name == name
+                    && a.report.is_none()
+                    && matches!(
+                        a.status,
+                        AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
+                    )
+            }) {
+                current.prompt_pending = false;
+                current.status = AgentStatus::Working;
+            }
+            Ok(())
+        })?;
+    }
+    delivery.map(|_| true)
 }
 
 #[cfg(test)]

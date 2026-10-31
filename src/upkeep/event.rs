@@ -8,6 +8,7 @@ use super::regroup::{self, RegroupReport};
 #[serde(rename_all = "snake_case")]
 pub enum EventOutcome {
     Regrouped(RegroupReport),
+    Supervised(usize),
     Disabled,
     Ignored,
 }
@@ -53,6 +54,13 @@ pub fn handle_event_in_state(
     h: &dyn Herdr,
     state_dir: &std::path::Path,
 ) -> Result<EventOutcome, ShepherdError> {
+    if matches!(
+        name,
+        "pane.agent_status_changed" | "pane.agent_detected" | "pane.exited"
+    ) {
+        return crate::supervise::handle_pane_event(h, state_dir, cfg, name, payload)
+            .map(EventOutcome::Supervised);
+    }
     if !matches!(name, "worktree.created" | "worktree.removed") || !cfg.upkeep.regroup {
         return handle_event_inner(name, payload, cfg, h);
     }
@@ -267,5 +275,21 @@ mod tests {
             }
         });
         assert_eq!(max.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn pane_events_route_to_supervision_without_regroup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config::load(dir.path(), None).unwrap();
+        let h = FakeHerdr::new(vec![]);
+        let outcome = handle_event_in_state(
+            "pane.exited",
+            &serde_json::json!({"pane_id":"unowned"}),
+            &cfg,
+            &h,
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(outcome, EventOutcome::Supervised(0));
+        assert!(h.calls.borrow().is_empty());
     }
 }

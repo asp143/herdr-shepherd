@@ -74,6 +74,12 @@ pub trait Herdr {
     fn focus_agent(&self, _name: &str) -> Result<(), ShepherdError> {
         Err(unsupported("focus_agent"))
     }
+    fn pane_cwd(&self, _pane: &str) -> Result<Option<std::path::PathBuf>, ShepherdError> {
+        Ok(None)
+    }
+    fn pane_session_ref(&self, _pane: &str) -> Result<Option<String>, ShepherdError> {
+        Ok(None)
+    }
     fn resume_agent(&self, _name: &str) -> Result<(), ShepherdError> {
         Err(unsupported("resume_agent"))
     }

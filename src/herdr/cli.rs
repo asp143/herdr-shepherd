@@ -323,6 +323,41 @@ impl Herdr for CliHerdr {
         Err(command_error(&output))
     }
 
+    fn pane_cwd(&self, pane: &str) -> Result<Option<PathBuf>, ShepherdError> {
+        let value = self.request(&["pane", "get", pane])?;
+        Ok([
+            "/result/pane/foreground_cwd",
+            "/result/foreground_cwd",
+            "/result/pane/cwd",
+            "/result/cwd",
+            "/result/pane/process_cwd",
+        ]
+        .into_iter()
+        .find_map(|path| {
+            value
+                .pointer(path)
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+        }))
+    }
+    fn pane_session_ref(&self, pane: &str) -> Result<Option<String>, ShepherdError> {
+        let value = self.request(&["pane", "get", pane])?;
+        Ok([
+            "/result/pane/agent_session/value",
+            "/result/pane/agent_session_ref",
+            "/result/pane/session_ref",
+            "/result/pane/agent_session/session_ref",
+            "/result/agent_session_ref",
+        ]
+        .into_iter()
+        .find_map(|path| {
+            value
+                .pointer(path)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }))
+    }
+
     fn prompt_agent(
         &self,
         name: &str,
@@ -553,5 +588,26 @@ mod tests {
         let err = h.workspaces().unwrap_err();
         assert!(matches!(err, ShepherdError::HerdrUnavailable(_)));
         assert!(err.to_string().contains(socket.to_str().unwrap()));
+    }
+    #[test]
+    fn pane_helpers_use_foreground_and_session_value_schema() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("herdr.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let bin = dir.path().join("herdr-fake");
+        std::fs::write(&bin,r#"#!/bin/sh
+printf '%s\n' '{"result":{"pane":{"cwd":"/tmp/shell","foreground_cwd":"/tmp/foreground","agent_session":{"source":"integration","agent":"codex","kind":"thread","value":"fixture-session"}}}}'
+"#).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let h = CliHerdr { bin, socket };
+        assert_eq!(
+            h.pane_cwd("owned:p1").unwrap().as_deref(),
+            Some(std::path::Path::new("/tmp/foreground"))
+        );
+        assert_eq!(
+            h.pane_session_ref("owned:p1").unwrap().as_deref(),
+            Some("fixture-session")
+        );
     }
 }

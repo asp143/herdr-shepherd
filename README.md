@@ -1,6 +1,6 @@
 # herdr-shepherd
 
-Shepherd is a herdr plugin intended to take a ticket through planning, parallel coding, review, QA, and a pull request, then handle feedback and cleanup after the user merges. Phase 2 adds gated GitHub operations, credential-stripped agent environments, worktree push guards, PR sidebar status, verified cleanup, and lifecycle hooks. The core supplies ticket storage, state transitions, role and supervision settings, PR text helpers, and ticket fetching. Agent orchestration and automatic PR revision loops belong to later phases.
+Shepherd is a herdr plugin that delegates tickets through planning, isolated coding, review, and QA. Phase 3 stops at `ready_for_pr`; PR automation belongs to Phase 4. It also provides gated GitHub operations, credential controls, workspace upkeep, supervision, cleanup, and lifecycle hooks.
 
 ## Install
 
@@ -12,7 +12,7 @@ From this checkout:
 sh scripts/build.sh && herdr plugin link "$PWD"
 ```
 
-The binary is `bin/herdr-shepherd`. Add that directory to your PATH to use the shorter commands below, or invoke the binary by its path. Linking registers three actions: `herdr-shepherd.regroup`, `herdr-shepherd.prune`, and `herdr-shepherd.validate-config`. Creating or removing a herdr worktree automatically regroups workspaces when global upkeep permits it.
+The binary is `bin/herdr-shepherd`. Add that directory to your PATH to use the shorter commands below, or invoke the binary by its path. Linking registers upkeep actions plus `herdr-shepherd.init`, `herdr-shepherd.start`, `herdr-shepherd.resume`, and `herdr-shepherd.status`. Creating or removing a herdr worktree automatically regroups workspaces when global upkeep permits it.
 
 ## Commands
 
@@ -25,7 +25,7 @@ The binary is `bin/herdr-shepherd`. Add that directory to your PATH to use the s
 | `event` | Handle the event name and JSON supplied by herdr. |
 | `keys [--herdr-config PATH]` | Print a keybinding snippet without changing herdr configuration. |
 | `pr view --worktree PATH` | Read the current branch PR; return null if none exists. |
-| `pr push --worktree PATH` | Push only the declared ticket branch through the gate. |
+| `pr push --worktree PATH [--branch BRANCH]` | Push only a stored ticket branch through the isolated transport; an explicit branch must match the store. |
 | `pr create --worktree PATH --base BRANCH --title TITLE --body-file FILE` | Create a ready PR and request missing CODEOWNERS reviewers. |
 | `pr owners --worktree PATH --base BRANCH` | Print changed-path owners, excluding the authenticated author. |
 | `pr reply --worktree PATH --number N [--comment ID] --body-file FILE` | Reply to an inline review comment, or add a general PR comment. |
@@ -39,6 +39,17 @@ The binary is `bin/herdr-shepherd`. Add that directory to your PATH to use the s
 | `ticket list [--project-root PATH]` | List tickets in the invoking project's store. |
 | `ticket show <id> [--project-root PATH]` | Show a stored ticket and its history. |
 | `ticket fetch <id> [--project-root PATH]` | Fetch ticket JSON from the configured source without storing it. |
+| `init [--project-root PATH]` | Write defaults and snapshot project trust without changing herdr configuration. |
+| `start`, `resume`, `status` | Launch or focus the lead, recover launches, and report ticket state. |
+| `ticket add --id ID --title TITLE --body-file FILE` | Add a queued ticket; optional acceptance, type, and base flags are supported. |
+| `ticket dispatch` | Schedule revisions before queued tickets and launch planners or revision coders. |
+| `ticket transition ID --to STATE [--reason REASON]` | Apply a legal transition with the configured revision cap. |
+| `ticket integrate ID` | Integrate child commits, roll back conflicts, and remove proven integrated children. |
+| `ticket cancel ID` | Close a ticket while preserving its worktree and commits. |
+| `agent spawn --ticket ID --role ROLE --task-file FILE [--unit N]` | Launch the configured role; concurrent coders use child worktrees. |
+| `agent report --agent NAME --report-file FILE` | Validate and store the report; an inherited caller pane must own that agent. |
+| `agent list`, `agent status NAME`, `agent cancel NAME [--force]` | Inspect or retire owned flock agents. |
+| `config trust [--project-root PATH]` | Explicitly replace the project trust snapshot and print its diff. |
 
 Global options are `--json`, `--config-dir PATH`, and `--state-dir PATH`.
 Ticket inspection requires `--state-dir` or `HERDR_PLUGIN_STATE_DIR`. State lives
@@ -80,7 +91,7 @@ Global settings come from `shepherd.toml` inside the first available location:
 2. `HERDR_PLUGIN_CONFIG_DIR`
 3. `~/.config/herdr/plugins/config/herdr-shepherd`
 
-A project `.shepherd.toml` at the Git root replaces the global settings in full, except `[upkeep]`, which always comes from the global file. A project `[upkeep]` is ignored with a warning. Missing files use defaults; malformed files and unsupported schema versions are errors. Unknown sections are preserved for later phases.
+`validate-config` reads `.shepherd.toml` at the selected Git root. Runtime commands use the project configuration snapshot captured by `init`, `start`, or ticket startup; `config trust` explicitly replaces it. Project settings replace the global settings in full, except `[upkeep]`, which always comes from the global file. A project `[upkeep]` is ignored with a warning. Missing files use defaults; malformed files and unsupported schema versions are errors. Unknown sections are preserved for later phases.
 
 `validate-config` also resolves `[shepherd]`, `[roles.*]`, `[runners.*]`, and
 `[supervision]` from the selected file. Its existing output fields are retained,
@@ -99,8 +110,7 @@ revision rounds, and PR polling every 180 seconds. Supervision defaults are a
 30-second sweep, 120-second report grace, 20-minute stall threshold, and
 15-minute escalation threshold. User regex rules run before built-in
 `codex-trust`, `press-enter`, and `codex-update-notice` rules. Rule keys are
-limited to `enter`, `esc`, `y`, `n`, `1` through `9`, `down`, and `up`. This core
-resolves supervision configuration; executing those rules is a later module.
+limited to `enter`, `esc`, `y`, `n`, `1` through `9`, `down`, and `up`. The supervisor executes these rules for owned panes inside their assigned worktrees.
 Rules require a nonempty pattern and keys, unique names (including built-ins),
 and either no harness filter or one of `codex`, `omp`, `claude`, and `pi`.
 
@@ -172,9 +182,9 @@ Prune treats unavailable herdr as a warning and returns its report successfully.
 
 The protected-branch floor is `main`, `master`, `development`, `develop`, `production`, `release-*`, and `sync/*`, plus the repository default and PR base. `[shepherd] protected_branches` adds glob patterns; it cannot remove the floor. Ordinary pushes require an explicit remote and destination equal to the ticket branch. Force flags, deletion, `--no-verify`, wildcards, mirror/all/tag pushes, merging, approval, and auto-merge are refused. Configured implicit tag propagation and remote mirroring are disabled for gated pushes. Opaque GraphQL and review mutation calls are refused conservatively. Literal PR body text does not affect policy parsing.
 
-Hook installation enables worktree config and records `shepherd.ticketBranch` and `core.hooksPath` only in the linked worktree. Installation in the main checkout is refused. The shared hook script reads the invoking worktree's marker each time. A missing marker allows non-shepherd worktrees; a marked worktree rejects other refs, deletion, and non-fast-forward updates.
+Hook installation enables worktree config and records `shepherd.ticketBranch` and `core.hooksPath` only in the linked worktree. Installation in the main checkout is refused. The shared hook script reads the invoking worktree's marker each time. A missing marker refuses pushes when the shepherd hooks directory is installed. A marked worktree rejects other refs, deletion, and non-fast-forward updates.
 
-The pure `gate::env::agent_env` helper removes `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, and `SSH_AUTH_SOCK`. It sets `GH_CONFIG_DIR=<state>/agent-gh`, `GIT_TERMINAL_PROMPT=0`, `GIT_SSH_COMMAND="ssh -o BatchMode=yes -o IdentitiesOnly=yes -i /dev/null"`, and prepends `<state>/shim` to PATH. `install_shim` creates that executable shim and empty gh config directory. Phase 3 will apply this environment when launching agents. The shim preserves the stripped environment when forwarding allowed operations. Body and JSON payload readers refuse secret-file paths.
+The `gate::env::agent_env` helper replaces `GH_TOKEN` and `GITHUB_TOKEN` with an invalid placeholder and removes enterprise tokens and `SSH_AUTH_SOCK`. It uses a cleaned global Git configuration, disables system configuration, and sets both ask-pass programs to `/bin/false`. It sets `GH_CONFIG_DIR=<state>/agent-gh`, `GIT_TERMINAL_PROMPT=0`, `GIT_SSH_COMMAND="ssh -o BatchMode=yes -o IdentitiesOnly=yes -i /dev/null"`, and prepends `<state>/shim` to PATH. `install_shim` creates that executable shim and empty gh config directory. Agent launch applies this environment before starting a harness. The shim preserves the stripped environment when forwarding allowed operations. Body and JSON payload readers refuse secret-file paths.
 
 CODEOWNERS search order is `.github/CODEOWNERS`, `CODEOWNERS`, then `docs/CODEOWNERS`. Last matching rule wins for each changed path. Owners are combined, sorted, and deduplicated; emails and the PR author are excluded. Teams stay `org/team`. Existing GitHub reviewer requests are retained without duplicates. No labels or assignees are added.
 
@@ -235,7 +245,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --locked
 ```
 
-Tests use temporary repositories and bare remotes, fake GitHub/Herdr/probe implementations, and sanitized fixtures. Git fixtures ignore host signing configuration. `cargo test --locked --features test-support` additionally verifies the public fake Herdr interface. `proc::capture` exposes exit status and stderr; `proc::run` remains the compatibility wrapper for Phase 1 callers. No cadence code is included. Licensed under MIT.
+Tests use temporary repositories and bare remotes, fake GitHub/Herdr/probe implementations, and sanitized fixtures. Git fixtures ignore host signing configuration. `cargo test --locked --features test-support` additionally verifies the public fake Herdr interface. `proc::capture` exposes exit status and stderr; `proc::run` remains the compatibility wrapper for Phase 1 callers. Cadence and pane-event supervision use owned-agent fixtures. Licensed under MIT.
 
 ## Credential controls and their limits
 
@@ -252,3 +262,64 @@ still reach credentials by reading files directly, accessing the keyring,
 reading `~/.ssh`, or finding an ssh-agent socket. GitHub branch protection is
 needed for guarantees against those actions. An OS sandbox can add isolation;
 choosing and configuring one is a separate decision.
+
+
+## Ticket orchestration and supervision
+
+Run `init`, review the generated settings, then invoke the start action from the
+project workspace. Give the lead the ticket text and acceptance criteria. The
+lead never edits repository code: it uses `ticket add`, `ticket dispatch`,
+`ticket transition`, and `agent spawn` to delegate the work. Every flock agent
+submits a JSON report. A report preserves tests, changed paths, findings, and
+its commit SHA. Only the lead talks to the user.
+
+The queue gives waiting revisions priority. Capacity exhaustion leaves queued
+and revising tickets unchanged; failed launches block with `launch_failed` and
+other dispatch actions continue. Concurrent spawn calls serialize placement so
+two coders cannot accidentally share a writable worktree. Child integration is
+transactional: any conflict restores the pre-integration HEAD, leaves a clean
+branch, and records both ranges in `Ticket.integration_ranges`. A resolver can
+merge the child branches locally, resolve conflicts, report, and rerun
+`ticket integrate` to recognize the contained commits.
+
+Pane events and periodic sweeps supervise owned agents. Safe fixed-key dialog
+rules run only after policy and foreground-cwd checks, and revalidate the screen
+before input. Unknown dialogs go to the lead. Idle or stalled agents receive one
+nudge before escalation; crashed agents resume once with the pinned profile and
+session; provider failures use the role's next runner. Startup prompts and lead
+pings remain durable while blocked. A corrupt project or failed screen read does
+not stop healthy agents. PR polling runs in a separate bounded worker so it
+cannot hold up the supervision sweep.
+
+## Stored project trust and push transport
+
+`init`, `start`, and ticket startup capture the origin URLs, default branch, and
+project config blob/text in `StoreData.trust`. Runtime policy and lifecycle hooks
+use this stored text. Shared Git config, refs, and edited project files never
+refresh it implicitly. Use `config trust` from a user pane to review the printed
+diff and explicitly replace the snapshot; managed agent panes cannot invoke it.
+Global upkeep remains selected from the global configuration.
+
+Gated pushes require a stored ticket for the worktree. They run from a
+shepherd-owned bare repository under the state directory, use the stored remote
+and a verified ticket commit SHA, and never import repository SSH commands,
+credential helpers, URL rewrites, includes, or receive-pack settings. Remote
+inspection and deletion use the same transport. Local remotes are refused in
+release builds; temporary test fixtures have an explicit debug-only allowance.
+Direct GLOBAL authentication settings are copied into a private, no-include
+transport config. This retains global credentials and SSH configuration while
+preventing global includes from reloading mutable repository settings.
+
+Repo-local `credential.helper` and `core.sshCommand` settings in a project's own
+shared `.git/config` can still reach agent Git commands. Agents run as the same
+OS user and can explicitly reach files, keyrings, or SSH agent sockets. These
+layers are defense in depth. GitHub branch protection provides the remote
+protection; an OS sandbox is a separate choice.
+
+## Manual smoke
+
+`scripts/smoke.sh --prebuilt` uses real default runner profiles in an isolated
+headless herdr server, a `/tmp` project, and a local bare origin. It checks the
+actual planner/coder/reviewer/QA reports, badges, `ready_for_pr`, hello output,
+the test, unchanged origin refs, and cleanup. It leaves evidence under the
+printed `/tmp/shepherd-smoke-*` path and never controls the existing server.

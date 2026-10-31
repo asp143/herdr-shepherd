@@ -73,7 +73,7 @@ pub fn launch_configured(
     for runner in &req.runners {
         crate::harness::harness_for(&runner.harness)?;
     }
-    let mut record = store.update(|data| {
+    let (mut record, _operation) = store.update(|data| {
         if req.role.name != "lead"
             && data
                 .agents
@@ -120,6 +120,10 @@ pub fn launch_configured(
             number += 1;
             name = agent_name(&data.project_root, &req.ticket, &req.role.name, number);
         }
+        // Nonblocking acquisition inside the reservation transaction avoids a
+        // state/operation lock inversion with recovery.
+        let operation = crate::flock::try_agent_operation(store, &name)?
+            .ok_or_else(|| ShepherdError::Usage("agent launch is already running".into()))?;
         // A retired lead has the same stable name; retain one current record.
         if req.role.name == "lead" {
             data.agents.retain(|record| record.name != name);
@@ -142,7 +146,7 @@ pub fn launch_configured(
             prompt_pending: true,
         };
         data.agents.push(record.clone());
-        Ok(record)
+        Ok((record, operation))
     })?;
     let result = launch_reserved(h, store, &req, cfg, &mut record);
     if result.is_err() {
@@ -258,8 +262,18 @@ fn launch_reserved(
             );
             return Ok(());
         }
-        match h.prompt_agent(&record.name, &record.task, true) {
-            Ok(()) => {
+        match crate::flock::deliver_pending_prompt(h, store, &record.name) {
+            Ok(false) => {
+                if let Some(current) = store
+                    .read()?
+                    .agents
+                    .into_iter()
+                    .find(|a| a.name == record.name)
+                {
+                    *record = current;
+                }
+            }
+            Ok(true) => {
                 record.prompt_pending = false;
                 record.status = AgentStatus::Working;
             }
@@ -389,6 +403,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn active_launch_is_not_reconciled_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let store = Store::open(&state, dir.path()).unwrap();
+        let h = FakeHerdr::new(vec![]);
+        let observed = store.clone();
+        *h.on_start.borrow_mut() = Some(Box::new(move |_| {
+            let event = FakeHerdr::new(vec![]);
+            let report = crate::flock::reconcile(&event, &observed).unwrap();
+            assert_eq!(report.failed, 0, "a live launcher owns its starting intent");
+        }));
+        let record = launch(&h, &store, req(dir.path(), &state)).unwrap();
+        assert_eq!(record.status, AgentStatus::Working);
+    }
+    #[test]
+    fn event_recovery_and_normal_launch_share_one_prompt_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let store = Store::open(&state, dir.path()).unwrap();
+        let h = FakeHerdr::new(vec![]);
+        let event_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = event_count.clone();
+        let observed_store = store.clone();
+        *h.on_start.borrow_mut() = Some(Box::new(move |name| {
+            let rec = observed_store
+                .read()
+                .unwrap()
+                .agents
+                .into_iter()
+                .find(|a| a.name == name)
+                .unwrap();
+            let event = FakeHerdr::new(vec![]);
+            event
+                .agent_records
+                .borrow_mut()
+                .push(crate::herdr::AgentInfo {
+                    name: Some(name.into()),
+                    agent: "codex".into(),
+                    agent_status: "idle".into(),
+                    cwd: Some(rec.worktree),
+                    pane_id: rec.pane_id.unwrap(),
+                    workspace_id: Some("w1".into()),
+                });
+            crate::flock::reconcile(&event, &observed_store).unwrap();
+            count.set(
+                count.get()
+                    + event
+                        .calls
+                        .borrow()
+                        .iter()
+                        .filter(|c| c.starts_with("prompt_agent"))
+                        .count(),
+            );
+        }));
+        launch(&h, &store, req(dir.path(), &state)).unwrap();
+        let normal = h
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("prompt_agent"))
+            .count();
+        assert_eq!(
+            event_count.get() + normal,
+            1,
+            "startup events must not duplicate the initial task"
+        );
+    }
     #[test]
     fn all_runners_fail_launch_failed() {
         let dir = tempfile::tempdir().unwrap();

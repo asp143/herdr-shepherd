@@ -373,13 +373,14 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
             let outcome = if *detach {
                 herdr_shepherd::watch::detach(&state_dir(cli), Some(&config_dir), *interval)?
             } else {
-                herdr_shepherd::watch::run(
+                herdr_shepherd::watch::run_with_config_dir(
                     &state_dir(cli),
                     &CliHerdr::from_env(),
                     &herdr_shepherd::github::gh::GhBackend,
                     &cfg,
                     *once,
                     *interval,
+                    Some(&config_dir),
                 )?
             };
             output::emit(cli.json, &outcome, || outcome.status.clone());

@@ -3,8 +3,9 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::OpenOptionsExt,
+    os::unix::process::CommandExt,
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -69,6 +70,7 @@ impl WatchState {
 #[derive(Default, Debug, Serialize)]
 pub struct TickReport {
     pub polled: usize,
+    pub supervised: usize,
     pub updated: usize,
     pub cleared: usize,
     pub errors: Vec<String>,
@@ -207,6 +209,21 @@ pub fn run(
     once: bool,
     interval: Option<u64>,
 ) -> Result<WatchOutcome, ShepherdError> {
+    run_with_config_dir(state_dir, h, gh, cfg, once, interval, None)
+}
+
+pub fn run_with_config_dir(
+    state_dir: &Path,
+    h: &dyn Herdr,
+    gh: &dyn PrBackend,
+    cfg: &Config,
+    once: bool,
+    interval: Option<u64>,
+    config_dir: Option<&Path>,
+) -> Result<WatchOutcome, ShepherdError> {
+    if std::env::var_os("SHEPHERD_WATCH_PR_ONLY").is_some_and(|value| value == "1") {
+        return run_pr_once(state_dir, h, gh, cfg);
+    }
     let guard = if std::env::var_os("SHEPHERD_WATCH_DETACHED").is_some_and(|value| value == "1") {
         lock::acquire_child(state_dir)?
     } else {
@@ -229,15 +246,52 @@ pub fn run(
             "watch interval must be positive".into(),
         ));
     }
-    let mut state = WatchState::load(state_dir)?;
-    let notifier = Notifier::new(h, cfg.upkeep.notifications);
+    let mut worker = PrWorker::default();
+    let mut next_pr = Instant::now();
     loop {
-        let report = tick(h, gh, cfg, &notifier, &mut state);
+        let mut report = TickReport::default();
+        if once {
+            let mut state = WatchState::load(state_dir)?;
+            report = tick(
+                h,
+                gh,
+                cfg,
+                &Notifier::new(h, cfg.upkeep.notifications),
+                &mut state,
+            );
+            if let Err(error) = state.save(state_dir) {
+                report.errors.push(error.to_string());
+            }
+        } else {
+            if let Err(error) = worker.poll() {
+                report.errors.push(error.to_string());
+            }
+            if cfg.enabled && cfg.upkeep.pr_status && Instant::now() >= next_pr && !worker.running()
+            {
+                let selected =
+                    config_dir
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| match &cfg.source {
+                            crate::config::ConfigSource::Global(path) => {
+                                path.parent().map(Path::to_path_buf).unwrap_or_default()
+                            }
+                            _ => crate::config::resolve_config_dir(None),
+                        });
+                if let Err(error) = worker.start(state_dir, &selected) {
+                    report.errors.push(error.to_string());
+                }
+                next_pr = Instant::now() + Duration::from_secs(interval);
+            }
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let supervision = crate::supervise::sweep_projects(h, state_dir, cfg, now);
+        report.supervised = supervision.observed;
+        report.errors.extend(supervision.errors);
         for error in &report.errors {
             eprintln!("shepherd: watch: {error}");
-        }
-        if let Err(error) = state.save(state_dir) {
-            eprintln!("shepherd: watch state: {error}");
         }
         if once {
             return Ok(WatchOutcome {
@@ -246,8 +300,129 @@ pub fn run(
                 report: Some(report),
             });
         }
-        thread::sleep(Duration::from_secs(interval));
+        thread::sleep(Duration::from_secs(1));
     }
+}
+
+const PR_WORKER_SECONDS: u64 = 180;
+
+#[derive(Default)]
+struct PrWorker {
+    child: Option<Child>,
+    started: Option<Instant>,
+}
+impl PrWorker {
+    fn running(&self) -> bool {
+        self.child.is_some()
+    }
+    fn start(&mut self, state: &Path, config: &Path) -> Result<(), ShepherdError> {
+        let child = Command::new(std::env::current_exe().map_err(anyhow::Error::from)?)
+            .arg("--state-dir")
+            .arg(state)
+            .arg("--config-dir")
+            .arg(config)
+            .args(["watch", "--once"])
+            .env("SHEPHERD_WATCH_PR_ONLY", "1")
+            .env("SHEPHERD_WATCH_PARENT_PID", std::process::id().to_string())
+            .env_remove("SHEPHERD_WATCH_DETACHED")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .process_group(0)
+            .spawn()
+            .map_err(anyhow::Error::from)?;
+        self.child = Some(child);
+        self.started = Some(Instant::now());
+        Ok(())
+    }
+    fn poll(&mut self) -> Result<(), ShepherdError> {
+        if self
+            .started
+            .is_some_and(|started| started.elapsed() >= Duration::from_secs(PR_WORKER_SECONDS))
+        {
+            self.stop();
+            return Err(anyhow::anyhow!("PR poll exceeded its worker deadline").into());
+        }
+        if let Some(child) = self.child.as_mut()
+            && let Some(status) = child.try_wait().map_err(anyhow::Error::from)?
+        {
+            self.child = None;
+            self.started = None;
+            if !status.success() {
+                return Err(anyhow::anyhow!("PR poll worker exited with {status}").into());
+            }
+        }
+        Ok(())
+    }
+    fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(child.id() as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.started = None;
+    }
+}
+impl Drop for PrWorker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn parent_monitor() {
+    let Some(parent) = std::env::var("SHEPHERD_WATCH_PARENT_PID")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+    else {
+        return;
+    };
+    // This worker has no authority to outlive its resident supervisor. Check
+    // parent liveness even while a provider/CLI call is blocked, with a hard
+    // wall-clock bound independent of the number of workspaces.
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(PR_WORKER_SECONDS);
+        loop {
+            thread::sleep(Duration::from_millis(250));
+            if Instant::now() >= deadline
+                || nix::sys::signal::kill(nix::unistd::Pid::from_raw(parent), None).is_err()
+            {
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+pub fn run_pr_once(
+    state_dir: &Path,
+    h: &dyn Herdr,
+    gh: &dyn PrBackend,
+    cfg: &Config,
+) -> Result<WatchOutcome, ShepherdError> {
+    let Some(_guard) = lock::acquire_named(state_dir, "watch-pr.lock")? else {
+        return Ok(already_running());
+    };
+    parent_monitor();
+    let mut state = WatchState::load(state_dir)?;
+    let report = tick(
+        h,
+        gh,
+        cfg,
+        &Notifier::new(h, cfg.upkeep.notifications),
+        &mut state,
+    );
+    state.save(state_dir)?;
+    for error in &report.errors {
+        eprintln!("shepherd: PR poll: {error}");
+    }
+    Ok(WatchOutcome {
+        status: "completed".into(),
+        pid: None,
+        report: Some(report),
+    })
 }
 
 /// Serialize detached launches, then wait for the re-exec to own the poll lock.
@@ -599,5 +774,14 @@ mod tests {
                 .iter()
                 .any(|call| call.contains("shepherd_pr"))
         );
+    }
+    #[test]
+    fn watch_once_includes_supervision_without_pr_status() {
+        let (dir, h, mut cfg) = setup();
+        cfg.upkeep.pr_status = false;
+        let gh = FakeBackend::new(vec![]);
+        let out = run(&dir.path().join("state"), &h, &gh, &cfg, true, Some(180)).unwrap();
+        assert_eq!(out.report.unwrap().supervised, 0);
+        assert!(gh.calls.borrow().is_empty());
     }
 }

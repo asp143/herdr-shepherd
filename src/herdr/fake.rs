@@ -11,28 +11,40 @@ use super::{
     model::{AgentInfo, Workspace},
 };
 
+pub type StartObserver = Box<dyn Fn(&str)>;
+
 pub struct FakeHerdr {
+    pub on_start: RefCell<Option<StartObserver>>,
     pub workspaces: RefCell<Vec<Workspace>>,
     pub calls: RefCell<Vec<String>>,
     pub notify_error: Cell<bool>,
     pub agent_records: RefCell<Vec<AgentInfo>>,
     pub start_results: RefCell<VecDeque<AgentStart>>,
     pub visible_screens: RefCell<VecDeque<String>>,
+    pub visible_cache: RefCell<HashMap<String, String>>,
+    pub read_errors: RefCell<HashMap<String, String>>,
     pub panic_on_start: Cell<bool>,
     pub start_envs: RefCell<Vec<HashMap<String, String>>>,
+    pub pane_cwds: RefCell<HashMap<String, std::path::PathBuf>>,
+    pub pane_sessions: RefCell<HashMap<String, String>>,
 }
 
 impl FakeHerdr {
     pub fn new(workspaces: Vec<Workspace>) -> Self {
         Self {
+            on_start: RefCell::new(None),
             workspaces: RefCell::new(workspaces),
             calls: RefCell::new(Vec::new()),
             notify_error: Cell::new(false),
             agent_records: RefCell::new(Vec::new()),
             start_results: RefCell::new(VecDeque::new()),
             visible_screens: RefCell::new(VecDeque::new()),
+            visible_cache: RefCell::new(HashMap::new()),
+            read_errors: RefCell::new(HashMap::new()),
             panic_on_start: Cell::new(false),
             start_envs: RefCell::new(Vec::new()),
+            pane_cwds: RefCell::new(HashMap::new()),
+            pane_sessions: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -107,6 +119,9 @@ impl Herdr for FakeHerdr {
             pane_id: pane.into(),
             workspace_id: None,
         });
+        if let Some(observer) = self.on_start.borrow().as_ref() {
+            observer(name);
+        }
         Ok(result)
     }
     fn prompt_agent(
@@ -124,7 +139,10 @@ impl Herdr for FakeHerdr {
             .iter()
             .any(|agent| agent.name.as_deref() == Some(name) && agent.agent_status == "blocked")
         {
-            return Err(anyhow::anyhow!("agent_blocked").into());
+            return Err(ShepherdError::HerdrCommand {
+                code: "agent_blocked".into(),
+                message: "agent is blocked".into(),
+            });
         }
         Ok(())
     }
@@ -136,10 +154,20 @@ impl Herdr for FakeHerdr {
     }
     fn read_visible(&self, name: &str) -> Result<String, ShepherdError> {
         self.calls.borrow_mut().push(format!("read_visible {name}"));
+        if let Some(error) = self.read_errors.borrow().get(name) {
+            return Err(anyhow::anyhow!("{error}").into());
+        }
+        if let Some(screen) = self.visible_screens.borrow_mut().pop_front() {
+            self.visible_cache
+                .borrow_mut()
+                .insert(name.into(), screen.clone());
+            return Ok(screen);
+        }
         Ok(self
-            .visible_screens
-            .borrow_mut()
-            .pop_front()
+            .visible_cache
+            .borrow()
+            .get(name)
+            .cloned()
             .unwrap_or_default())
     }
     fn close_tab(&self, tab: &str) -> Result<(), ShepherdError> {
@@ -152,6 +180,12 @@ impl Herdr for FakeHerdr {
     fn focus_agent(&self, name: &str) -> Result<(), ShepherdError> {
         self.calls.borrow_mut().push(format!("focus_agent {name}"));
         Ok(())
+    }
+    fn pane_cwd(&self, pane: &str) -> Result<Option<std::path::PathBuf>, ShepherdError> {
+        Ok(self.pane_cwds.borrow().get(pane).cloned())
+    }
+    fn pane_session_ref(&self, pane: &str) -> Result<Option<String>, ShepherdError> {
+        Ok(self.pane_sessions.borrow().get(pane).cloned())
     }
     fn resume_agent(&self, name: &str) -> Result<(), ShepherdError> {
         self.calls.borrow_mut().push(format!("resume_agent {name}"));
