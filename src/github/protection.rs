@@ -57,7 +57,7 @@ fn fresh(checked_at: u64, now: u64) -> bool {
         .is_some_and(|age| age < 24 * 60 * 60)
 }
 
-/// Cache both successful reads and unknown results. A new base is always read.
+/// Cache successful reads; retry unknown results. A new base is always read.
 pub fn cached_protection(
     store: &Store,
     gh: &dyn PrBackend,

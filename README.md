@@ -1,6 +1,6 @@
 # herdr-shepherd
 
-Shepherd is a herdr plugin that delegates tickets through planning, isolated coding, review, and QA. Phase 3 stops at `ready_for_pr`; PR automation belongs to Phase 4. It also provides gated GitHub operations, credential controls, workspace upkeep, supervision, cleanup, and lifecycle hooks.
+Shepherd is a herdr plugin that delegates tickets through planning, isolated coding, review, and QA. The PR loop pushes a ready-for-review PR, waits for CI, routes review feedback through the flock, and cleans up after the user merges. It also provides gated GitHub operations, credential controls, workspace upkeep, supervision, cleanup, and lifecycle hooks.
 
 ## Install
 
@@ -32,13 +32,18 @@ The binary is `bin/herdr-shepherd`. Add that directory to your PATH to use the s
 | `hook install --worktree PATH --branch BRANCH` | Opt a linked worktree into a per-worktree pre-push guard. |
 | `hook pre-push [REMOTE URL]` | Validate Git pre-push stdin using that worktree's ticket branch. |
 | `shim gh -- ARGS...` | Check agent GitHub calls and exec the real gh outside the shim PATH. |
-| `watch [--once] [--interval SECONDS] [--detach]` | Poll linked-worktree PRs and report sidebar status. |
+| `watch [--once] [--interval SECONDS] [--detach]` | Drive ticket CI, comment pickup, merge cleanup, and sidebar PR status. |
 | `cleanup --worktree PATH [--dry-run] [--force-discard]` | Remove an owned, verified merged ticket workspace. |
 | `hooks emit EVENT --json-file FILE` | Emit a configured lifecycle event with a JSON payload. |
 
 | `ticket list [--project-root PATH]` | List tickets in the invoking project's store. |
 | `ticket show <id> [--project-root PATH]` | Show a stored ticket and its history. |
 | `ticket fetch <id> [--project-root PATH]` | Fetch ticket JSON from the configured source without storing it. |
+| `ticket pr <id> --summary-file FILE --changes-file FILE --testing-file FILE` | Push the stored ticket branch and open a ready PR after QA. |
+| `ticket comments <id> [--new]` | Read review comments, issue comments, and changes-requested review bodies. |
+| `ticket reply <id> --comment ID [--kind KIND] --body-file FILE` | Decline a comment with evidence; kind distinguishes review, issue, and review-body IDs. |
+| `ticket revise <id> --comments ID,ID [--kind KIND] --task-file FILE` | Accept feedback and queue coder, reviewer, and QA. |
+| `ticket ack <id> --comment ID [--kind KIND] --body-file FILE` | Describe a pushed revision and its commit SHA. |
 | `init [--project-root PATH]` | Write defaults and snapshot project trust without changing herdr configuration. |
 | `start`, `resume`, `status` | Launch or focus the lead, recover launches, and report ticket state. |
 | `ticket add --id ID --title TITLE --body-file FILE` | Add a queued ticket; optional acceptance, type, and base flags are supported. |
@@ -186,13 +191,15 @@ Hook installation enables worktree config and records `shepherd.ticketBranch` an
 
 The `gate::env::agent_env` helper replaces `GH_TOKEN` and `GITHUB_TOKEN` with an invalid placeholder and removes enterprise tokens and `SSH_AUTH_SOCK`. It uses a cleaned global Git configuration, disables system configuration, and sets both ask-pass programs to `/bin/false`. It sets `GH_CONFIG_DIR=<state>/agent-gh`, `GIT_TERMINAL_PROMPT=0`, `GIT_SSH_COMMAND="ssh -o BatchMode=yes -o IdentitiesOnly=yes -i /dev/null"`, and prepends `<state>/shim` to PATH. `install_shim` creates that executable shim and empty gh config directory. Agent launch applies this environment before starting a harness. The shim preserves the stripped environment when forwarding allowed operations. Body and JSON payload readers refuse secret-file paths.
 
-CODEOWNERS search order is `.github/CODEOWNERS`, `CODEOWNERS`, then `docs/CODEOWNERS`. Last matching rule wins for each changed path. Owners are combined, sorted, and deduplicated; emails and the PR author are excluded. Teams stay `org/team`. Existing GitHub reviewer requests are retained without duplicates. No labels or assignees are added.
+CODEOWNERS and the changed-path base are read from the verified base commit through the trusted transport, so ticket edits cannot choose their own reviewers. CODEOWNERS search order is `.github/CODEOWNERS`, `CODEOWNERS`, then `docs/CODEOWNERS`. Last matching rule wins for each changed path. Owners are combined, sorted, and deduplicated; emails and the PR author are excluded. Teams stay `org/team`. Existing GitHub reviewer requests are retained without duplicates. No labels or assignees are added.
 
 ## PR watcher
 
 The plugin startup command launches `watch --detach`. One poller holds `watch.lock`; duplicate starts return `already_running` with exit 0. Detached launch uses a second lock and a readiness handshake. `--once` performs one poll. Set `[shepherd] pr_poll_seconds` to change the default 180-second interval.
 
-The watcher reports `shepherd_pr` (or the configured prefix plus `pr`) as `open`, `ci-pending`, `ci-failing`, `changes-requested`, `merged`, or `closed`. Metadata goes through Herdr's socket API because the installed 0.9.5 CLI rejects its advertised report-metadata arguments. Only successful observations update the atomic `watch-state.json`; GitHub failures keep the last good token and are logged. A missing PR clears only a token owned by this watcher. Notifications fire on merged, closed, failing CI, and requested-changes transitions when enabled. Ticket-specific cleanup/comment orchestration requires Phase 3 ownership state.
+The watcher reports `shepherd_pr` (or the configured prefix plus `pr`) as `open`, `ci-pending`, `ci-failing`, `changes-requested`, `merged`, or `closed`. Metadata goes through Herdr's socket API because the installed 0.9.5 CLI rejects its advertised report-metadata arguments. Only successful observations update the atomic `watch-state.json`; GitHub failures keep the last good token and are logged. A missing PR clears only a token owned by this watcher. Notifications fire on merged, closed, failing CI, and requested-changes transitions when enabled. Stored tickets are polled even when their workspace is absent. Green CI hands the PR to the user; red CI queues a coder with failing check names and URLs and consumes a revision round. Missing checks hand off after ten continuous minutes; GitHub outages leave the ticket and revision counter unchanged. Comments received during CI or building remain pending until `pr_open`, then wake or resume the lead once. Replies are recorded so they cannot feed back into triage.
+
+The lead checks each comment against the code, replies with evidence when declining it, and delegates legitimate feedback through coder, reviewer, and QA. Revision preparation fetches the snapshotted URL into owned refs and fast-forwards with owned Git configuration, preserving the pre-sync review base. Divergence or a moving remote blocks with `conflict`; ordinary pushes never force. Shepherd never resolves review threads, approves, requests changes, or merges. A merge during a revision retires its flock and preserves unpushed work for the user; a closed PR retains its resources.
 
 To run an isolated manual watcher:
 
@@ -208,7 +215,7 @@ Cleanup requires a linked worktree with its matching ticket-branch marker and a 
 
 Squash cleanup requires the PR head commit ID to match the local tip when ancestry or patch equivalence cannot prove containment. Local and remote branches are retained unless ancestry proves containment in the base. Local deletion uses an atomic expected-tip ref update after that proof; branch configuration is retained. The specialized remote-delete gate requires a bound merge proof and uses an expected-tip lease on a deletion-only refspec, so an advanced remote branch is retained. Ordinary pushes continue to refuse all force/lease flags and cannot use this path to rewrite commits.
 
-`--dry-run` performs read-only checks, skips fetch, and sends no notifications. Normal preflight fetches origin with pruning. Worktree removal never uses force unless `--force-discard` was explicit; unrelated nested worktrees are refused even then. The main checkout is fast-forwarded only when clean and on the base; otherwise the report includes `main_checkout_dirty` or `main_checkout_not_on_base`. No recursive shell deletion is used. Cleanup emits `ticket.cleaned_up` after a successful non-dry workspace removal.
+`--dry-run` performs read-only checks, skips fetch, and sends no notifications. Normal preflight fetches the verified base through the snapshotted URL and the shepherd-owned transport. Worktree removal never uses force unless `--force-discard` was explicit; unrelated nested worktrees are refused even then. The main checkout is fast-forwarded only when clean and on the base; otherwise the report includes `main_checkout_dirty` or `main_checkout_not_on_base`. No recursive shell deletion is used. Cleanup emits `ticket.cleaned_up` after a successful non-dry workspace removal.
 
 ## Lifecycle hooks
 
@@ -260,8 +267,12 @@ are retained without following includes.
 These controls are defense in depth. An agent running as the same OS user can
 still reach credentials by reading files directly, accessing the keyring,
 reading `~/.ssh`, or finding an ssh-agent socket. GitHub branch protection is
-needed for guarantees against those actions. An OS sandbox can add isolation;
-choosing and configuring one is a separate decision.
+needed for guarantees against those actions. The known same-user credential limit is deliberate: v1 does not add an OS sandbox.
+Branch protection on GitHub supplies the guarantee. Shepherd reads protection for
+the ticket base and snapshotted default branch at startup, warns without blocking
+when either is unprotected, and shows warnings in status and the lead summary.
+Successful protection reads are cached for 24 hours; unknown results are retried.
+Shepherd never changes repository protection settings.
 
 
 ## Ticket orchestration and supervision
@@ -320,6 +331,9 @@ protection; an OS sandbox is a separate choice.
 
 `scripts/smoke.sh --prebuilt` uses real default runner profiles in an isolated
 headless herdr server, a `/tmp` project, and a local bare origin. It checks the
-actual planner/coder/reviewer/QA reports, badges, `ready_for_pr`, hello output,
-the test, unchanged origin refs, and cleanup. It leaves evidence under the
+actual planner/coder/reviewer/QA reports and badges, local gated pushes,
+`ci_wait` to `pr_open`, comment triage, a declined reply, a reviewed
+revision and acknowledgement, and cleanup after a simulated user merge. GitHub
+operations use the debug-only fake backend; the base is updated only to simulate
+the user merging in the disposable bare remote. It leaves evidence under the
 printed `/tmp/shepherd-smoke-*` path and never controls the existing server.
