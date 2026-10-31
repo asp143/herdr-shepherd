@@ -480,7 +480,10 @@ fn revision_pushes_and_returns_to_ci_wait() {
         }
     );
     assert_eq!(store.read().unwrap().tickets[0].state, TicketState::CiWait);
-    assert_eq!(store.read().unwrap().tickets[0].ci_head_sha.as_deref(), Some(expected.as_str()));
+    assert_eq!(
+        store.read().unwrap().tickets[0].ci_head_sha.as_deref(),
+        Some(expected.as_str())
+    );
     assert_eq!(
         git(
             &repo.root,
@@ -710,6 +713,50 @@ fn non_fast_forward_rejection_blocks_without_retry() {
             .any(|call| call.starts_with("notify ") && call.contains("conflict"))
     );
     assert_eq!(gh.pushes.get(), 0);
+}
+
+#[test]
+fn revision_recovers_a_push_saved_only_on_the_remote() {
+    if !local_transport_enabled("revision_recovers_a_push_saved_only_on_the_remote") {
+        return;
+    }
+    let repo = Repo::new();
+    let store = stored_revision(&repo);
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+    let gh = PushBackend::new(&repo);
+    let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+    complete_revision_agents(&repo, &store, &h, &gh);
+    let tested = git(&repo.root, &["rev-parse", "HEAD"]);
+    store
+        .update(|data| {
+            let run = data.tickets[0].revision_run.as_mut().unwrap();
+            run.stage = herdr_shepherd::ticket::revise::RevisionStage::Push;
+            run.tested_sha = Some(tested.clone());
+            run.agent = None;
+            assert_ne!(run.synced_sha.as_deref(), Some(tested.as_str()));
+            Ok(())
+        })
+        .unwrap();
+    // Simulate the durable network result left by a crash before saving state.
+    repo.gate()
+        .git_push_expected(&["origin", "fix/ticket"], &tested)
+        .unwrap();
+    let outcome = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "retry").unwrap();
+    assert_eq!(
+        outcome,
+        herdr_shepherd::ticket::revise::RevisionOutcome::Pushed {
+            sha: tested.clone()
+        }
+    );
+    let ticket = &store.read().unwrap().tickets[0];
+    assert_eq!(ticket.state, TicketState::CiWait);
+    assert_eq!(ticket.ci_head_sha.as_deref(), Some(tested.as_str()));
+    assert!(ticket.revision_run.is_none());
+    assert_eq!(
+        gh.pushes.get(),
+        0,
+        "an already published commit must not be pushed twice"
+    );
 }
 
 #[test]

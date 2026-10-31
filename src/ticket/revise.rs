@@ -392,7 +392,8 @@ fn finish_revision(
         .and_then(|run| run.synced_sha.as_deref());
     let remote_tip = crate::gate::transport::PushTransport::open(&gate.state_dir, &gate.worktree)?
         .remote_tip(&initial.branch)?;
-    if synced_sha.is_none() || remote_tip.as_deref() != synced_sha {
+    let already_pushed = remote_tip.as_deref() == Some(head.as_str());
+    if !already_pushed && (synced_sha.is_none() || remote_tip.as_deref() != synced_sha) {
         return block_push_conflict(
             h,
             store,
@@ -404,7 +405,7 @@ fn finish_revision(
     }
     // The dispatch lock prevents merge handling from retiring this revision.
     // The gated transport must be able to acquire its own shared store lock.
-    if let Err(error) = gh.push_expected(gate, &head) {
+    if !already_pushed && let Err(error) = gh.push_expected(gate, &head) {
         let moved = crate::gate::transport::PushTransport::open(&gate.state_dir, &gate.worktree)?
             .remote_tip(&initial.branch)
             .is_ok_and(|tip| tip.as_deref() != synced_sha);
