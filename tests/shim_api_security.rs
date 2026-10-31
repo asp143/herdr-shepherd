@@ -296,3 +296,37 @@ fn shim_blocks_repository_settings_and_ruleset_writes() {
         f.assert_blocked(&args);
     }
 }
+
+#[test]
+fn shim_blocks_issue_and_run_mutations() {
+    let _guard = SCRIPT_EXEC_LOCK.lock().unwrap();
+    let f = Fixture::new();
+    for args in [
+        vec!["issue", "delete", "7", "--yes"],
+        vec!["issue", "edit", "7", "--title", "changed"],
+        vec!["run", "cancel", "7"],
+        vec!["run", "rerun", "7"],
+        vec!["run", "delete", "7"],
+    ] {
+        f.assert_blocked(&args);
+    }
+    for args in [
+        vec!["issue", "view", "7"],
+        vec!["issue", "list"],
+        vec!["issue", "status"],
+        vec!["run", "view", "7"],
+        vec!["run", "list"],
+        vec!["run", "watch", "7"],
+    ] {
+        if f.marker.exists() {
+            fs::remove_file(&f.marker).unwrap();
+        }
+        let out = f.invoke(&args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(f.marker.exists());
+    }
+}

@@ -351,7 +351,21 @@ pub fn check_gh(args: &[&str]) -> Result<(), ShepherdError> {
         {
             Ok(())
         }
-        "issue" | "search" | "run" | "version" => Ok(()),
+        "issue"
+            if rest
+                .first()
+                .is_some_and(|verb| matches!(*verb, "view" | "list" | "status")) =>
+        {
+            Ok(())
+        }
+        "run"
+            if rest
+                .first()
+                .is_some_and(|verb| matches!(*verb, "view" | "list" | "watch")) =>
+        {
+            Ok(())
+        }
+        "search" | "version" => Ok(()),
         _ => Err(denied("unsupported gh command or global option")),
     }
 }
