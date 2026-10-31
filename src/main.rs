@@ -135,6 +135,9 @@ enum TicketCommands {
         id: String,
     },
     Dispatch,
+    Integrate {
+        id: String,
+    },
     Transition {
         id: String,
         #[arg(long)]
@@ -402,6 +405,19 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                     let ticket = cli_ticket::cancel(herdr_client()?.as_ref(), &store, &cfg, id)?;
                     output::emit(cli.json, &ticket, || {
                         serde_json::to_string_pretty(&ticket).expect("serializable")
+                    });
+                }
+                TicketCommands::Integrate { id } => {
+                    let store = herdr_shepherd::store::Store::open(&state_dir(cli), &project)?;
+                    let cfg = herdr_shepherd::trusted::committed_config(
+                        &config::resolve_config_dir(cli.config_dir.as_deref()),
+                        &project,
+                        None,
+                        &state_dir(cli),
+                    )?;
+                    let report = cli_ticket::integrate(herdr_client()?.as_ref(), &store, &cfg, id)?;
+                    output::emit(cli.json, &report, || {
+                        serde_json::to_string_pretty(&report).expect("serializable")
                     });
                 }
                 TicketCommands::Dispatch => {

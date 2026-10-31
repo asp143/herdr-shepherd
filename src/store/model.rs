@@ -60,6 +60,8 @@ pub struct Ticket {
     pub findings: Vec<Finding>,
     pub pr_number: Option<u64>,
     pub children: Vec<ChildWorktree>,
+    #[serde(default)]
+    pub integration_ranges: Vec<String>,
     pub history: Vec<Transition>,
     pub created_at: String,
     pub updated_at: String,

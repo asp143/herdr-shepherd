@@ -87,57 +87,99 @@ pub fn run(
                 .roles
                 .iter()
                 .find(|r| &r.name == role)
-                .cloned()
                 .ok_or_else(|| ShepherdError::Usage(format!("unknown role: {role}")))?;
             let data = store.read()?;
-            let ticket = data
+            let mut ticket = data
                 .tickets
                 .iter()
                 .find(|t| &t.id == ticket)
+                .cloned()
                 .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {ticket}")))?;
-            let task = crate::cli_pr::read_text(task_file)?;
-            let worktree = ticket
-                .worktree
-                .clone()
-                .ok_or_else(|| ShepherdError::Usage("ticket has no worktree".into()))?;
-            let workspace_id = ticket
-                .workspace_id
-                .clone()
-                .ok_or_else(|| ShepherdError::Usage("ticket has no workspace".into()))?;
-            if unit.is_some() {
+            if !herdr_shepherd::ticket::state::is_active(ticket.state) {
+                return Err(ShepherdError::Usage("ticket is not active".into()));
+            }
+            let parallel = data.agents.iter().any(|a| {
+                a.ticket == ticket.id
+                    && a.role == role.name
+                    && matches!(
+                        a.status,
+                        herdr_shepherd::store::AgentStatus::Starting
+                            | herdr_shepherd::store::AgentStatus::Working
+                            | herdr_shepherd::store::AgentStatus::Blocked
+                    )
+            });
+            let child_mode = role.worktree == herdr_shepherd::roles::WorktreeMode::Child;
+            if parallel && child_mode && unit.is_none() {
                 return Err(ShepherdError::Usage(
-                    "child worktrees are not wired yet".into(),
+                    "parallel coders require --unit".into(),
                 ));
             }
-            let bin = std::env::current_exe().map_err(anyhow::Error::from)?;
-            let prompt = format!(
-                "Ticket {}: {}\n{}\nTask: {task}\nStay on branch {} in worktree {}. Never switch branches or write outside it. Never read .env*, Credentials/, *.pem, *.key or other secret files. Never push, open PRs, or call GitHub. Label findings High (Blocker) | Mid | Low | Wish. Report using: {} agent report --agent {{{{agent_name}}}} --report-file <path>\nJSON: {{\"status\":\"completed|blocked|failed\",\"summary\":\"text\",\"tests\":[],\"changed_paths\":[],\"blockers\":[],\"findings\":[],\"commit_sha\":null}}",
-                ticket.id,
-                ticket.title,
-                ticket.body,
-                ticket.branch,
-                worktree.display(),
-                bin.display()
-            );
-            let runners = role
-                .runners
-                .iter()
-                .map(|name| resolved.runners[name].clone())
-                .collect();
-            let tab_label = role.name.clone();
-            serde_json::to_value(flock::spawn(
+            if unit.is_some() && !child_mode {
+                return Err(ShepherdError::Usage(
+                    "--unit requires a child-worktree role".into(),
+                ));
+            }
+            let task = crate::cli_pr::read_text(task_file)?;
+            let mut label = None;
+            if child_mode && parallel {
+                let unit = unit.expect("checked unit");
+                if data
+                    .agents
+                    .iter()
+                    .filter(|a| {
+                        a.role != "lead"
+                            && matches!(
+                                a.status,
+                                herdr_shepherd::store::AgentStatus::Starting
+                                    | herdr_shepherd::store::AgentStatus::Working
+                                    | herdr_shepherd::store::AgentStatus::Blocked
+                            )
+                    })
+                    .count()
+                    >= resolved.shepherd.max_parallel_agents
+                {
+                    return Err(ShepherdError::Capacity);
+                }
+                let child = if let Some(child) = ticket.children.iter().find(|c| c.unit == unit) {
+                    child.clone()
+                } else {
+                    let bin = std::env::current_exe().map_err(anyhow::Error::from)?;
+                    let child = herdr_shepherd::ticket::children::create_child(
+                        h, &ticket, unit, state, &bin,
+                    )?;
+                    store.update(|data| {
+                        let t = data
+                            .tickets
+                            .iter_mut()
+                            .find(|t| t.id == ticket.id)
+                            .ok_or_else(|| ShepherdError::Usage("ticket disappeared".into()))?;
+                        t.children.push(child.clone());
+                        Ok(())
+                    })?;
+                    herdr_shepherd::gate::hook::install_configured(
+                        &child.path,
+                        &child.branch,
+                        state,
+                        &bin,
+                        config_dir,
+                    )?;
+                    child
+                };
+                ticket.worktree = Some(child.path);
+                ticket.workspace_id = Some(child.workspace_id);
+                ticket.branch = child.branch;
+                label = Some(format!("{}-{unit}", role.name));
+            }
+            serde_json::to_value(spawn_task_request(
                 h,
                 &store,
                 &cfg,
-                LaunchRequest {
-                    ticket: ticket.id.clone(),
-                    role,
-                    runners,
-                    worktree,
-                    workspace_id,
-                    tab_label,
-                    prompt,
-                    state_dir: state.into(),
+                TaskRequest {
+                    state,
+                    ticket: &ticket,
+                    role_name: &role.name,
+                    task: &task,
+                    tab_label: label.as_deref(),
                 },
             )?)
             .expect("serializable")
@@ -149,6 +191,14 @@ pub fn run(
     Ok(())
 }
 
+pub struct TaskRequest<'a> {
+    pub state: &'a Path,
+    pub ticket: &'a herdr_shepherd::store::Ticket,
+    pub role_name: &'a str,
+    pub task: &'a str,
+    pub tab_label: Option<&'a str>,
+}
+
 pub fn spawn_task(
     h: &dyn Herdr,
     store: &Store,
@@ -158,6 +208,33 @@ pub fn spawn_task(
     role_name: &str,
     task: &str,
 ) -> Result<herdr_shepherd::store::AgentRecord, ShepherdError> {
+    spawn_task_request(
+        h,
+        store,
+        cfg,
+        TaskRequest {
+            state,
+            ticket,
+            role_name,
+            task,
+            tab_label: None,
+        },
+    )
+}
+
+pub fn spawn_task_request(
+    h: &dyn Herdr,
+    store: &Store,
+    cfg: &herdr_shepherd::config::Config,
+    request: TaskRequest<'_>,
+) -> Result<herdr_shepherd::store::AgentRecord, ShepherdError> {
+    let TaskRequest {
+        state,
+        ticket,
+        role_name,
+        task,
+        tab_label: requested_label,
+    } = request;
     let resolved = roles::resolve(cfg)?;
     let role = resolved
         .roles
@@ -189,7 +266,7 @@ pub fn spawn_task(
         .iter()
         .map(|name| resolved.runners[name].clone())
         .collect();
-    let tab_label = role.name.clone();
+    let tab_label = requested_label.unwrap_or(&role.name).to_owned();
     flock::spawn(
         h,
         store,

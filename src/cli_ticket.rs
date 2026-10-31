@@ -142,3 +142,101 @@ pub fn transition(
     );
     Ok(ticket)
 }
+
+pub fn integrate(
+    h: &dyn Herdr,
+    store: &Store,
+    cfg: &Config,
+    id: &str,
+) -> Result<herdr_shepherd::ticket::children::IntegrateReport, ShepherdError> {
+    use herdr_shepherd::ticket::children;
+    let data = store.read()?;
+    if data.agents.iter().any(|a| {
+        a.ticket == id
+            && matches!(
+                a.status,
+                AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
+            )
+    }) {
+        return Err(ShepherdError::Usage(
+            "wait for coders to report before integrating".into(),
+        ));
+    }
+    let mut ticket = data
+        .tickets
+        .into_iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
+    let path = ticket
+        .worktree
+        .clone()
+        .ok_or_else(|| ShepherdError::Usage("ticket has no worktree".into()))?;
+    if crate::cli_pr::git(&path, &["branch", "--show-current"])? != ticket.branch {
+        return Err(ShepherdError::PolicyDenied(
+            "ticket worktree changed branch".into(),
+        ));
+    }
+    let ranges = children::conflict_ranges(&ticket.children);
+    let result = children::integrate(&path, &mut ticket.children);
+    match result {
+        Err(error @ ShepherdError::Conflict { .. }) => {
+            let cap = roles::resolve(cfg)?.shepherd.max_revision_rounds;
+            store.update(|data| {
+                let t = data
+                    .tickets
+                    .iter_mut()
+                    .find(|t| t.id == id)
+                    .ok_or_else(|| ShepherdError::Usage("ticket disappeared".into()))?;
+                t.integration_ranges = ranges;
+                transition_with_limit(
+                    t,
+                    TicketState::Blocked,
+                    Some(BlockedReason::Conflict),
+                    &launch::now(),
+                    cap,
+                )
+            })?;
+            herdr_shepherd::hooks::emit(
+                cfg,
+                "ticket.blocked",
+                &serde_json::json!({"ticket":id,"reason":"conflict"}),
+            );
+            herdr_shepherd::flock::ping(
+                h,
+                store,
+                &format!("{id}: child integration conflict; both ranges retained"),
+            );
+            herdr_shepherd::notify::Notifier::new(h, cfg.upkeep.notifications)
+                .send(&format!("{id}: integration blocked"), &error.to_string());
+            Err(error)
+        }
+        Err(error) => Err(error),
+        Ok(report) => {
+            store.update(|data| {
+                let t = data
+                    .tickets
+                    .iter_mut()
+                    .find(|t| t.id == id)
+                    .ok_or_else(|| ShepherdError::Usage("ticket disappeared".into()))?;
+                t.children = ticket.children.clone();
+                t.integration_ranges = report.ranges.clone();
+                Ok(())
+            })?;
+            for child in &ticket.children {
+                for rec in store.read()?.agents.into_iter().filter(|a| {
+                    a.ticket == id && a.worktree == child.path && a.status == AgentStatus::Reported
+                }) {
+                    herdr_shepherd::flock::cancel(h, store, &rec.name, false)?;
+                }
+                children::cleanup_integrated(h, &path, std::slice::from_ref(child))?;
+                store.update(|data| {
+                    if let Some(t) = data.tickets.iter_mut().find(|t| t.id == id) {
+                        t.children.retain(|c| c.unit != child.unit);
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(report)
+        }
+    }
+}
