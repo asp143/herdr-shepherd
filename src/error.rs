@@ -8,6 +8,8 @@ pub enum ShepherdError {
     GithubUnavailable(String),
     Runtime(anyhow::Error),
     PolicyDenied(String),
+    Capacity,
+    Conflict { unit: u32, range: String },
     Attribution,
     NoTicketSource,
 }
@@ -21,6 +23,8 @@ impl ShepherdError {
             Self::GithubUnavailable(_) => "github_unavailable",
             Self::Runtime(_) => "runtime",
             Self::PolicyDenied(_) => "policy_denied",
+            Self::Capacity => "capacity",
+            Self::Conflict { .. } => "conflict",
             Self::Attribution => "attribution",
             Self::NoTicketSource => "no_ticket_source",
         }
@@ -30,7 +34,10 @@ impl ShepherdError {
         match self {
             Self::Usage(_) | Self::Config { .. } => 2,
             Self::HerdrUnavailable(_) => 3,
-            Self::Runtime(_) | Self::GithubUnavailable(_) => 1,
+            Self::Runtime(_)
+            | Self::GithubUnavailable(_)
+            | Self::Capacity
+            | Self::Conflict { .. } => 1,
             Self::PolicyDenied(_) => 4,
             Self::Attribution | Self::NoTicketSource => 2,
         }
@@ -46,6 +53,8 @@ impl fmt::Display for ShepherdError {
             | Self::PolicyDenied(message) => f.write_str(message),
             Self::Config { path, message } => write!(f, "{}: {message}", path.display()),
             Self::Runtime(error) => write!(f, "{error:#}"),
+            Self::Capacity => f.write_str("parallel agent capacity reached"),
+            Self::Conflict { unit, range } => write!(f, "child unit {unit} conflicts: {range}"),
             Self::Attribution => f.write_str("human-facing text contains AI attribution"),
             Self::NoTicketSource => {
                 f.write_str("no ticket source configured; paste the ticket text")

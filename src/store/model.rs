@@ -94,6 +94,8 @@ pub struct AgentRecord {
     pub last_progress_at: String,
     pub nudges: u32,
     pub restarts: u32,
+    #[serde(default)]
+    pub prompt_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
