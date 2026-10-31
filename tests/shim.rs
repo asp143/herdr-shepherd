@@ -1,8 +1,13 @@
 use herdr_shepherd::gate::shim::install_shim;
-use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+use std::{fs, os::unix::fs::PermissionsExt, process::Command, sync::Mutex};
+
+// A parallel fork can inherit another thread's writable script descriptor
+// until exec. Keep script creation and execution in one critical section.
+static SCRIPT_EXEC_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn shim_blocks_merge() {
+    let _guard = SCRIPT_EXEC_LOCK.lock().unwrap();
     let state = tempfile::tempdir().unwrap();
     let dir = install_shim(
         state.path(),
@@ -19,6 +24,7 @@ fn shim_blocks_merge() {
 
 #[test]
 fn shim_passes_through_allowed() {
+    let _guard = SCRIPT_EXEC_LOCK.lock().unwrap();
     let state = tempfile::tempdir().unwrap();
     let real = state.path().join("real");
     fs::create_dir(&real).unwrap();
@@ -45,6 +51,7 @@ fn shim_passes_through_allowed() {
 
 #[test]
 fn shim_blocks_merge_api_bypasses() {
+    let _guard = SCRIPT_EXEC_LOCK.lock().unwrap();
     let state = tempfile::tempdir().unwrap();
     let real = state.path().join("real");
     fs::create_dir(&real).unwrap();
