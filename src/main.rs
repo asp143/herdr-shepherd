@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, error::ErrorKind};
 use herdr_shepherd::{
@@ -8,7 +8,7 @@ use herdr_shepherd::{
     output,
     probe::SystemProbe,
     proc,
-    upkeep::{event, prune, regroup},
+    upkeep::{event, keys, prune, regroup},
 };
 
 #[derive(Parser)]
@@ -21,7 +21,12 @@ struct Cli {
     json: bool,
     #[arg(long, global = true)]
     config_dir: Option<PathBuf>,
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        env = "HERDR_PLUGIN_STATE_DIR",
+        hide_env_values = true
+    )]
     state_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
@@ -35,6 +40,11 @@ enum Commands {
     Regroup,
     /// Handle a plugin event supplied by herdr.
     Event,
+    /// Print suggested bindings without editing herdr configuration.
+    Keys {
+        #[arg(long)]
+        herdr_config: Option<PathBuf>,
+    },
     /// Report stale worktrees without changing them.
     Prune {
         #[arg(long)]
@@ -60,13 +70,42 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
             });
         }
         Commands::ValidateConfig { project_root } => {
-            let current = project_root_from_cwd()?;
+            let current = resolve_project_root(project_root.as_deref())?;
             let cfg = config::load(
                 &config::resolve_config_dir(cli.config_dir.as_deref()),
-                Some(project_root.as_deref().unwrap_or(&current)),
+                Some(&current),
             )?;
             output::emit(cli.json, &cfg, || {
                 serde_json::to_string_pretty(&cfg).expect("config is serializable")
+            });
+        }
+        Commands::Keys { herdr_config } => {
+            let cfg = config::load(&config::resolve_config_dir(cli.config_dir.as_deref()), None)?;
+            let path = herdr_config
+                .clone()
+                .unwrap_or_else(|| home().join(".config/herdr/config.toml"));
+            let invalid = |message: String| ShepherdError::Config {
+                path: path.clone(),
+                message,
+            };
+            let text = if cfg.upkeep.keybindings {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(err) => return Err(invalid(err.to_string())),
+                }
+            } else {
+                String::new()
+            };
+            text.parse::<toml::Table>()
+                .map_err(|err| invalid(err.to_string()))?;
+            let snippet = keys::keys_snippet(&text, cfg.upkeep.keybindings);
+            output::emit(cli.json, &snippet, || {
+                let mut text = snippet.toml.clone();
+                for key in &snippet.skipped {
+                    text.push_str(&format!("# skipped existing user binding: {key}\n"));
+                }
+                text
             });
         }
         Commands::Regroup => {
@@ -139,10 +178,36 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn project_root_from_cwd() -> Result<PathBuf, ShepherdError> {
-    let cwd = std::env::current_dir().map_err(anyhow::Error::from)?;
+fn resolve_project_root(explicit: Option<&Path>) -> Result<PathBuf, ShepherdError> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    let context = std::env::var("HERDR_PLUGIN_CONTEXT_JSON")
+        .ok()
+        .map(|text| serde_json::from_str::<serde_json::Value>(&text))
+        .transpose()
+        .map_err(|err| ShepherdError::Usage(format!("invalid HERDR_PLUGIN_CONTEXT_JSON: {err}")))?;
+    let cwd = context
+        .as_ref()
+        .and_then(|context| {
+            [
+                context.pointer("/worktree/checkout_path"),
+                context.get("focused_pane_cwd"),
+                context.get("workspace_cwd"),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .find(|path| !path.is_empty())
+            .map(PathBuf::from)
+        })
+        .map(Ok)
+        .unwrap_or_else(std::env::current_dir)
+        .map_err(anyhow::Error::from)?;
     let root = proc::run(
-        std::process::Command::new("git").args(["rev-parse", "--show-toplevel"]),
+        std::process::Command::new("git")
+            .current_dir(&cwd)
+            .args(["rev-parse", "--show-toplevel"]),
         std::time::Duration::from_secs(20),
     );
     Ok(root

@@ -70,12 +70,15 @@ pub fn plan_regroup(workspaces: &[Workspace]) -> RegroupPlan {
         }
         let parent_prefix = format!("{}/", parent.label);
         for child in &group.children {
-            if let Some(label) = child
-                .label
+            let mut label = child.label.as_str();
+            while let Some(bare) = label
                 .strip_prefix("worktree/")
-                .or_else(|| child.label.strip_prefix(&parent_prefix))
+                .or_else(|| label.strip_prefix(&parent_prefix))
                 .filter(|label| !label.is_empty())
             {
+                label = bare;
+            }
+            if label != child.label {
                 plan.renames
                     .push((child.workspace_id.clone(), label.to_owned()));
             }
@@ -227,6 +230,21 @@ mod tests {
         let second = plan_regroup(&h.workspaces().unwrap());
         assert!(second.renames.is_empty());
         assert!(second.moves.is_empty());
+    }
+
+    #[test]
+    fn nested_generated_prefixes_are_idempotent() {
+        let h = FakeHerdr::new(vec![
+            parent("P"),
+            child("C1", "worktree/rff/task", "P"),
+            child("C2", "worktree/worktree/fix/foo", "P"),
+        ]);
+        let first = plan_regroup(&h.workspaces().unwrap());
+        apply(&h, &first).unwrap();
+        let second = plan_regroup(&h.workspaces().unwrap());
+        assert!(second.renames.is_empty(), "{second:?}");
+        assert!(second.moves.is_empty());
+        assert_eq!(h.workspaces().unwrap()[2].label, "fix/foo");
     }
 
     #[test]
