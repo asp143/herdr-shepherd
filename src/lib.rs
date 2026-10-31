@@ -4,6 +4,7 @@ pub mod herdr;
 pub mod output;
 pub mod probe;
 pub mod proc;
+pub mod roles;
 pub mod store;
 pub mod ticket;
 pub mod upkeep;

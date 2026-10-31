@@ -53,6 +53,22 @@ Global settings come from `shepherd.toml` inside the first available location:
 
 A project `.shepherd.toml` at the Git root replaces the global settings in full, except `[upkeep]`, which always comes from the global file. A project `[upkeep]` is ignored with a warning. Missing files use defaults; malformed files and unsupported schema versions are errors. Unknown sections are preserved for later phases.
 
+`validate-config` also resolves `[shepherd]`, `[roles.*]`, `[runners.*]`, and
+`[supervision]` from the selected file. Its existing output fields are retained,
+with `shepherd`, `roles`, `runners`, and `supervision` added alongside them.
+Defaults include planner, researcher, coder, reviewer, and QA roles, with the
+`codex-sol-high`, `omp-astra`, and `omp-glm-infra` runner catalog. Named role and
+runner entries override built-in fields; new roles default to the ticket
+worktree and `codex-sol-high`. No fields are merged between config files.
+
+Shepherd defaults are two concurrent tickets, six parallel agents, three
+revision rounds, and PR polling every 180 seconds. Supervision defaults are a
+30-second sweep, 120-second report grace, 20-minute stall threshold, and
+15-minute escalation threshold. User regex rules run before built-in
+`codex-trust`, `press-enter`, and `codex-update-notice` rules. Rule keys are
+limited to `enter`, `esc`, `y`, `n`, `1` through `9`, `down`, and `up`. This core
+resolves supervision configuration; executing those rules is a later module.
+
 Example global settings:
 
 ```toml

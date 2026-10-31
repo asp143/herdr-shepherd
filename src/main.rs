@@ -74,6 +74,14 @@ enum TicketCommands {
     Show { id: String },
 }
 
+#[derive(serde::Serialize)]
+struct ValidatedConfig {
+    #[serde(flatten)]
+    config: config::Config,
+    #[serde(flatten)]
+    resolved: herdr_shepherd::roles::Resolved,
+}
+
 fn run(cli: &Cli) -> Result<(), ShepherdError> {
     match &cli.command {
         Commands::Ticket {
@@ -113,8 +121,12 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 &config::resolve_config_dir(cli.config_dir.as_deref()),
                 Some(&current),
             )?;
-            output::emit(cli.json, &cfg, || {
-                serde_json::to_string_pretty(&cfg).expect("config is serializable")
+            let validated = ValidatedConfig {
+                resolved: herdr_shepherd::roles::resolve(&cfg)?,
+                config: cfg,
+            };
+            output::emit(cli.json, &validated, || {
+                serde_json::to_string_pretty(&validated).expect("config is serializable")
             });
         }
         Commands::Keys { herdr_config } => {
