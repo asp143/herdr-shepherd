@@ -209,6 +209,31 @@ mod tests {
                 self.active.fetch_sub(1, Ordering::SeqCst);
                 result
             }
+            fn report_workspace_tokens(
+                &self,
+                ws: &str,
+                set: &[(String, String)],
+                clear: &[String],
+            ) -> Result<(), ShepherdError> {
+                self.fake.report_workspace_tokens(ws, set, clear)
+            }
+            fn report_pane_tokens(
+                &self,
+                pane: &str,
+                set: &[(String, String)],
+                clear: &[String],
+            ) -> Result<(), ShepherdError> {
+                self.fake.report_pane_tokens(pane, set, clear)
+            }
+            fn notify(&self, t: &str, b: &str) -> Result<(), ShepherdError> {
+                self.fake.notify(t, b)
+            }
+            fn remove_worktree(&self, ws: &str, force: bool) -> Result<(), ShepherdError> {
+                self.fake.remove_worktree(ws, force)
+            }
+            fn close_workspace(&self, ws: &str) -> Result<(), ShepherdError> {
+                self.fake.close_workspace(ws)
+            }
         }
         let config_dir = tempfile::tempdir().unwrap();
         let cfg = config::load(config_dir.path(), None).unwrap();

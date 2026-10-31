@@ -3,6 +3,8 @@ pub mod error;
 pub mod gate;
 pub mod github;
 pub mod herdr;
+pub mod metadata;
+pub mod notify;
 pub mod output;
 pub mod probe;
 pub mod proc;

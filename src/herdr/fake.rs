@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crate::error::ShepherdError;
 
@@ -10,6 +10,7 @@ use super::{
 pub struct FakeHerdr {
     pub workspaces: RefCell<Vec<Workspace>>,
     pub calls: RefCell<Vec<String>>,
+    pub notify_error: Cell<bool>,
 }
 
 impl FakeHerdr {
@@ -17,11 +18,69 @@ impl FakeHerdr {
         Self {
             workspaces: RefCell::new(workspaces),
             calls: RefCell::new(Vec::new()),
+            notify_error: Cell::new(false),
         }
     }
 }
 
 impl Herdr for FakeHerdr {
+    fn report_workspace_tokens(
+        &self,
+        ws: &str,
+        set: &[(String, String)],
+        clear: &[String],
+    ) -> Result<(), ShepherdError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("workspace_tokens {ws} {set:?} {clear:?}"));
+        Ok(())
+    }
+
+    fn report_pane_tokens(
+        &self,
+        pane: &str,
+        set: &[(String, String)],
+        clear: &[String],
+    ) -> Result<(), ShepherdError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("pane_tokens {pane} {set:?} {clear:?}"));
+        Ok(())
+    }
+
+    fn notify(&self, title: &str, body: &str) -> Result<(), ShepherdError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("notify {title} {body}"));
+        if self.notify_error.get() {
+            Err(ShepherdError::Runtime(anyhow::anyhow!(
+                "notification unavailable"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn remove_worktree(&self, ws: &str, force: bool) -> Result<(), ShepherdError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("remove_worktree {ws} {force}"));
+        self.workspaces
+            .borrow_mut()
+            .retain(|workspace| workspace.workspace_id != ws);
+        Ok(())
+    }
+
+    fn close_workspace(&self, ws: &str) -> Result<(), ShepherdError> {
+        self.calls
+            .borrow_mut()
+            .push(format!("close_workspace {ws}"));
+        self.workspaces
+            .borrow_mut()
+            .retain(|workspace| workspace.workspace_id != ws);
+        Ok(())
+    }
+
     fn workspaces(&self) -> Result<Vec<Workspace>, ShepherdError> {
         self.calls.borrow_mut().push("workspaces".into());
         Ok(self.workspaces.borrow().clone())

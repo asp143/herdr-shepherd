@@ -59,7 +59,60 @@ impl CliHerdr {
     }
 }
 
+fn metadata_args(kind: &str, id: &str, set: &[(String, String)], clear: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = [kind, "report-metadata", "--source", "shepherd", id]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    for (key, value) in set {
+        args.extend(["--token".into(), format!("{key}={value}")]);
+    }
+    for key in clear {
+        args.extend(["--clear-token".into(), key.clone()]);
+    }
+    args
+}
+
 impl Herdr for CliHerdr {
+    fn report_workspace_tokens(
+        &self,
+        ws: &str,
+        set: &[(String, String)],
+        clear: &[String],
+    ) -> Result<(), ShepherdError> {
+        let args = metadata_args("workspace", ws, set, clear);
+        self.command(&args.iter().map(String::as_str).collect::<Vec<_>>())
+            .map(|_| ())
+    }
+
+    fn report_pane_tokens(
+        &self,
+        pane: &str,
+        set: &[(String, String)],
+        clear: &[String],
+    ) -> Result<(), ShepherdError> {
+        let args = metadata_args("pane", pane, set, clear);
+        self.command(&args.iter().map(String::as_str).collect::<Vec<_>>())
+            .map(|_| ())
+    }
+
+    fn notify(&self, title: &str, body: &str) -> Result<(), ShepherdError> {
+        self.command(&["notification", "show", title, "--body", body])
+            .map(|_| ())
+    }
+
+    fn remove_worktree(&self, ws: &str, force: bool) -> Result<(), ShepherdError> {
+        let mut args = vec!["worktree", "remove", "--workspace", ws];
+        if force {
+            args.push("--force");
+        }
+        self.command(&args).map(|_| ())
+    }
+
+    fn close_workspace(&self, ws: &str) -> Result<(), ShepherdError> {
+        self.command(&["workspace", "close", ws]).map(|_| ())
+    }
+
     fn workspaces(&self) -> Result<Vec<Workspace>, ShepherdError> {
         model::parse_snapshot(&self.command(&["api", "snapshot"])?).map_err(ShepherdError::Runtime)
     }
@@ -90,6 +143,33 @@ impl Herdr for CliHerdr {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn metadata_argv_keeps_tokens_in_shepherd_source() {
+        assert_eq!(
+            metadata_args(
+                "workspace",
+                "w1",
+                &[("shepherd_pr".into(), "open".into())],
+                &["shepherd_stage".into()],
+            ),
+            [
+                "workspace",
+                "report-metadata",
+                "--source",
+                "shepherd",
+                "w1",
+                "--token",
+                "shepherd_pr=open",
+                "--clear-token",
+                "shepherd_stage",
+            ]
+        );
+        assert_eq!(
+            metadata_args("pane", "p1", &[], &[]),
+            ["pane", "report-metadata", "--source", "shepherd", "p1"]
+        );
+    }
 
     #[test]
     fn missing_binary_is_herdr_unavailable() {

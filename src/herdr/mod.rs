@@ -12,6 +12,21 @@ pub trait Herdr {
     fn agents(&self) -> Result<Vec<AgentInfo>, ShepherdError>;
     fn rename_workspace(&self, id: &str, label: &str) -> Result<(), ShepherdError>;
     fn move_block(&self, ids: &[String], before: Option<&str>) -> Result<(), ShepherdError>;
+    fn report_workspace_tokens(
+        &self,
+        ws: &str,
+        set: &[(String, String)],
+        clear: &[String],
+    ) -> Result<(), ShepherdError>;
+    fn report_pane_tokens(
+        &self,
+        pane: &str,
+        set: &[(String, String)],
+        clear: &[String],
+    ) -> Result<(), ShepherdError>;
+    fn notify(&self, title: &str, body: &str) -> Result<(), ShepherdError>;
+    fn remove_worktree(&self, ws: &str, force: bool) -> Result<(), ShepherdError>;
+    fn close_workspace(&self, ws: &str) -> Result<(), ShepherdError>;
 }
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
