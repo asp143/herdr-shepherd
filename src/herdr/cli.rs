@@ -118,11 +118,14 @@ fn response_error(output: &proc::Captured) -> Option<String> {
 fn command_error(output: &proc::Captured) -> ShepherdError {
     // Do not echo arguments: pane environment scripts and prompts can contain
     // private user text. Preserve the server's error code for launch decisions.
-    anyhow::anyhow!(
-        "herdr command failed: {}",
-        response_error(output).unwrap_or_else(|| format!("exit {}", output.status))
-    )
-    .into()
+    if let Some(code) = response_error(output) {
+        ShepherdError::HerdrCommand {
+            code,
+            message: "command failed".into(),
+        }
+    } else {
+        anyhow::anyhow!("herdr command failed: exit {}", output.status).into()
+    }
 }
 
 fn id(value: &serde_json::Value, key: &str) -> Result<String, ShepherdError> {
@@ -456,6 +459,30 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
+    #[test]
+    fn prompt_errors_preserve_server_codes_only() {
+        for (text, expected) in [
+            (
+                r#"{"error":{"code":"timeout","message":"wait expired"}}"#,
+                Some("timeout"),
+            ),
+            ("connect timeout", None),
+            (
+                r#"{"error":{"code":"permission_denied","message":"timeout in text"}}"#,
+                Some("permission_denied"),
+            ),
+        ] {
+            let output = crate::proc::capture(
+                Command::new("/bin/sh").args(["-c", "cat >&2; exit 1"]),
+                Duration::from_secs(2),
+                Some(text.as_bytes()),
+            )
+            .unwrap();
+            let error = command_error(&output);
+            assert_eq!(error.herdr_code(), expected);
+            assert_eq!(error.prompt_was_submitted(), expected == Some("timeout"));
+        }
+    }
     #[test]
     fn metadata_uses_socket_tokens_and_null_clears() {
         use std::io::{BufRead, BufReader, Write};

@@ -263,13 +263,10 @@ fn launch_reserved(
                 record.prompt_pending = false;
                 record.status = AgentStatus::Working;
             }
-            Err(error) if error.to_string().contains("agent_blocked") => {
+            Err(error) if error.herdr_code() == Some("agent_blocked") => {
                 record.status = AgentStatus::Blocked;
             }
-            Err(error)
-                if error.to_string().contains("agent_prompt_stalled")
-                    || error.to_string().contains("timeout") =>
-            {
+            Err(error) if error.prompt_was_submitted() => {
                 // Accepted submissions must never be sent a second time solely
                 // because the observation deadline expired.
                 record.prompt_pending = false;
