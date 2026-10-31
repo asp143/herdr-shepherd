@@ -64,8 +64,13 @@ impl GhBackend {
                     .map(str::to_owned)
                     .or_else(|| {
                         let slug = request.get("slug")?.as_str()?;
-                        let org = request.pointer("/organization/login")?.as_str()?;
-                        Some(format!("{org}/{slug}"))
+                        // gh exports Team.slug as the qualified org/team name.
+                        if slug.contains('/') {
+                            Some(slug.to_owned())
+                        } else {
+                            let org = request.pointer("/organization/login")?.as_str()?;
+                            Some(format!("{org}/{slug}"))
+                        }
                     })
             })
             .collect())
@@ -225,10 +230,23 @@ pub fn parse_view(text: &str) -> Result<PrStatus, ShepherdError> {
         comment_ids: raw
             .comments
             .iter()
-            .filter_map(|c| {
-                c.get("databaseId")
-                    .or_else(|| c.get("id"))
+            .filter_map(|comment| {
+                comment
+                    .get("databaseId")
                     .and_then(Value::as_u64)
+                    .or_else(|| comment.get("id").and_then(Value::as_u64))
+                    .or_else(|| {
+                        // gh exports opaque GraphQL IDs; its URL retains the
+                        // numeric REST comment ID required by reply endpoints.
+                        let (_, fragment) = comment.get("url")?.as_str()?.rsplit_once('#')?;
+                        let digits = fragment
+                            .strip_prefix("issuecomment-")
+                            .or_else(|| fragment.strip_prefix("discussion_r"))?;
+                        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                            return None;
+                        }
+                        digits.parse().ok()
+                    })
             })
             .collect(),
     })
@@ -338,6 +356,26 @@ mod tests {
                 "--body-file",
                 "-"
             ]
+        );
+    }
+
+    #[test]
+    fn graphql_comment_ids_use_numeric_url_fragments() {
+        let mut raw: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/gh_pr_view.json")).unwrap();
+        raw["comments"] = json!([
+            {"id":"IC_opaque", "url":"https://github.com/example/project/pull/42#issuecomment-234"},
+            {"id":"PRRC_opaque", "url":"https://github.com/example/project/pull/42#discussion_r345"},
+            {"databaseId":456,"id":"IC_opaque"},
+            {"id":567},
+            {"id":"IC_unusable", "url":"https://github.com/example/project/pull/42#issuecomment-+678"},
+            {"id":"IC_unusable", "url":"https://github.com/example/project/pull/42#other-789"}
+        ]);
+        // Review IDs are a different object kind and must not become comment IDs.
+        raw["reviews"] = json!([{"id":"PRR_opaque"}]);
+        assert_eq!(
+            parse_view(&raw.to_string()).unwrap().comment_ids,
+            [234, 345, 456, 567]
         );
     }
 

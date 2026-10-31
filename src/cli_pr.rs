@@ -14,6 +14,12 @@ use std::{
 
 #[derive(Subcommand)]
 pub enum PrCommand {
+    Owners {
+        #[arg(long)]
+        worktree: PathBuf,
+        #[arg(long)]
+        base: String,
+    },
     View {
         #[arg(long)]
         worktree: PathBuf,
@@ -126,7 +132,8 @@ pub fn read_text(path: &Path) -> Result<String, ShepherdError> {
 
 pub fn run(command: &PrCommand, config_dir: &Path, json: bool) -> Result<(), ShepherdError> {
     let worktree = match command {
-        PrCommand::View { worktree }
+        PrCommand::Owners { worktree, .. }
+        | PrCommand::View { worktree }
         | PrCommand::Push { worktree }
         | PrCommand::Create { worktree, .. }
         | PrCommand::Reply { worktree, .. } => worktree,
@@ -134,12 +141,15 @@ pub fn run(command: &PrCommand, config_dir: &Path, json: bool) -> Result<(), She
     let root = git(worktree, &["rev-parse", "--show-toplevel"])?;
     let cfg = config::load(config_dir, Some(Path::new(&root)))?;
     let base = match command {
-        PrCommand::Create { base, .. } => Some(base.as_str()),
+        PrCommand::Create { base, .. } | PrCommand::Owners { base, .. } => Some(base.as_str()),
         _ => None,
     };
     let mut gate = gate(worktree, &cfg, base)?;
     let backend = GhBackend;
     let data = match command {
+        PrCommand::Owners { base, .. } => {
+            serde_json::to_value(owners(&gate, base)?).map_err(anyhow::Error::from)?
+        }
         PrCommand::View { .. } => {
             serde_json::to_value(backend.view(worktree, &gate.ticket_branch)?)
                 .map_err(anyhow::Error::from)?
@@ -168,6 +178,19 @@ pub fn run(command: &PrCommand, config_dir: &Path, json: bool) -> Result<(), She
                 &gate.policy,
             )?;
             let status = backend.create(&gate, base, title, &read_text(body_file)?)?;
+            let owners = owners(&gate, base)?;
+            if !owners.is_empty() {
+                let requested = backend.requested_reviewers(&gate, status.number)?;
+                let remaining: Vec<_> = owners
+                    .into_iter()
+                    .filter(|owner| {
+                        !requested
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(owner))
+                    })
+                    .collect();
+                backend.add_reviewers(&gate, status.number, &remaining)?;
+            }
             serde_json::to_value(status).map_err(anyhow::Error::from)?
         }
         PrCommand::Reply {
@@ -184,4 +207,40 @@ pub fn run(command: &PrCommand, config_dir: &Path, json: bool) -> Result<(), She
         serde_json::to_string_pretty(&data).expect("serializable")
     });
     Ok(())
+}
+
+fn owners(gate: &Gate, base: &str) -> Result<Vec<String>, ShepherdError> {
+    use herdr_shepherd::github::codeowners;
+    git(&gate.worktree, &["check-ref-format", "--branch", base])?;
+    let root = git(&gate.worktree, &["rev-parse", "--show-toplevel"])?;
+    let Some(path) = codeowners::find_codeowners(Path::new(&root)) else {
+        return Ok(Vec::new());
+    };
+    let rules = codeowners::parse(&read_text(&path)?);
+    if rules.is_empty() {
+        return Ok(Vec::new());
+    }
+    let changed = git(
+        &gate.worktree,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            &format!("origin/{base}...HEAD"),
+            "--",
+        ],
+    )?;
+    let changed: Vec<_> = changed
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let author = gate.gh(&["api", "user", "-q", ".login"], &gate.worktree)?;
+    let author = author.trim();
+    if author.is_empty() {
+        return Err(ShepherdError::GithubUnavailable(
+            "GitHub returned an empty author".into(),
+        ));
+    }
+    Ok(codeowners::owners_for(&rules, &changed, Some(author)))
 }

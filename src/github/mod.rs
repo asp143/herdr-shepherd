@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{error::ShepherdError, gate::Gate};
 
+pub mod codeowners;
 #[cfg(test)]
 pub mod fake;
 pub mod gh;
