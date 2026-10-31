@@ -60,6 +60,26 @@ pub fn next_actions(data: &StoreData, settings: &ShepherdSettings) -> Vec<Action
         .collect()
 }
 
+/// Dispatch the existing Revising priority without changing its lifecycle state.
+#[allow(clippy::too_many_arguments)]
+pub fn resume_revising(
+    h: &dyn crate::herdr::Herdr,
+    gh: &dyn crate::github::PrBackend,
+    store: &crate::store::Store,
+    cfg: &crate::config::Config,
+    gate: &crate::gate::Gate,
+    id: &str,
+    now: &str,
+) -> Result<super::revise::RevisionOutcome, crate::error::ShepherdError> {
+    let settings = crate::roles::resolve(cfg)?.shepherd;
+    if !next_actions(&store.read()?, &settings).contains(&Action::ResumeRevising(id.into())) {
+        return Err(crate::error::ShepherdError::Usage(
+            "revision has no available scheduling slot".into(),
+        ));
+    }
+    super::revise::resume_revision(h, gh, store, cfg, gate, id, now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

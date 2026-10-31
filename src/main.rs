@@ -458,8 +458,9 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                         None,
                         &state_dir(cli),
                     )?;
-                    let result = cli_ticket::dispatch(
+                    let result = cli_ticket::dispatch_with_backend(
                         herdr_client()?.as_ref(),
+                        github_client()?.as_ref(),
                         &store,
                         &cfg,
                         &state_dir(cli),

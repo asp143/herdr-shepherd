@@ -71,6 +71,8 @@ pub struct Ticket {
     pub comments: Vec<CommentRecord>,
     #[serde(default)]
     pub revision_task: Option<String>,
+    #[serde(default)]
+    pub revision_run: Option<crate::ticket::revise::RevisionRun>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

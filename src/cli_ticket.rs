@@ -8,8 +8,9 @@ use herdr_shepherd::{
 };
 use std::path::Path;
 
-pub fn dispatch(
+pub fn dispatch_with_backend(
     h: &dyn Herdr,
+    gh: &dyn herdr_shepherd::github::PrBackend,
     store: &Store,
     cfg: &Config,
     state: &Path,
@@ -52,26 +53,28 @@ pub fn dispatch(
                 )
             }
             scheduler::Action::ResumeRevising(id) => {
-                let ticket = store.update(|data| {
-                    let t = data
-                        .tickets
-                        .iter_mut()
-                        .find(|t| t.id == id)
-                        .ok_or_else(|| ShepherdError::Usage("ticket disappeared".into()))?;
-                    transition_with_limit(
-                        t,
-                        TicketState::Building,
-                        None,
-                        &launch::now(),
-                        resolved.shepherd.max_revision_rounds,
-                    )?;
-                    Ok(t.clone())
-                })?;
-                (
-                    ticket,
-                    "coder",
-                    "Revise the implementation using the ticket findings and latest plan. Commit the fix, run relevant checks and report.",
-                )
+                let ticket = store
+                    .read()?
+                    .tickets
+                    .into_iter()
+                    .find(|ticket| ticket.id == id)
+                    .ok_or_else(|| ShepherdError::Usage("ticket disappeared".into()))?;
+                let path = ticket
+                    .worktree
+                    .as_deref()
+                    .ok_or_else(|| ShepherdError::Usage("ticket has no worktree".into()))?;
+                let mut gate = crate::cli_pr::gate(
+                    path,
+                    cfg,
+                    Some(&ticket.base),
+                    Some(&ticket.branch),
+                    state,
+                )?;
+                gate.config_dir = config_dir.into();
+                let outcome =
+                    scheduler::resume_revising(h, gh, store, cfg, &gate, &id, &launch::now())?;
+                started.push(serde_json::json!({"ticket":id,"revision":outcome}));
+                continue;
             }
         };
         let rec = crate::cli_flock::spawn_task(h, store, cfg, state, &ticket, role, task)?;
