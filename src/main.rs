@@ -8,7 +8,7 @@ use herdr_shepherd::{
     output,
     probe::SystemProbe,
     proc,
-    upkeep::{prune, regroup},
+    upkeep::{event, prune, regroup},
 };
 
 #[derive(Parser)]
@@ -33,6 +33,8 @@ enum Commands {
     Version,
     /// Relabel and pack linked worktree workspaces.
     Regroup,
+    /// Handle a plugin event supplied by herdr.
+    Event,
     /// Report stale worktrees without changing them.
     Prune {
         #[arg(long)]
@@ -75,6 +77,20 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                     "herdr-shepherd: {} relabeled, {} group(s) repacked",
                     report.relabeled, report.repacked
                 )
+            });
+        }
+        Commands::Event => {
+            let name = std::env::var("HERDR_PLUGIN_EVENT")
+                .map_err(|_| ShepherdError::Usage("HERDR_PLUGIN_EVENT is required".into()))?;
+            let payload = std::env::var("HERDR_PLUGIN_EVENT_JSON")
+                .map_err(|_| ShepherdError::Usage("HERDR_PLUGIN_EVENT_JSON is required".into()))?;
+            let payload = serde_json::from_str(&payload).map_err(|err| {
+                ShepherdError::Usage(format!("invalid HERDR_PLUGIN_EVENT_JSON: {err}"))
+            })?;
+            let cfg = config::load(&config::resolve_config_dir(cli.config_dir.as_deref()), None)?;
+            let outcome = event::handle_event(&name, &payload, &cfg, &CliHerdr::from_env())?;
+            output::emit(cli.json, &outcome, || {
+                format!("herdr-shepherd: {outcome:?}")
             });
         }
         Commands::Prune { no_size, all, root } => {

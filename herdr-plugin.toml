@@ -1,0 +1,35 @@
+id = "herdr-shepherd"
+name = "Shepherd"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Shepherd a flock of coding agents from ticket to merged PR, plus herdr upkeep"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["sh", "scripts/build.sh"]
+
+[[actions]]
+id = "regroup"
+title = "Shepherd: Regroup worktrees"
+contexts = ["workspace"]
+command = ["bin/herdr-shepherd", "regroup"]
+
+[[actions]]
+id = "prune"
+title = "Shepherd: Stale worktree report"
+contexts = ["workspace"]
+command = ["bin/herdr-shepherd", "prune", "--no-size"]
+
+[[actions]]
+id = "validate-config"
+title = "Shepherd: Validate config"
+contexts = ["workspace"]
+command = ["bin/herdr-shepherd", "validate-config"]
+
+[[events]]
+on = "worktree.created"
+command = ["bin/herdr-shepherd", "event"]
+
+[[events]]
+on = "worktree.removed"
+command = ["bin/herdr-shepherd", "event"]
