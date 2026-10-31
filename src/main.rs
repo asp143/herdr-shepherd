@@ -34,6 +34,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Gate gh calls from agent panes.
+    Shim {
+        #[command(subcommand)]
+        command: ShimCommand,
+    },
     /// Print the shepherd version.
     Version,
     /// Relabel and pack linked worktree workspaces.
@@ -61,8 +66,33 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum ShimCommand {
+    Gh {
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+fn state_dir(cli: &Cli) -> PathBuf {
+    cli.state_dir
+        .clone()
+        .unwrap_or_else(|| home().join(".local/state/herdr/plugins/herdr-shepherd"))
+}
+
 fn run(cli: &Cli) -> Result<(), ShepherdError> {
     match &cli.command {
+        Commands::Shim {
+            command: ShimCommand::Gh { args },
+        } => {
+            if let Err(error) = herdr_shepherd::gate::shim::run(args, &state_dir(cli)) {
+                if matches!(error, ShepherdError::PolicyDenied(_)) {
+                    eprintln!("shepherd: blocked: {error}");
+                    std::process::exit(4);
+                }
+                return Err(error);
+            }
+        }
         Commands::Version => {
             let version = env!("CARGO_PKG_VERSION");
             output::emit(cli.json, &serde_json::json!({ "version": version }), || {

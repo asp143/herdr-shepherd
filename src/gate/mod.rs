@@ -90,3 +90,15 @@ impl Gate {
         Ok(result.stdout)
     }
 }
+pub mod env;
+pub mod shim;
+
+impl Gate {
+    /// Execute the real gh for a credential-stripped agent, preserving its env.
+    pub fn exec_gh(args: &[&str], path: &std::ffi::OsStr) -> Result<(), ShepherdError> {
+        use std::os::unix::process::CommandExt;
+        check_gh(args)?;
+        let error = Command::new("gh").args(args).env("PATH", path).exec();
+        Err(ShepherdError::Runtime(error.into()))
+    }
+}
