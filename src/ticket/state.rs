@@ -45,6 +45,8 @@ pub fn transition_with_limit(
             | (PrOpen, Revising | Merged | Closed)
             | (Revising, Building | Reviewing | Qa | CiWait | PrOpen)
             | (Merged, CleanedUp)
+            | (ReadyForPr | PrOpen | Merged, Blocked)
+            | (Blocked, Failed)
     );
     let blocked_origin = t
         .history
@@ -64,6 +66,12 @@ pub fn transition_with_limit(
     }
     let mut to = to;
     let mut reason = reason;
+    if t.state == Blocked
+        && t.blocked_reason == Some(BlockedReason::LoopCap)
+        && blocked_origin == Some(to)
+    {
+        t.revision_round = 0;
+    }
     if matches!((t.state, to), (Reviewing | Qa | CiWait, Building)) {
         let next = t.revision_round.checked_add(1);
         t.revision_round = next.unwrap_or(u32::MAX);
@@ -169,6 +177,43 @@ mod tests {
     }
 
     #[test]
+    fn loop_cap_unblock_starts_fresh_revision_rounds() {
+        for prior in [Reviewing, Qa, CiWait] {
+            let mut ticket = Ticket {
+                state: prior,
+                revision_round: 3,
+                ..Ticket::default()
+            };
+            transition(&mut ticket, Building, None, "cap").unwrap();
+            assert_eq!(ticket.state, Blocked);
+            assert_eq!(ticket.blocked_reason, Some(BlockedReason::LoopCap));
+            transition(&mut ticket, prior, None, "unblock").unwrap();
+            assert_eq!(ticket.revision_round, 0);
+            assert_eq!(ticket.blocked_reason, None);
+            assert_eq!(ticket.history[1].from, Blocked);
+            assert_eq!(ticket.history[1].to, prior);
+            for round in 1..=3 {
+                transition(&mut ticket, Building, None, "retry").unwrap();
+                assert_eq!(ticket.state, Building);
+                assert_eq!(ticket.revision_round, round);
+                let path: &[TicketState] = match prior {
+                    Reviewing => &[Reviewing],
+                    Qa => &[Reviewing, Qa],
+                    CiWait => &[Reviewing, Qa, ReadyForPr, CiWait],
+                    _ => unreachable!(),
+                };
+                for &next in path {
+                    transition(&mut ticket, next, None, "next").unwrap();
+                }
+            }
+            transition(&mut ticket, Building, None, "cap again").unwrap();
+            assert_eq!(ticket.state, Blocked);
+            assert_eq!(ticket.blocked_reason, Some(BlockedReason::LoopCap));
+            assert_eq!(ticket.revision_round, 4);
+        }
+    }
+
+    #[test]
     fn unblock_returns_to_prior() {
         for prior in [
             Planning,
@@ -193,6 +238,39 @@ mod tests {
             assert_eq!(ticket.blocked_reason, None);
             assert_eq!(ticket.history[1].from, Blocked);
             assert_eq!(ticket.history[1].to, prior);
+        }
+    }
+
+    #[test]
+    fn pr_and_cleanup_states_can_block_and_resume() {
+        for prior in [ReadyForPr, PrOpen, Merged] {
+            let mut ticket = Ticket {
+                state: prior,
+                revision_round: 2,
+                ..Ticket::default()
+            };
+            transition(
+                &mut ticket,
+                Blocked,
+                Some(BlockedReason::Escalated),
+                "blocked",
+            )
+            .unwrap();
+            assert_eq!(ticket.state, Blocked);
+            assert_eq!(ticket.blocked_reason, Some(BlockedReason::Escalated));
+            assert_eq!(ticket.history[0].from, prior);
+            assert_eq!(ticket.history[0].to, Blocked);
+            assert_eq!(ticket.updated_at, "blocked");
+            let blocked = ticket.clone();
+            assert!(transition(&mut ticket, Building, None, "wrong").is_err());
+            assert_eq!(ticket, blocked);
+            transition(&mut ticket, prior, None, "resume").unwrap();
+            assert_eq!(ticket.state, prior);
+            assert_eq!(ticket.blocked_reason, None);
+            assert_eq!(ticket.revision_round, 2);
+            assert_eq!(ticket.history[1].from, Blocked);
+            assert_eq!(ticket.history[1].to, prior);
+            assert_eq!(ticket.updated_at, "resume");
         }
     }
 
@@ -317,6 +395,24 @@ mod tests {
         let before = ticket.clone();
         assert!(transition(&mut ticket, Building, None, "invalid").is_err());
         assert_eq!(ticket, before);
+    }
+
+    #[test]
+    fn blocked_ticket_can_fail() {
+        let mut ticket = Ticket {
+            state: Building,
+            revision_round: 2,
+            ..Ticket::default()
+        };
+        transition(&mut ticket, Blocked, Some(BlockedReason::Policy), "blocked").unwrap();
+        transition(&mut ticket, Failed, None, "failed").unwrap();
+        assert_eq!(ticket.state, Failed);
+        assert_eq!(ticket.blocked_reason, None);
+        assert_eq!(ticket.revision_round, 2);
+        assert_eq!(ticket.history[1].from, Blocked);
+        assert_eq!(ticket.history[1].to, Failed);
+        assert_eq!(ticket.history[1].reason, None);
+        assert_eq!(ticket.updated_at, "failed");
     }
 
     #[test]

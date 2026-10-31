@@ -39,6 +39,9 @@ slot. Review, QA, and red CI bounces share a revision counter; exceeding the cap
 blocks the ticket with `loop_cap`. `transition` uses the default cap of three;
 `transition_with_limit` accepts the project's resolved cap. Blocked tickets may
 resume only their recorded prior state, or be cancelled.
+PR-ready, open-PR, and merged tickets can also block for escalation or cleanup
+failure. Blocked tickets can fail; resuming a loop-cap block grants a fresh set
+of revision rounds.
 
 `ticket::pr_body` builds PR titles and the ordered Summary, Changes, Testing,
 optional Not addressed, and optional Ticket sections. The Ticket link uses
