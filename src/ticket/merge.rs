@@ -128,20 +128,25 @@ fn escalate(
     now: &str,
     message: &str,
 ) -> Result<MergeOutcome, ShepherdError> {
-    if store
-        .read()?
-        .tickets
-        .iter()
-        .any(|ticket| ticket.id == id && ticket.state != TicketState::Blocked)
-    {
-        transition(
-            store,
-            id,
-            TicketState::Blocked,
-            Some(BlockedReason::Escalated),
-            now,
-        )?;
-    }
+    store.update(|data| {
+        let ticket = data
+            .tickets
+            .iter_mut()
+            .find(|ticket| ticket.id == id)
+            .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
+        if ticket.state != TicketState::Blocked {
+            super::state::transition(
+                ticket,
+                TicketState::Blocked,
+                Some(BlockedReason::Escalated),
+                now,
+            )?;
+        }
+        // This escalation already tells the user about the merged ticket.
+        // Later blocked observations must not produce a second merge notice.
+        ticket.merged_while_blocked_notified = true;
+        Ok(())
+    })?;
     Notifier::new(h, cfg.upkeep.notifications).send(message, "");
     Ok(MergeOutcome::Escalated)
 }
@@ -284,10 +289,22 @@ fn handle_with_context(
     let cfg = &selected;
     if ticket.state == TicketState::Blocked {
         if status.state == PrState::Merged {
-            Notifier::new(h, cfg.upkeep.notifications).send(
-                &format!("{id}: merged while blocked; resources kept"),
-                &status.url,
-            );
+            let notify = store.update(|data| {
+                let Some(current) = data.tickets.iter_mut().find(|current| current.id == id) else {
+                    return Ok(false);
+                };
+                if current.merged_while_blocked_notified {
+                    return Ok(false);
+                }
+                current.merged_while_blocked_notified = true;
+                Ok(true)
+            })?;
+            if notify {
+                Notifier::new(h, cfg.upkeep.notifications).send(
+                    &format!("{id}: merged while blocked; resources kept"),
+                    &status.url,
+                );
+            }
         }
         if ticket.blocked_reason == Some(BlockedReason::Escalated) {
             retire_flock(store, h, id)?;
@@ -900,6 +917,97 @@ mod tests {
                 .iter()
                 .any(|call| call.contains("merged while blocked"))
         );
+    }
+
+    #[test]
+    fn merged_while_blocked_notifies_once_across_ticks() {
+        let fixture = Fixture::new(TicketState::Blocked);
+        for _ in 0..3 {
+            assert_eq!(fixture.run().unwrap(), MergeOutcome::Unchanged);
+        }
+        let calls = fixture.h.fake.calls.borrow();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.contains("merged while blocked"))
+                .count(),
+            1
+        );
+        assert!(fixture.path.exists());
+    }
+
+    #[test]
+    fn merged_escalation_does_not_notify_again_when_blocked() {
+        let fixture = Fixture::new(TicketState::Revising);
+        assert_eq!(fixture.run().unwrap(), MergeOutcome::Escalated);
+        for _ in 0..3 {
+            assert_eq!(fixture.run().unwrap(), MergeOutcome::Unchanged);
+        }
+        assert_eq!(
+            fixture
+                .h
+                .fake
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("notify ") && call.contains("merged"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn watcher_handles_ticket_merge_only_in_lifecycle_pass() {
+        let fixture = Fixture::new(TicketState::Blocked);
+        let mut state = crate::watch::WatchState {
+            state_dir: Some(fixture._dir.path().join("state")),
+            ..Default::default()
+        };
+        let mut open = fixture.status.clone();
+        open.state = PrState::Open;
+        open.merged_at = None;
+        let backend = FakeBackend::new(vec![Ok(Some(open)), Ok(Some(fixture.status.clone()))]);
+        let first = crate::watch::tick(
+            &fixture.h,
+            &backend,
+            &fixture.cfg,
+            &Notifier::new(&fixture.h, true),
+            &mut state,
+        );
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert!(
+            !fixture
+                .h
+                .fake
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.contains("merged while blocked")),
+            "the workspace status pass handled a second terminal observation"
+        );
+        for _ in 0..3 {
+            let backend = FakeBackend::new(vec![
+                Ok(Some(fixture.status.clone())),
+                Ok(Some(fixture.status.clone())),
+            ]);
+            let report = crate::watch::tick(
+                &fixture.h,
+                &backend,
+                &fixture.cfg,
+                &Notifier::new(&fixture.h, true),
+                &mut state,
+            );
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+        }
+        let calls = fixture.h.fake.calls.borrow();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("notify ") && call.contains("merged"))
+                .count(),
+            1
+        );
+        assert!(fixture.path.exists());
     }
 
     #[test]

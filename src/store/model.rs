@@ -87,6 +87,8 @@ pub struct Ticket {
     pub revision_run: Option<crate::ticket::revise::RevisionRun>,
     #[serde(default)]
     pub protection_warnings: Vec<crate::github::protection::ProtectionWarning>,
+    #[serde(default)]
+    pub merged_while_blocked_notified: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

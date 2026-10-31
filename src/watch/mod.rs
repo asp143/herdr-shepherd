@@ -1,10 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::OpenOptionsExt,
     os::unix::process::CommandExt,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -79,6 +79,23 @@ pub struct TickReport {
     pub errors: Vec<String>,
 }
 
+fn ticket_workspaces(state_dir: &Path) -> HashSet<(String, PathBuf)> {
+    let Ok((stores, _)) = crate::supervise::project_stores(state_dir) else {
+        // The lifecycle pass reports store errors. Never initialize state from
+        // a workspace merely to decide whether it belongs to a ticket.
+        return HashSet::new();
+    };
+    stores
+        .into_iter()
+        .filter_map(|store| store.read().ok())
+        .flat_map(|data| {
+            data.tickets.into_iter().filter_map(|ticket| {
+                Some((ticket.workspace_id?, ticket.worktree?.canonicalize().ok()?))
+            })
+        })
+        .collect()
+}
+
 pub fn tick(
     h: &dyn Herdr,
     gh: &dyn PrBackend,
@@ -103,6 +120,11 @@ pub fn tick(
     if !cfg.upkeep.pr_status {
         return report;
     }
+    let ticket_workspaces = st
+        .state_dir
+        .as_deref()
+        .map(ticket_workspaces)
+        .unwrap_or_default();
     let key = match token(&cfg.upkeep.token_prefix, "pr") {
         Ok(key) => key,
         Err(error) => {
@@ -142,17 +164,22 @@ pub fn tick(
         report.polled += 1;
         match gh.view(path, &branch) {
             Ok(Some(status)) => {
-                match crate::ticket::merge::handle_workspace_pr_state(
-                    h,
-                    gh,
-                    cfg,
-                    &ws,
-                    &status,
-                    &st.state_dir.clone().unwrap_or_else(crate::gate::state_dir),
-                ) {
-                    Ok(crate::ticket::merge::MergeOutcome::CleanedUp) => continue,
-                    Err(error) => report.errors.push(format!("{}: {error}", ws.workspace_id)),
-                    _ => {}
+                // Explicit-state ticks already handled stored tickets above.
+                // A later workspace observation must not drive the same
+                // ticket's lifecycle again in this tick.
+                if st.state_dir.is_none() {
+                    match crate::ticket::merge::handle_workspace_pr_state(
+                        h,
+                        gh,
+                        cfg,
+                        &ws,
+                        &status,
+                        &st.state_dir.clone().unwrap_or_else(crate::gate::state_dir),
+                    ) {
+                        Ok(crate::ticket::merge::MergeOutcome::CleanedUp) => continue,
+                        Err(error) => report.errors.push(format!("{}: {error}", ws.workspace_id)),
+                        _ => {}
+                    }
                 }
                 let value = pr_token_value(&status);
                 let value_changed = st.last.get(&ws.workspace_id).is_none_or(|old| old != value);
@@ -176,6 +203,9 @@ pub fn tick(
                         report.updated += 1;
                         report.cleared += clear.len();
                         if value_changed
+                            && !path.canonicalize().ok().is_some_and(|path| {
+                                ticket_workspaces.contains(&(ws.workspace_id.clone(), path))
+                            })
                             && matches!(
                                 value,
                                 "merged" | "closed" | "ci-failing" | "changes-requested"
