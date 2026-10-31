@@ -729,3 +729,18 @@ fn cleanup_emits_lifecycle_after_workspace_removal() {
     );
     assert!(!repo.ticket.exists());
 }
+
+#[test]
+fn dry_run_lists_ignored_files_before_removal() {
+    let repo = Repo::new();
+    let exclude = ok(&repo.ticket, &["rev-parse", "--git-path", "info/exclude"]);
+    fs::write(exclude.trim(), " ignored-cache\n").unwrap();
+    fs::write(repo.ticket.join(" ignored-cache"), "fixture cache\n").unwrap();
+    let report = cleanup::run(repo.preflight(true).unwrap(), true).unwrap();
+    assert!(
+        report
+            .ignored_files
+            .contains(&repo.ticket.join(" ignored-cache"))
+    );
+    assert!(repo.ticket.join(" ignored-cache").exists());
+}

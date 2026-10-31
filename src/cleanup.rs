@@ -85,6 +85,7 @@ pub struct CleanupReport {
     pub remote_branch: RemoteBranch,
     pub base_synced: Result<(), String>,
     pub children_removed: Vec<PathBuf>,
+    pub ignored_files: Vec<PathBuf>,
 }
 
 struct Target {
@@ -571,6 +572,23 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
             remote_branch: remote_state(&p.main, &p.target.branch, &p.proof.tip, contained)?,
             base_synced: base_sync_status(&p.main, &p.proof.base),
             children_removed: p.children.iter().map(|child| child.path.clone()).collect(),
+            ignored_files: p
+                .children
+                .iter()
+                .chain(std::iter::once(&p.target))
+                .map(|target| {
+                    raw_ignored(&target.path).map(|paths| {
+                        paths
+                            .split('\0')
+                            .filter(|s| !s.is_empty())
+                            .map(|s| target.path.join(s))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
         };
         if dry_run {
             return Ok(report);
@@ -671,6 +689,24 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
         }
     }
     result
+}
+
+fn raw_ignored(path: &Path) -> Result<String, ShepherdError> {
+    let out = crate::proc::capture(
+        Command::new("git").current_dir(path).args([
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ]),
+        Duration::from_secs(20),
+        None,
+    )?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!("cannot enumerate ignored files").into());
+    }
+    Ok(out.stdout)
 }
 
 #[cfg(test)]
