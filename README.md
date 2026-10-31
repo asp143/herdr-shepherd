@@ -236,3 +236,19 @@ cargo test --locked
 ```
 
 Tests use temporary repositories and bare remotes, fake GitHub/Herdr/probe implementations, and sanitized fixtures. Git fixtures ignore host signing configuration. `cargo test --locked --features test-support` additionally verifies the public fake Herdr interface. `proc::capture` exposes exit status and stderr; `proc::run` remains the compatibility wrapper for Phase 1 callers. No cadence code is included. Licensed under MIT.
+
+## Credential controls and their limits
+
+Agents use a generated global Git config that omits every credential helper,
+SSH command, URL rewrite, and include. System Git configuration is disabled,
+ask-pass programs are disabled, and GitHub token variables contain an invalid
+placeholder so `gh` does not fall back to keyring credentials. The pane handoff
+also removes inherited Git configuration overrides before exporting these
+settings. Safe user settings, including Git author and signing preferences,
+are retained without following includes.
+
+These controls are defense in depth. An agent running as the same OS user can
+still reach credentials by reading files directly, accessing the keyring,
+reading `~/.ssh`, or finding an ssh-agent socket. GitHub branch protection is
+needed for guarantees against those actions. An OS sandbox can add isolation;
+choosing and configuring one is a separate decision.

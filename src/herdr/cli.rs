@@ -138,9 +138,16 @@ fn id(value: &serde_json::Value, key: &str) -> Result<String, ShepherdError> {
 /// Only explicitly supplied variables are exported; the launcher supplies a
 /// small safe set rather than serializing its entire process environment.
 pub fn env_script(values: &HashMap<String, String>) -> Result<String, ShepherdError> {
-    let mut script =
-        "unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN SSH_AUTH_SOCK; "
-            .to_owned();
+    let mut script = concat!(
+        "unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN ",
+        "SSH_AUTH_SOCK GIT_SSH GIT_SSH_COMMAND GIT_ASKPASS SSH_ASKPASS ",
+        "GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_SYSTEM ",
+        "GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM; ",
+        "for shepherd_git_var in $(env | sed -n ",
+        "'s/^\\(GIT_CONFIG_\\(KEY\\|VALUE\\)_[0-9][0-9]*\\)=.*/\\1/p'); ",
+        "do unset \"$shepherd_git_var\"; done; "
+    )
+    .to_owned();
     let mut keys: Vec<_> = values.keys().collect();
     keys.sort();
     for key in keys {
@@ -252,6 +259,22 @@ impl Herdr for CliHerdr {
         args: &[String],
         env: &HashMap<String, String>,
     ) -> Result<AgentStart, ShepherdError> {
+        let cleaned = env.get("GIT_CONFIG_GLOBAL").ok_or_else(|| {
+            ShepherdError::Usage("agent launch requires sanitized Git configuration".into())
+        })?;
+        let state_dir = Path::new(cleaned).parent().ok_or_else(|| {
+            ShepherdError::Usage("sanitized Git configuration needs a state directory".into())
+        })?;
+        let source = ["HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
+            .collect();
+        let prepared = crate::gate::env::prepare_agent_gitconfig(&source, state_dir)?;
+        let mut values = env.clone();
+        values.insert(
+            "GIT_CONFIG_GLOBAL".into(),
+            prepared.to_string_lossy().into_owned(),
+        );
         let sequence = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -262,7 +285,7 @@ impl Herdr for CliHerdr {
         // satisfying wait-output before the exports have actually executed.
         let script = format!(
             "{}printf '%s%s\\n' 'shepherd-ready-' '{suffix}'",
-            env_script(env)?
+            env_script(&values)?
         );
         self.request(&["pane", "run", pane, &script])?;
         self.request(&[
