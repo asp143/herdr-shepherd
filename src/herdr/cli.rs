@@ -89,12 +89,22 @@ impl CliHerdr {
         })
     }
 
-    fn request(&self, args: &[&str]) -> Result<serde_json::Value, ShepherdError> {
+    /// Some herdr commands acknowledge success without JSON (pane run),
+    /// or print plain terminal text (pane wait-output and agent read).
+    fn capture_success(&self, args: &[&str]) -> Result<String, ShepherdError> {
         let output = self.capture(args)?;
         if !output.status.success() {
             return Err(command_error(&output));
         }
-        serde_json::from_str(&output.stdout)
+        Ok(output.stdout)
+    }
+
+    fn request(&self, args: &[&str]) -> Result<serde_json::Value, ShepherdError> {
+        let output = self.capture_success(args)?;
+        if output.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_json::from_str(&output)
             .map_err(anyhow::Error::from)
             .map_err(Into::into)
     }
@@ -290,8 +300,8 @@ impl Herdr for CliHerdr {
             "{}printf '%s%s\\n' 'shepherd-ready-' '{suffix}'",
             env_script(&values)?
         );
-        self.request(&["pane", "run", pane, &script])?;
-        self.request(&[
+        self.capture_success(&["pane", "run", pane, &script])?;
+        self.capture_success(&[
             "pane",
             "wait-output",
             pane,
@@ -378,21 +388,22 @@ impl Herdr for CliHerdr {
     }
 
     fn read_visible(&self, name: &str) -> Result<String, ShepherdError> {
-        let value = self.request(&["agent", "read", name, "--source", "visible"])?;
-        [
-            "/result/text",
-            "/result/output",
-            "/result/screen",
-            "/result/content",
-        ]
-        .into_iter()
-        .find_map(|pointer| {
-            value
-                .pointer(pointer)
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .ok_or_else(|| anyhow::anyhow!("herdr read response lacks screen text").into())
+        let output = self.capture_success(&["agent", "read", name, "--source", "visible"])?;
+        // The installed CLI prints terminal text. Preserve it byte-for-byte,
+        // while accepting JSON envelopes from compatible clients and fixtures.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&output)
+            && let Some(text) = [
+                "/result/text",
+                "/result/output",
+                "/result/screen",
+                "/result/content",
+            ]
+            .into_iter()
+            .find_map(|pointer| value.pointer(pointer).and_then(serde_json::Value::as_str))
+        {
+            return Ok(text.to_owned());
+        }
+        Ok(output)
     }
 
     fn agent_get(&self, name: &str) -> Result<Option<AgentInfo>, ShepherdError> {
@@ -609,5 +620,84 @@ printf '%s\n' '{"result":{"pane":{"cwd":"/tmp/shell","foreground_cwd":"/tmp/fore
             h.pane_session_ref("owned:p1").unwrap().as_deref(),
             Some("fixture-session")
         );
+    }
+    #[test]
+    fn start_agent_accepts_silent_run_and_text_wait() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("herdr.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let bin = dir.path().join("herdr-fake");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+case "$1 $2" in
+  'pane run') exit 0 ;;
+  'pane wait-output') printf '%s\n' 'matched readiness marker'; exit 0 ;;
+  'agent start') printf '%s\n' '{"result":{"agent":{"agent_status":"idle"}}}'; exit 0 ;;
+  *) exit 9 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let h = CliHerdr { bin, socket };
+        let values = HashMap::from([(
+            "GIT_CONFIG_GLOBAL".into(),
+            dir.path()
+                .join("agent.gitconfig")
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+        let result = h.start_agent(
+            "sh-fixture-coder-1",
+            "codex",
+            "owned:p1",
+            &["--yolo".into(), "-m".into(), "gpt-6.1-sol".into()],
+            &values,
+        );
+        assert!(matches!(result, Ok(AgentStart::Ready)), "{result:?}");
+    }
+
+    fn output_fixture(text: &str) -> (tempfile::TempDir, CliHerdr, UnixListener) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let bin = dir.path().join("herdr-fake");
+        let quoted = text.replace('\'', "'\\''");
+        std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s' '{quoted}'\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (dir, CliHerdr { bin, socket }, listener)
+    }
+
+    #[test]
+    fn read_visible_accepts_plain_terminal_text() {
+        let screen = "Trust this folder?\nTrust and continue\n";
+        let (_dir, h, _listener) = output_fixture(screen);
+        assert_eq!(h.read_visible("sh-fixture-coder-1").unwrap(), screen);
+    }
+
+    #[test]
+    fn read_visible_accepts_json_envelope() {
+        let (_dir, h, _listener) =
+            output_fixture(r#"{"result":{"text":"Trust this folder?\nTrust and continue\n"}}"#);
+        assert_eq!(
+            h.read_visible("sh-fixture-coder-1").unwrap(),
+            "Trust this folder?\nTrust and continue\n"
+        );
+    }
+
+    #[test]
+    fn send_keys_accepts_empty_acknowledgement() {
+        let (_dir, h, _listener) = output_fixture("");
+        h.send_keys("sh-fixture-coder-1", &["enter".into()])
+            .unwrap();
+    }
+
+    #[test]
+    fn structured_request_rejects_malformed_nonempty_response() {
+        let (_dir, h, _listener) = output_fixture("not JSON\n");
+        assert!(h.pane_cwd("owned:p1").is_err());
     }
 }
