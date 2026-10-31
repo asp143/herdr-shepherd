@@ -6,6 +6,7 @@ pub enum ShepherdError {
     Config { path: PathBuf, message: String },
     HerdrUnavailable(String),
     Runtime(anyhow::Error),
+    Attribution,
 }
 
 impl ShepherdError {
@@ -15,6 +16,7 @@ impl ShepherdError {
             Self::Config { .. } => "config_invalid",
             Self::HerdrUnavailable(_) => "herdr_unavailable",
             Self::Runtime(_) => "runtime",
+            Self::Attribution => "attribution",
         }
     }
 
@@ -23,6 +25,7 @@ impl ShepherdError {
             Self::Usage(_) | Self::Config { .. } => 2,
             Self::HerdrUnavailable(_) => 3,
             Self::Runtime(_) => 1,
+            Self::Attribution => 2,
         }
     }
 }
@@ -33,6 +36,7 @@ impl fmt::Display for ShepherdError {
             Self::Usage(message) | Self::HerdrUnavailable(message) => f.write_str(message),
             Self::Config { path, message } => write!(f, "{}: {message}", path.display()),
             Self::Runtime(error) => write!(f, "{error:#}"),
+            Self::Attribution => f.write_str("human-facing text contains AI attribution"),
         }
     }
 }
