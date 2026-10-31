@@ -59,18 +59,31 @@ impl CliHerdr {
     }
 }
 
-fn metadata_args(kind: &str, id: &str, set: &[(String, String)], clear: &[String]) -> Vec<String> {
-    let mut args: Vec<String> = [kind, "report-metadata", "--source", "shepherd", id]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+fn metadata_request(
+    h: &CliHerdr,
+    kind: &str,
+    id: &str,
+    set: &[(String, String)],
+    clear: &[String],
+) -> Result<(), ShepherdError> {
+    let mut tokens = serde_json::Map::new();
     for (key, value) in set {
-        args.extend(["--token".into(), format!("{key}={value}")]);
+        tokens.insert(key.clone(), json!(value));
     }
     for key in clear {
-        args.extend(["--clear-token".into(), key.clone()]);
+        tokens.insert(key.clone(), serde_json::Value::Null);
     }
-    args
+    let mut params = json!({"source":"shepherd", "tokens":tokens});
+    params[format!("{kind}_id")] = json!(id);
+    socket::request(
+        &h.socket,
+        &json!({
+            "id":"shepherd-metadata",
+            "method":format!("{kind}.report_metadata"),
+            "params":params,
+        }),
+    )
+    .map(|_| ())
 }
 
 impl Herdr for CliHerdr {
@@ -80,9 +93,7 @@ impl Herdr for CliHerdr {
         set: &[(String, String)],
         clear: &[String],
     ) -> Result<(), ShepherdError> {
-        let args = metadata_args("workspace", ws, set, clear);
-        self.command(&args.iter().map(String::as_str).collect::<Vec<_>>())
-            .map(|_| ())
+        metadata_request(self, "workspace", ws, set, clear)
     }
 
     fn report_pane_tokens(
@@ -91,9 +102,7 @@ impl Herdr for CliHerdr {
         set: &[(String, String)],
         clear: &[String],
     ) -> Result<(), ShepherdError> {
-        let args = metadata_args("pane", pane, set, clear);
-        self.command(&args.iter().map(String::as_str).collect::<Vec<_>>())
-            .map(|_| ())
+        metadata_request(self, "pane", pane, set, clear)
     }
 
     fn notify(&self, title: &str, body: &str) -> Result<(), ShepherdError> {
@@ -145,30 +154,47 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     #[test]
-    fn metadata_argv_keeps_tokens_in_shepherd_source() {
-        assert_eq!(
-            metadata_args(
-                "workspace",
-                "w1",
-                &[("shepherd_pr".into(), "open".into())],
-                &["shepherd_stage".into()],
-            ),
-            [
-                "workspace",
-                "report-metadata",
-                "--source",
-                "shepherd",
-                "w1",
-                "--token",
-                "shepherd_pr=open",
-                "--clear-token",
-                "shepherd_stage",
-            ]
-        );
-        assert_eq!(
-            metadata_args("pane", "p1", &[], &[]),
-            ["pane", "report-metadata", "--source", "shepherd", "p1"]
-        );
+    fn metadata_uses_socket_tokens_and_null_clears() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            for (method, id_key, id) in [
+                ("workspace.report_metadata", "workspace_id", "w1"),
+                ("pane.report_metadata", "pane_id", "p1"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], method);
+                assert_eq!(request["params"][id_key], id);
+                assert_eq!(request["params"]["source"], "shepherd");
+                assert_eq!(
+                    request["params"]["tokens"],
+                    json!({"shepherd_pr":"open","shepherd_stage":null})
+                );
+                stream.write_all(b"{\"result\":{}}\n").unwrap();
+            }
+        });
+        let h = CliHerdr {
+            bin: dir.path().join("missing-herdr"),
+            socket,
+        };
+        h.report_workspace_tokens(
+            "w1",
+            &[("shepherd_pr".into(), "open".into())],
+            &["shepherd_stage".into()],
+        )
+        .unwrap();
+        h.report_pane_tokens(
+            "p1",
+            &[("shepherd_pr".into(), "open".into())],
+            &["shepherd_stage".into()],
+        )
+        .unwrap();
+        server.join().unwrap();
     }
 
     #[test]
