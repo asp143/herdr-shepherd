@@ -364,6 +364,7 @@ mod tests {
             merged_at: Some("2026-10-31T00:00:00Z".into()),
             base: "main".into(),
             head: "feat/test".into(),
+            head_oid: None,
             checks: Checks::Passing,
             review: ReviewDecision::None,
             comment_ids: vec![],

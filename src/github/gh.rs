@@ -84,7 +84,7 @@ impl PrBackend for GhBackend {
             ticket_branch: branch.into(),
             worktree: worktree.into(),
         };
-        match gate.gh(&["pr", "view", branch, "--json", "number,url,state,mergedAt,baseRefName,headRefName,statusCheckRollup,reviewDecision,comments,reviews"], worktree) {
+        match gate.gh(&["pr", "view", branch, "--json", "number,url,state,mergedAt,baseRefName,headRefName,headRefOid,statusCheckRollup,reviewDecision,comments,reviews"], worktree) {
             Ok(text) => parse_view(&text).map(Some),
             Err(ShepherdError::Runtime(error)) if {
                 let text = error.to_string().to_ascii_lowercase();
@@ -197,6 +197,8 @@ struct View {
     base_ref_name: String,
     head_ref_name: String,
     #[serde(default)]
+    head_ref_oid: Option<String>,
+    #[serde(default)]
     status_check_rollup: Option<Vec<Value>>,
     #[serde(default)]
     review_decision: Option<String>,
@@ -225,6 +227,7 @@ pub fn parse_view(text: &str) -> Result<PrStatus, ShepherdError> {
         merged_at: raw.merged_at,
         base: raw.base_ref_name,
         head: raw.head_ref_name,
+        head_oid: raw.head_ref_oid,
         checks: map_checks(&Value::Array(raw.status_check_rollup.unwrap_or_default())),
         review,
         comment_ids: raw

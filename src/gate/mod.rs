@@ -127,3 +127,63 @@ impl Gate {
         )
     }
 }
+
+impl Gate {
+    /// The only delete escape hatch: cleanup must provide a bound merge proof.
+    pub fn delete_remote_branch(
+        &self,
+        branch: &str,
+        proof: &crate::cleanup::MergeProof,
+    ) -> Result<(), ShepherdError> {
+        if branch != self.ticket_branch || self.policy.is_protected(branch) {
+            return Err(ShepherdError::PolicyDenied(
+                "cleanup may delete only the unprotected ticket branch".into(),
+            ));
+        }
+        proof.authorize(self, branch)?;
+        let reference = format!("refs/heads/{branch}");
+        let remote = Self::execute(
+            Command::new("git").current_dir(&self.worktree).args([
+                "ls-remote",
+                "--heads",
+                "origin",
+                &reference,
+            ]),
+            Duration::from_secs(60),
+            None,
+        )?;
+        if remote.trim().is_empty() {
+            return Ok(());
+        }
+        let mut rows = remote.lines();
+        let first = rows
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        if first.as_slice() != [proof.tip(), reference.as_str()] || rows.next().is_some() {
+            return Err(ShepherdError::PolicyDenied(
+                "remote branch changed since merge proof".into(),
+            ));
+        }
+        Self::execute(
+            Command::new("git")
+                .current_dir(&self.worktree)
+                .args([
+                    "-c",
+                    "push.followTags=false",
+                    "-c",
+                    "remote.origin.mirror=false",
+                ])
+                .args([
+                    "push",
+                    &format!("--force-with-lease={reference}:{}", proof.tip()),
+                    "origin",
+                    &format!(":{reference}"),
+                ]),
+            Duration::from_secs(120),
+            None,
+        )?;
+        Ok(())
+    }
+}

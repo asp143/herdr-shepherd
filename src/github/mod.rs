@@ -43,6 +43,8 @@ pub struct PrStatus {
     pub merged_at: Option<String>,
     pub base: String,
     pub head: String,
+    #[serde(default)]
+    pub head_oid: Option<String>,
     pub checks: Checks,
     pub review: ReviewDecision,
     pub comment_ids: Vec<u64>,

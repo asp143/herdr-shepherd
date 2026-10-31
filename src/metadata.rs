@@ -104,6 +104,7 @@ mod tests {
                 checks,
                 review,
                 comment_ids: vec![],
+                head_oid: None,
             };
             assert_eq!(pr_token_value(&status), expected);
         }

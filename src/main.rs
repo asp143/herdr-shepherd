@@ -35,6 +35,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Remove a verified merged ticket worktree.
+    Cleanup {
+        #[arg(long)]
+        worktree: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        force_discard: bool,
+    },
     /// Poll linked-worktree PRs and report sidebar metadata.
     Watch {
         #[arg(long, conflicts_with = "detach")]
@@ -116,6 +125,30 @@ fn state_dir(cli: &Cli) -> PathBuf {
 
 fn run(cli: &Cli) -> Result<(), ShepherdError> {
     match &cli.command {
+        Commands::Cleanup {
+            worktree,
+            dry_run,
+            force_discard,
+        } => {
+            let root = cli_pr::git(worktree, &["rev-parse", "--show-toplevel"])?;
+            let cfg = config::load(
+                &config::resolve_config_dir(cli.config_dir.as_deref()),
+                Some(Path::new(&root)),
+            )?;
+            let h = CliHerdr::from_env();
+            let preflight = herdr_shepherd::cleanup::preflight(
+                &h,
+                &herdr_shepherd::github::gh::GhBackend,
+                &cfg,
+                Path::new(&root),
+                *force_discard,
+                *dry_run,
+            )?;
+            let report = herdr_shepherd::cleanup::run(preflight, *dry_run)?;
+            output::emit(cli.json, &report, || {
+                serde_json::to_string_pretty(&report).expect("serializable")
+            });
+        }
         Commands::Watch {
             once,
             detach,
