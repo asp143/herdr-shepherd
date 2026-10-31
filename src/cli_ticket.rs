@@ -453,6 +453,7 @@ mod dispatch_tests {
                             .then(|| "Apply review feedback".into()),
                         revision_run: (state == TicketState::Revising).then_some(
                             herdr_shepherd::ticket::revise::RevisionRun {
+                                synced_sha: Some(head.clone()),
                                 base_sha: head,
                                 stage: herdr_shepherd::ticket::revise::RevisionStage::Coder,
                                 agent: None,

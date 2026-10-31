@@ -11,6 +11,8 @@ use crate::{
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct RevisionRun {
     pub base_sha: String,
+    #[serde(default)]
+    pub synced_sha: Option<String>,
     pub stage: RevisionStage,
     pub agent: Option<String>,
     #[serde(default)]
@@ -37,7 +39,7 @@ pub enum RevisionOutcome {
 
 /// Keep revision launch and terminal PR retirement mutually exclusive.
 /// The separate lock permits agent launch to acquire the project state lock.
-pub(crate) fn dispatch_lock(
+pub fn dispatch_lock(
     store: &crate::store::Store,
     id: &str,
 ) -> Result<std::fs::File, ShepherdError> {
@@ -123,6 +125,7 @@ pub fn resume_revision(
         if ticket.revision_run.is_none() {
             ticket.revision_run = Some(RevisionRun {
                 base_sha: base_head,
+                synced_sha: Some(observed_head.clone()),
                 stage: RevisionStage::Coder,
                 agent: None,
                 tested_sha: None,
@@ -264,7 +267,7 @@ pub fn resume_revision(
     };
     let run = ticket.revision_run.as_ref().expect("initialized run");
     if run.stage == RevisionStage::Push {
-        return finish_revision(gh, store, cfg, gate, id, now);
+        return finish_revision(h, gh, store, cfg, gate, id, now);
     }
     let role = match run.stage {
         RevisionStage::Coder => "coder",
@@ -323,6 +326,7 @@ pub fn resume_revision(
 }
 
 fn finish_revision(
+    h: &dyn crate::herdr::Herdr,
     gh: &dyn crate::github::PrBackend,
     store: &crate::store::Store,
     cfg: &crate::config::Config,
@@ -382,9 +386,45 @@ fn finish_revision(
             "revision PR is no longer open on the recorded branch and base".into(),
         ));
     }
+    let synced_sha = initial
+        .revision_run
+        .as_ref()
+        .and_then(|run| run.synced_sha.as_deref());
+    let remote_tip = crate::gate::transport::PushTransport::open(&gate.state_dir, &gate.worktree)?
+        .remote_tip(&initial.branch)?;
+    if synced_sha.is_none() || remote_tip.as_deref() != synced_sha {
+        return block_push_conflict(
+            h,
+            store,
+            cfg,
+            id,
+            now,
+            "remote branch changed after revision sync",
+        );
+    }
     // The dispatch lock prevents merge handling from retiring this revision.
     // The gated transport must be able to acquire its own shared store lock.
-    gh.push(gate)?;
+    if let Err(error) = gh.push(gate) {
+        let moved = crate::gate::transport::PushTransport::open(&gate.state_dir, &gate.worktree)?
+            .remote_tip(&initial.branch)
+            .is_ok_and(|tip| tip.as_deref() != synced_sha);
+        let rejection = error.to_string().to_ascii_lowercase();
+        if moved
+            || rejection.contains("non-fast-forward")
+            || rejection.contains("fetch first")
+            || rejection.contains("remote contains work")
+        {
+            return block_push_conflict(
+                h,
+                store,
+                cfg,
+                id,
+                now,
+                "remote branch rejected the revision fast-forward",
+            );
+        }
+        return Err(error);
+    }
     let outcome = store.update(|data| {
         let ticket = data.tickets.iter_mut().find(|ticket| ticket.id == id)
             .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
@@ -405,6 +445,34 @@ fn finish_revision(
         );
     }
     Ok(outcome)
+}
+
+fn block_push_conflict(
+    h: &dyn crate::herdr::Herdr,
+    store: &crate::store::Store,
+    cfg: &crate::config::Config,
+    id: &str,
+    now: &str,
+    reason: &str,
+) -> Result<RevisionOutcome, ShepherdError> {
+    let message = format!("{id}: revision blocked (conflict): {reason}");
+    store.update(|data| {
+        let ticket = data
+            .tickets
+            .iter_mut()
+            .find(|ticket| ticket.id == id)
+            .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
+        super::state::transition(
+            ticket,
+            TicketState::Blocked,
+            Some(crate::store::BlockedReason::Conflict),
+            now,
+        )?;
+        data.pending_pings.push(message.clone());
+        Ok(())
+    })?;
+    crate::notify::Notifier::new(h, cfg.upkeep.notifications).send(&message, "");
+    Ok(RevisionOutcome::Blocked)
 }
 
 fn run_marker(run: &RevisionRun) -> String {

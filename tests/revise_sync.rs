@@ -566,6 +566,168 @@ fn changes_after_qa_block_push() {
 }
 
 #[test]
+fn remote_move_after_sync_blocks_and_notifies() {
+    if !local_transport_enabled("remote_move_after_sync_blocks_and_notifies") {
+        return;
+    }
+    let repo = Repo::new();
+    let store = stored_revision(&repo);
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+    let gh = PushBackend::new(&repo);
+    let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+    complete_revision_agents(&repo, &store, &h, &gh);
+    let remote = repo.user_commit();
+    assert_eq!(
+        resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later").unwrap(),
+        herdr_shepherd::ticket::revise::RevisionOutcome::Blocked
+    );
+    let data = store.read().unwrap();
+    assert_eq!(
+        data.tickets[0].blocked_reason,
+        Some(herdr_shepherd::store::BlockedReason::Conflict)
+    );
+    assert!(
+        data.pending_pings
+            .iter()
+            .any(|ping| ping.contains("T-1") && ping.contains("conflict"))
+    );
+    assert!(
+        h.calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("notify ") && call.contains("T-1"))
+    );
+    assert_eq!(gh.pushes.get(), 0);
+    assert_eq!(
+        git(&repo.remote, &["rev-parse", "refs/heads/fix/ticket"]),
+        remote
+    );
+}
+
+#[test]
+fn remote_move_during_push_blocks_and_notifies() {
+    if !local_transport_enabled("remote_move_during_push_blocks_and_notifies") {
+        return;
+    }
+    let repo = Repo::new();
+    let store = stored_revision(&repo);
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+    let gh = PushBackend::new(&repo);
+    let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+    complete_revision_agents(&repo, &store, &h, &gh);
+    let local = git(&repo.root, &["rev-parse", "HEAD"]);
+    gh.move_remote_on_push.set(true);
+    assert_eq!(
+        resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later").unwrap(),
+        herdr_shepherd::ticket::revise::RevisionOutcome::Blocked
+    );
+    let data = store.read().unwrap();
+    assert_eq!(
+        data.tickets[0].blocked_reason,
+        Some(herdr_shepherd::store::BlockedReason::Conflict)
+    );
+    assert!(
+        h.calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("notify ") && call.contains("conflict"))
+    );
+    assert_eq!(git(&repo.root, &["rev-parse", "HEAD"]), local);
+    assert_eq!(
+        git(&repo.remote, &["rev-parse", "refs/heads/fix/ticket"]),
+        git(&repo.user, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(gh.pushes.get(), 0);
+}
+
+#[test]
+fn non_fast_forward_rejection_blocks_without_retry() {
+    if !local_transport_enabled("non_fast_forward_rejection_blocks_without_retry") {
+        return;
+    }
+    let repo = Repo::new();
+    let store = stored_revision(&repo);
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+    let gh = PushBackend::new(&repo);
+    let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+    complete_revision_agents(&repo, &store, &h, &gh);
+    *gh.push_error.borrow_mut() =
+        Some("[rejected] fix/ticket -> fix/ticket (non-fast-forward)".into());
+    assert_eq!(
+        resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later").unwrap(),
+        herdr_shepherd::ticket::revise::RevisionOutcome::Blocked
+    );
+    assert_eq!(
+        store.read().unwrap().tickets[0].blocked_reason,
+        Some(herdr_shepherd::store::BlockedReason::Conflict)
+    );
+    assert!(
+        h.calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("notify ") && call.contains("conflict"))
+    );
+    assert_eq!(gh.pushes.get(), 0);
+}
+
+#[test]
+fn revision_push_outage_keeps_run_retryable() {
+    if !local_transport_enabled("revision_push_outage_keeps_run_retryable") {
+        return;
+    }
+    let repo = Repo::new();
+    let store = stored_revision(&repo);
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+    let gh = PushBackend::new(&repo);
+    let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+    complete_revision_agents(&repo, &store, &h, &gh);
+    *gh.push_error.borrow_mut() = Some("temporary connection timeout".into());
+    assert_eq!(
+        resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later")
+            .unwrap_err()
+            .code(),
+        "runtime"
+    );
+    let data = store.read().unwrap();
+    assert_eq!(data.tickets[0].state, TicketState::Revising);
+    assert_eq!(data.tickets[0].revision_round, 0);
+    assert!(data.pending_pings.is_empty());
+    *gh.push_error.borrow_mut() = None;
+    assert!(matches!(
+        resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "retry").unwrap(),
+        herdr_shepherd::ticket::revise::RevisionOutcome::Pushed { .. }
+    ));
+}
+
+#[test]
+fn missing_sync_snapshot_blocks_push() {
+    if !local_transport_enabled("missing_sync_snapshot_blocks_push") {
+        return;
+    }
+    let repo = Repo::new();
+    let store = stored_revision(&repo);
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+    let gh = PushBackend::new(&repo);
+    let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+    complete_revision_agents(&repo, &store, &h, &gh);
+    store
+        .update(|data| {
+            data.tickets[0].revision_run.as_mut().unwrap().synced_sha = None;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later").unwrap(),
+        herdr_shepherd::ticket::revise::RevisionOutcome::Blocked
+    );
+    assert_eq!(gh.pushes.get(), 0);
+    assert_eq!(
+        store.read().unwrap().tickets[0].blocked_reason,
+        Some(herdr_shepherd::store::BlockedReason::Conflict)
+    );
+}
+
+#[test]
 fn merged_pr_cannot_receive_revision_push() {
     if !local_transport_enabled("merged_pr_cannot_receive_revision_push") {
         return;
@@ -752,6 +914,9 @@ struct PushBackend {
     config: PathBuf,
     state: PathBuf,
     bin: PathBuf,
+    user: PathBuf,
+    move_remote_on_push: std::cell::Cell<bool>,
+    push_error: std::cell::RefCell<Option<String>>,
 }
 impl PushBackend {
     fn new(repo: &Repo) -> Self {
@@ -771,6 +936,9 @@ impl PushBackend {
             config: repo.gate().config_dir,
             state: repo.gate().state_dir,
             bin,
+            user: repo.user.clone(),
+            move_remote_on_push: std::cell::Cell::new(false),
+            push_error: std::cell::RefCell::new(None),
         }
     }
 }
@@ -795,6 +963,16 @@ impl herdr_shepherd::github::PrBackend for PushBackend {
         }))
     }
     fn push(&self, gate: &Gate) -> Result<(), herdr_shepherd::error::ShepherdError> {
+        if let Some(error) = self.push_error.borrow().as_ref() {
+            return Err(anyhow::anyhow!("{error}").into());
+        }
+        if self.move_remote_on_push.replace(false) {
+            git(
+                &self.user,
+                &["commit", "--allow-empty", "-m", "racing user commit"],
+            );
+            git(&self.user, &["push", "origin", "fix/ticket"]);
+        }
         let path =
             std::env::join_paths([self.bin.clone(), "/usr/bin".into(), "/bin".into()]).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
