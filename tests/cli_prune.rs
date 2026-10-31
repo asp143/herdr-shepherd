@@ -58,6 +58,25 @@ fn never_writes() {
             .success()
     );
     fs::write(git.join("ordinary.txt"), "ordinary fixture\n").unwrap();
+    for args in [
+        vec!["config", "user.name", "Fixture"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+        vec!["add", "ordinary.txt"],
+        vec!["commit", "-m", "fixture"],
+    ] {
+        let out = Command::new("git")
+            .current_dir(&git)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(git.join(".git/index").exists());
+    fs::write(git.join("ordinary.txt"), "modified fixture\n").unwrap();
     fs::create_dir(root.path().join("example/orphan")).unwrap();
     fs::write(root.path().join("example/stray.txt"), "ordinary fixture\n").unwrap();
     let before = snapshot(root.path());

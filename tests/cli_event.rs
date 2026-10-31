@@ -5,6 +5,7 @@ fn command(config: &std::path::Path) -> Command {
     cmd.args(["--json", "--config-dir"])
         .arg(config)
         .arg("event")
+        .env("HERDR_PLUGIN_STATE_DIR", config.join("state"))
         .env("HERDR_SOCKET_PATH", "/nonexistent/sock")
         .env("HERDR_BIN_PATH", "/nonexistent/herdr")
         .env_remove("HERDR_PLUGIN_EVENT")

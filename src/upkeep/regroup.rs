@@ -52,7 +52,7 @@ pub fn plan_regroup(workspaces: &[Workspace]) -> RegroupPlan {
         let group = &mut groups[group_index];
         if worktree.is_linked_worktree {
             group.children.push(workspace);
-        } else if group.parent.is_none() {
+        } else {
             group.parent = Some(workspace);
         }
     }
@@ -73,7 +73,11 @@ pub fn plan_regroup(workspaces: &[Workspace]) -> RegroupPlan {
             let mut label = child.label.as_str();
             while let Some(bare) = label
                 .strip_prefix("worktree/")
-                .or_else(|| label.strip_prefix(&parent_prefix))
+                .or_else(|| {
+                    (!parent.label.is_empty())
+                        .then(|| label.strip_prefix(&parent_prefix))
+                        .flatten()
+                })
                 .filter(|label| !label.is_empty())
             {
                 label = bare;
@@ -303,6 +307,51 @@ mod tests {
                 .map(|w| w.workspace_id.as_str())
                 .collect::<Vec<_>>(),
             ["P", "C", "X"]
+        );
+    }
+    #[test]
+    fn uses_last_nonlinked_parent() {
+        let h = FakeHerdr::new(vec![
+            ws("P1", "first", "repo", false),
+            child("C", "last/task", "repo"),
+            ws("P2", "last", "repo", false),
+            parent("X"),
+        ]);
+        let plan = plan_regroup(&h.workspaces().unwrap());
+        assert_eq!(plan.renames, [("C".into(), "task".into())]);
+        apply(&h, &plan).unwrap();
+        assert_eq!(
+            h.workspaces()
+                .unwrap()
+                .iter()
+                .map(|w| w.workspace_id.as_str())
+                .collect::<Vec<_>>(),
+            ["P1", "P2", "C", "X"]
+        );
+    }
+    #[test]
+    fn empty_parent_label_preserves_leading_slash() {
+        let plan = plan_regroup(&[ws("P", "", "repo", false), child("C", "/task", "repo")]);
+        assert!(plan.renames.is_empty());
+    }
+    #[test]
+    fn orphan_does_not_prevent_valid_group_packing() {
+        let h = FakeHerdr::new(vec![
+            child("O", "worktree/orphan", "absent"),
+            parent("P"),
+            parent("X"),
+            child("C", "worktree/task", "P"),
+        ]);
+        let plan = plan_regroup(&h.workspaces().unwrap());
+        assert_eq!(plan.renames, [("C".into(), "task".into())]);
+        apply(&h, &plan).unwrap();
+        assert_eq!(
+            h.workspaces()
+                .unwrap()
+                .iter()
+                .map(|w| w.workspace_id.as_str())
+                .collect::<Vec<_>>(),
+            ["O", "P", "C", "X"]
         );
     }
 }

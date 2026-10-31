@@ -103,3 +103,21 @@ impl Gate {
     }
 }
 pub mod hook;
+
+impl Gate {
+    /// Use a configured executable while preserving the same gh policy checks.
+    pub fn gh_using(
+        &self,
+        executable: &Path,
+        args: &[&str],
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<String, ShepherdError> {
+        check_gh(args)?;
+        Self::execute(
+            Command::new(executable).current_dir(cwd).args(args),
+            timeout,
+            None,
+        )
+    }
+}

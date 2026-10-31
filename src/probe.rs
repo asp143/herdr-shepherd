@@ -1,6 +1,9 @@
 use std::{path::Path, process::Command, time::Duration};
 
-use crate::proc;
+use crate::{
+    gate::{BranchPolicy, Gate},
+    proc,
+};
 
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const SIZE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -24,12 +27,19 @@ fn output(cmd: &mut Command, timeout: Duration) -> Option<String> {
 }
 
 fn pr_state_with(bin: &Path, p: &Path, branch: &str, timeout: Duration) -> Option<String> {
-    output(
-        Command::new(bin)
-            .current_dir(p)
-            .args(["pr", "view", branch, "--json", "state", "-q", ".state"]),
+    let gate = Gate {
+        policy: BranchPolicy::new(&[], None, None).ok()?,
+        ticket_branch: branch.into(),
+        worktree: p.into(),
+    };
+    gate.gh_using(
+        bin,
+        &["pr", "view", branch, "--json", "state", "-q", ".state"],
+        p,
         timeout,
     )
+    .ok()
+    .map(|value| value.trim().to_owned())
 }
 
 impl Probe for SystemProbe {
@@ -38,7 +48,7 @@ impl Probe for SystemProbe {
             Command::new("git")
                 .current_dir(p)
                 .env("GIT_OPTIONAL_LOCKS", "0")
-                .args(["branch", "--show-current"]),
+                .args(["-c", "core.fsmonitor=false", "branch", "--show-current"]),
             PROBE_TIMEOUT,
         )
         .filter(|s| !s.is_empty())
@@ -49,7 +59,7 @@ impl Probe for SystemProbe {
             Command::new("git")
                 .current_dir(p)
                 .env("GIT_OPTIONAL_LOCKS", "0")
-                .args(["status", "--porcelain"]),
+                .args(["-c", "core.fsmonitor=false", "status", "--porcelain"]),
             PROBE_TIMEOUT,
         )
         .is_some_and(|s| !s.is_empty())
@@ -117,5 +127,54 @@ mod tests {
         );
         assert!(start.elapsed() < Duration::from_millis(500));
         assert_eq!(PROBE_TIMEOUT, Duration::from_secs(20));
+    }
+    #[test]
+    fn never_writes_real_index_or_runs_fsmonitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let result = Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        git(&["config", "user.name", "Fixture"]);
+        fs::write(dir.path().join("tracked"), "fixture\n").unwrap();
+        git(&["add", "tracked"]);
+        git(&["commit", "-m", "fixture"]);
+        let marker = dir.path().join("fsmonitor-ran");
+        let hook = script(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nprintf marker > '{}'\nprintf 'token\\0'\n",
+                marker.display()
+            ),
+        );
+        git(&["config", "core.fsmonitor", hook.to_str().unwrap()]);
+        let index = dir.path().join(".git/index");
+        let before = (
+            fs::read(&index).unwrap(),
+            fs::metadata(&index).unwrap().modified().unwrap(),
+        );
+        assert_eq!(SystemProbe.branch(dir.path()).as_deref(), Some("main"));
+        SystemProbe.dirty(dir.path());
+        assert!(
+            !marker.exists(),
+            "read-only probes must not run configured fsmonitor commands"
+        );
+        assert_eq!(
+            (
+                fs::read(&index).unwrap(),
+                fs::metadata(&index).unwrap().modified().unwrap()
+            ),
+            before
+        );
     }
 }

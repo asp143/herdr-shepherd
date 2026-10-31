@@ -20,7 +20,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Upkeep {
     pub regroup: bool,
     pub pr_status: bool,
@@ -80,6 +80,13 @@ fn read_table(path: &Path) -> Result<Option<toml::Table>, ShepherdError> {
 pub fn load(config_dir: &Path, project_root: Option<&Path>) -> Result<Config, ShepherdError> {
     let global_path = config_dir.join("shepherd.toml");
     let global = read_table(&global_path)?;
+    if let Some(table) = &global
+        && table
+            .get("schema_version")
+            .is_some_and(|value| !matches!(value, toml::Value::Integer(1)))
+    {
+        return Err(invalid(&global_path, "schema_version must be 1"));
+    }
     let upkeep = match global.as_ref().and_then(|table| table.get("upkeep")) {
         Some(value) => value
             .clone()
@@ -211,5 +218,33 @@ mod tests {
         .unwrap();
         let cfg = load(global.path(), None).unwrap();
         assert_eq!(cfg.raw["roles"]["coder"]["description"].as_str(), Some("x"));
+    }
+    #[test]
+    fn unknown_upkeep_field_rejected() {
+        let global = tempfile::tempdir().unwrap();
+        fs::write(
+            global.path().join("shepherd.toml"),
+            "[upkeep]\nnotifictions = false\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            load(global.path(), None),
+            Err(ShepherdError::Config { .. })
+        ));
+    }
+    #[test]
+    fn global_schema_validated_when_project_overrides() {
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        fs::write(global.path().join("shepherd.toml"), "schema_version = 2\n").unwrap();
+        fs::write(
+            project.path().join(".shepherd.toml"),
+            "schema_version = 1\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            load(global.path(), Some(project.path())),
+            Err(ShepherdError::Config { .. })
+        ));
     }
 }

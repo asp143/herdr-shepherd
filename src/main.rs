@@ -214,7 +214,13 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 ShepherdError::Usage(format!("invalid HERDR_PLUGIN_EVENT_JSON: {err}"))
             })?;
             let cfg = config::load(&config::resolve_config_dir(cli.config_dir.as_deref()), None)?;
-            let outcome = event::handle_event(&name, &payload, &cfg, &CliHerdr::from_env())?;
+            let outcome = event::handle_event_in_state(
+                &name,
+                &payload,
+                &cfg,
+                &CliHerdr::from_env(),
+                &state_dir(cli),
+            )?;
             output::emit(cli.json, &outcome, || {
                 format!("herdr-shepherd: {outcome:?}")
             });

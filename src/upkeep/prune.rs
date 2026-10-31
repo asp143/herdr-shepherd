@@ -104,9 +104,15 @@ fn inspect(
     let metadata = fs::symlink_metadata(p).ok()?;
     let entry = p.file_name()?.to_string_lossy().into_owned();
     let repo = p.parent()?.file_name()?.to_string_lossy().into_owned();
-    let workspace = ws
-        .iter()
-        .find(|w| w.worktree.as_ref().and_then(|w| w.checkout_path.as_deref()) == Some(p));
+    let identity = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let workspace = ws.iter().find(|w| {
+        w.worktree
+            .as_ref()
+            .and_then(|w| w.checkout_path.as_deref())
+            .is_some_and(|checkout| {
+                fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf()) == identity
+            })
+    });
     let mut flags = Vec::new();
     let mut branch = None;
     let kind = if !metadata.is_dir() {
@@ -140,7 +146,13 @@ fn inspect(
     };
     let count = agents
         .iter()
-        .filter(|a| a.cwd.as_ref().is_some_and(|cwd| cwd.starts_with(p)))
+        .filter(|a| {
+            a.cwd.as_ref().is_some_and(|cwd| {
+                fs::canonicalize(cwd)
+                    .unwrap_or_else(|_| cwd.to_path_buf())
+                    .starts_with(&identity)
+            })
+        })
         .count();
     if count > 0 {
         flags.push(format!("AGENTS={count}"));
@@ -422,5 +434,73 @@ mod tests {
         };
         assert_eq!(scan(root.path(), &[], &[], &probe, false).len(), 16);
         assert!((2..=8).contains(&probe.maximum.load(Ordering::SeqCst)));
+    }
+    #[test]
+    fn symlink_root_matches_workspace_and_agent_paths() {
+        let container = tempfile::tempdir().unwrap();
+        let actual = container.path().join("actual");
+        fs::create_dir(&actual).unwrap();
+        let p = entry(&actual, "feat-a", true);
+        fs::create_dir(p.join("src")).unwrap();
+        let alias = container.path().join("alias");
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        let alias_p = alias.join("example/feat-a");
+        let ws = [Workspace {
+            workspace_id: "w1".into(),
+            label: "task".into(),
+            worktree: Some(crate::herdr::WorktreeInfo {
+                repo_key: "example".into(),
+                repo_root: None,
+                checkout_path: Some(alias_p.clone()),
+                is_linked_worktree: true,
+            }),
+        }];
+        let agents = [AgentInfo {
+            name: None,
+            agent: "codex".into(),
+            agent_status: "working".into(),
+            cwd: Some(alias_p.join("src")),
+            pane_id: "w1:p1".into(),
+            workspace_id: Some("w1".into()),
+        }];
+        let rows = scan(&alias, &ws, &agents, &FakeProbe, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].workspace_id.as_deref(), Some("w1"));
+        assert!(rows[0].flags.contains(&"AGENTS=1".to_string()));
+    }
+    #[test]
+    fn isolated_probe_errors_preserve_other_entries() {
+        struct FailingProbe;
+        impl Probe for FailingProbe {
+            fn branch(&self, p: &Path) -> Option<String> {
+                if p.ends_with("broken") {
+                    None
+                } else {
+                    Some("good".into())
+                }
+            }
+            fn dirty(&self, _: &Path) -> bool {
+                false
+            }
+            fn pr_state(&self, _: &Path, _: &str) -> Option<String> {
+                Some("OPEN".into())
+            }
+            fn size(&self, _: &Path) -> Option<String> {
+                None
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        entry(root.path(), "broken", true);
+        entry(root.path(), "good", true);
+        let rows = scan(root.path(), &[], &[], &FailingProbe, true);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().find(|r| r.entry == "broken").unwrap().kind,
+            Kind::NoPr
+        );
+        assert_eq!(
+            rows.iter().find(|r| r.entry == "good").unwrap().kind,
+            Kind::Open
+        );
     }
 }
