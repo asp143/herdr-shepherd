@@ -87,7 +87,20 @@ pub fn tick(
     st: &mut WatchState,
 ) -> TickReport {
     let mut report = TickReport::default();
-    if !cfg.enabled || !cfg.upkeep.pr_status {
+    if !cfg.enabled {
+        return report;
+    }
+    if let Some(state_dir) = st.state_dir.as_deref() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let tickets = tick_tickets(h, gh, cfg, state_dir, now);
+        report.polled += tickets.polled;
+        report.updated += tickets.updated;
+        report.errors.extend(tickets.errors);
+    }
+    if !cfg.upkeep.pr_status {
         return report;
     }
     let key = match token(&cfg.upkeep.token_prefix, "pr") {
@@ -283,8 +296,7 @@ pub fn run_with_config_dir(
             if let Err(error) = worker.poll() {
                 report.errors.push(error.to_string());
             }
-            if cfg.enabled && cfg.upkeep.pr_status && Instant::now() >= next_pr && !worker.running()
-            {
+            if cfg.enabled && Instant::now() >= next_pr && !worker.running() {
                 let selected =
                     config_dir
                         .map(Path::to_path_buf)
@@ -528,6 +540,8 @@ pub fn detach(
 }
 
 pub mod lock;
+mod tickets;
+pub use tickets::tick_tickets;
 
 #[cfg(test)]
 mod tests {

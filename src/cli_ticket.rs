@@ -43,9 +43,9 @@ pub fn dispatch_with_backend(
     let bin = std::env::current_exe().map_err(anyhow::Error::from)?;
     for action in actions {
         let id = match &action {
-            scheduler::Action::StartTicket(id) | scheduler::Action::ResumeRevising(id) => {
-                id.clone()
-            }
+            scheduler::Action::StartTicket(id)
+            | scheduler::Action::ResumeRevising(id)
+            | scheduler::Action::ResumeCiBuild(id) => id.clone(),
         };
         let active = store
             .read()?
@@ -67,6 +67,12 @@ pub fn dispatch_with_backend(
         }
         let mut entered_stage = None;
         let attempt = (|| {
+            let ci_build = matches!(&action, scheduler::Action::ResumeCiBuild(_));
+            let _ci_dispatch = if ci_build {
+                Some(herdr_shepherd::ticket::revise::dispatch_lock(store, &id)?)
+            } else {
+                None
+            };
             let (ticket, role, task) = match action {
                 scheduler::Action::StartTicket(id) => {
                     let ticket = intake::start_ticket_with_backend(
@@ -131,12 +137,38 @@ pub fn dispatch_with_backend(
                     started.push(serde_json::json!({"ticket":id,"revision":outcome}));
                     return Ok(None);
                 }
+                scheduler::Action::ResumeCiBuild(id) => {
+                    let ticket = store
+                        .read()?
+                        .tickets
+                        .into_iter()
+                        .find(|ticket| ticket.id == id && ticket.state == TicketState::Building)
+                        .ok_or_else(|| {
+                            ShepherdError::Usage("CI retry no longer building".into())
+                        })?;
+                    entered_stage = Some(TicketState::Building);
+                    (ticket, "coder", "")
+                }
+            };
+            let task = if ci_build {
+                ticket.ci_failure_task.as_deref().unwrap_or(task)
+            } else {
+                task
             };
             let rec = crate::cli_flock::spawn_task(h, store, cfg, state, &ticket, role, task)?;
             if rec.status == AgentStatus::LaunchFailed {
                 return Err(ShepherdError::Runtime(anyhow::anyhow!(
                     "all configured runners failed to launch"
                 )));
+            }
+            if ci_build {
+                store.update(|data| {
+                    if let Some(current) = data.tickets.iter_mut().find(|current| current.id == id)
+                    {
+                        current.ci_failure_task = None;
+                    }
+                    Ok(())
+                })?;
             }
             Ok(Some(rec))
         })();
@@ -517,6 +549,33 @@ mod dispatch_tests {
                 .state
         }
     }
+    #[test]
+    fn dispatch_starts_ci_fix_once_on_existing_ticket() {
+        let f = Fixture::new(1);
+        f.ticket("ci", TicketState::Building);
+        f.store
+            .update(|data| {
+                data.tickets[0].pr_number = Some(7);
+                data.tickets[0].ci_failure_task =
+                    Some("Fix unit: https://example.invalid/check/1".into());
+                Ok(())
+            })
+            .unwrap();
+        let report = f.dispatch();
+        assert_eq!(report["started"].as_array().unwrap().len(), 1);
+        let data = f.store.read().unwrap();
+        assert_eq!(data.tickets[0].state, TicketState::Building);
+        assert_eq!(data.tickets[0].pr_number, Some(7));
+        assert!(data.tickets[0].ci_failure_task.is_none());
+        assert_eq!(data.agents[0].role, "coder");
+        assert!(
+            data.agents[0]
+                .task
+                .contains("https://example.invalid/check/1")
+        );
+        assert!(f.dispatch()["started"].as_array().unwrap().is_empty());
+    }
+
     #[test]
     fn dispatch_defers_queued_and_revising_before_capacity_transition() {
         let f = Fixture::new(1);

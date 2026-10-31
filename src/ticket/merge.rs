@@ -82,7 +82,7 @@ fn verify_owned(store: &Store, h: &dyn Herdr, ticket: &Ticket) -> Result<(), She
     Ok(())
 }
 
-fn retire_flock(store: &Store, h: &dyn Herdr, id: &str) -> Result<(), ShepherdError> {
+pub(crate) fn retire_flock(store: &Store, h: &dyn Herdr, id: &str) -> Result<(), ShepherdError> {
     for agent in store.read()?.agents.into_iter().filter(|agent| {
         agent.ticket == id
             && matches!(

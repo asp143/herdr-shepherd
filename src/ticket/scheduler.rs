@@ -13,6 +13,7 @@ use crate::{
 pub enum Action {
     StartTicket(String),
     ResumeRevising(String),
+    ResumeCiBuild(String),
 }
 
 pub fn next_actions(data: &StoreData, settings: &ShepherdSettings) -> Vec<Action> {
@@ -48,15 +49,27 @@ pub fn next_actions(data: &StoreData, settings: &ShepherdSettings) -> Vec<Action
         .collect();
     revising.sort_by_key(|ticket| (&ticket.created_at, &ticket.id));
     queued.sort_by_key(|ticket| (&ticket.created_at, &ticket.id));
-    revising
-        .into_iter()
-        .map(|ticket| Action::ResumeRevising(ticket.id.clone()))
+    let ci_builds = data
+        .tickets
+        .iter()
+        .filter(|ticket| {
+            ticket.state == TicketState::Building
+                && ticket.ci_failure_task.is_some()
+                && !has_agent(&ticket.id)
+        })
+        .map(|ticket| Action::ResumeCiBuild(ticket.id.clone()));
+    ci_builds
         .chain(
-            queued
+            revising
                 .into_iter()
-                .map(|ticket| Action::StartTicket(ticket.id.clone())),
+                .map(|ticket| Action::ResumeRevising(ticket.id.clone()))
+                .chain(
+                    queued
+                        .into_iter()
+                        .map(|ticket| Action::StartTicket(ticket.id.clone())),
+                )
+                .take(slots),
         )
-        .take(slots)
         .collect()
 }
 
@@ -99,6 +112,20 @@ mod tests {
             })
             .collect();
         data
+    }
+
+    #[test]
+    fn ci_retry_dispatches_with_its_occupied_slot() {
+        let mut data = data(&[TicketState::Building, TicketState::Queued]);
+        data.tickets[0].ci_failure_task = Some("Fix failed CI".into());
+        let settings = ShepherdSettings {
+            max_concurrent_tickets: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(next_actions(&data, &settings)).unwrap(),
+            serde_json::json!([{"resume_ci_build":"T0"}])
+        );
     }
 
     #[test]

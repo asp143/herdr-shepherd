@@ -84,18 +84,19 @@ fn launch_lead(
     if rec.status == AgentStatus::LaunchFailed {
         return Err(anyhow::anyhow!("lead runner failed to launch").into());
     }
-    remember_lead(store, &rec)?;
+    remember_lead(store, &rec, ctx.workspace_id)?;
     h.focus_agent(&rec.name)?;
     Ok(rec)
 }
 
-fn remember_lead(store: &Store, rec: &AgentRecord) -> Result<(), ShepherdError> {
+fn remember_lead(store: &Store, rec: &AgentRecord, workspace: &str) -> Result<(), ShepherdError> {
     store.update(|data| {
         data.lead = Some(LeadRecord {
             agent_name: rec.name.clone(),
             tab_id: rec.tab_id.clone(),
             pane_id: rec.pane_id.clone(),
             started_at: launch::now(),
+            workspace_id: Some(workspace.into()),
         });
         Ok(())
     })
@@ -120,7 +121,7 @@ pub fn resume(
             )
     }) && h.agent_get(&rec.name)?.is_some()
     {
-        remember_lead(store, rec)?;
+        remember_lead(store, rec, ctx.workspace_id)?;
         h.focus_agent(&rec.name)?;
         flush_pings(h, store)?;
         return Ok(rec.clone());
@@ -321,6 +322,7 @@ mod tests {
                     tab_id: Some("w1:t1".into()),
                     pane_id: Some("w1:p1".into()),
                     started_at: "1".into(),
+                    workspace_id: Some("w1".into()),
                 });
                 Ok(())
             })

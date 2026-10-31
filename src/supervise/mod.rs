@@ -829,7 +829,7 @@ fn project_lock(store: &Store) -> Result<fs::File, ShepherdError> {
     Ok(file)
 }
 
-fn project_stores(state_dir: &Path) -> Result<(Vec<Store>, Vec<String>), ShepherdError> {
+pub(crate) fn project_stores(state_dir: &Path) -> Result<(Vec<Store>, Vec<String>), ShepherdError> {
     let entries = match fs::read_dir(state_dir.join("projects")) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1310,6 +1310,7 @@ mod tests {
                     tab_id: d.agents[0].tab_id.clone(),
                     pane_id: d.agents[0].pane_id.clone(),
                     started_at: "0".into(),
+                    workspace_id: Some("w1".into()),
                 });
                 Ok(())
             })
@@ -1615,6 +1616,7 @@ mod tests {
                     pane_id: lead.pane_id.clone(),
                     tab_id: lead.tab_id.clone(),
                     started_at: "0".into(),
+                    workspace_id: Some("w1".into()),
                 });
                 d.pending_pings.push("T-1: queued result".into());
                 Ok(())
