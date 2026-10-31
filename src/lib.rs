@@ -1,6 +1,7 @@
 pub mod cleanup;
 pub mod config;
 pub mod error;
+pub mod flock;
 pub mod gate;
 pub mod github;
 pub mod harness;

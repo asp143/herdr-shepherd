@@ -1,3 +1,4 @@
+mod cli_flock;
 mod cli_pr;
 use std::path::{Path, PathBuf};
 
@@ -35,6 +36,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Agent {
+        #[arg(long, global = true)]
+        project_root: Option<PathBuf>,
+        #[command(subcommand)]
+        command: cli_flock::AgentCommand,
+    },
     /// Emit configured lifecycle hooks.
     Hooks {
         #[command(subcommand)]
@@ -161,6 +168,20 @@ fn state_dir(cli: &Cli) -> PathBuf {
 
 fn run(cli: &Cli) -> Result<(), ShepherdError> {
     match &cli.command {
+        Commands::Agent {
+            project_root,
+            command,
+        } => {
+            let root = resolve_project_root(project_root.as_deref())?;
+            cli_flock::run(
+                command,
+                herdr_client()?.as_ref(),
+                &root,
+                &state_dir(cli),
+                &config::resolve_config_dir(cli.config_dir.as_deref()),
+                cli.json,
+            )?;
+        }
         Commands::Hooks {
             command: HooksCommand::Emit { event, json_file },
         } => {
@@ -440,6 +461,32 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
     Ok(())
 }
 
+fn herdr_client() -> Result<Box<dyn Herdr>, ShepherdError> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("SHEPHERD_FAKE_HERDR") {
+        let text = cli_pr::read_text(Path::new(&path))?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| ShepherdError::Usage(format!("invalid fake herdr: {e}")))?;
+        let workspaces = serde_json::from_value(
+            value
+                .get("workspaces")
+                .cloned()
+                .unwrap_or(serde_json::json!([])),
+        )
+        .map_err(anyhow::Error::from)?;
+        let h = herdr_shepherd::herdr::fake::FakeHerdr::new(workspaces);
+        *h.agent_records.borrow_mut() = serde_json::from_value(
+            value
+                .get("agents")
+                .cloned()
+                .unwrap_or(serde_json::json!([])),
+        )
+        .map_err(anyhow::Error::from)?;
+        return Ok(Box::new(h));
+    }
+    Ok(Box::new(CliHerdr::from_env()))
+}
+
 fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -449,6 +496,9 @@ fn home() -> PathBuf {
 fn resolve_project_root(explicit: Option<&Path>) -> Result<PathBuf, ShepherdError> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("HERDR_SHEPHERD_PROJECT_ROOT") {
+        return Ok(path.into());
     }
     let context = std::env::var("HERDR_PLUGIN_CONTEXT_JSON")
         .ok()

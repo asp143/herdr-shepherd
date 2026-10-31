@@ -103,6 +103,12 @@ pub fn launch_configured(
                 "lead is already running; resume it".into(),
             ));
         }
+        if req.role.name != "lead"
+            && let Some(ticket) = data.tickets.iter().find(|t| t.id == req.ticket)
+            && !crate::ticket::state::is_active(ticket.state)
+        {
+            return Err(ShepherdError::Usage("ticket is not active".into()));
+        }
         let mut number = data
             .agents
             .iter()
@@ -162,6 +168,9 @@ fn save(store: &Store, record: &AgentRecord) -> Result<(), ShepherdError> {
             .ok_or_else(|| ShepherdError::Usage("launch record disappeared".into()))?;
         // An immediately finishing agent may report while launch waits for
         // its working signal. Keep that report rather than overwriting it.
+        if stored.status == AgentStatus::Retired {
+            return Ok(());
+        }
         let report = stored.report.clone();
         let status = stored.status;
         *stored = record.clone();
@@ -238,6 +247,11 @@ fn launch_reserved(
             record.status = AgentStatus::Blocked;
             save(store, record)?;
             report_badges(h, cfg, &pane, runner, &req.role.name)?;
+            crate::hooks::emit(
+                cfg,
+                "agent.spawned",
+                &serde_json::json!({"ticket":record.ticket,"agent":record.name,"role":record.role,"runner":record.runner}),
+            );
             return Ok(());
         }
         match h.prompt_agent(&record.name, &record.task, true) {
