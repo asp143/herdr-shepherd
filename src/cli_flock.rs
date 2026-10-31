@@ -148,3 +148,61 @@ pub fn run(
     });
     Ok(())
 }
+
+pub fn spawn_task(
+    h: &dyn Herdr,
+    store: &Store,
+    cfg: &herdr_shepherd::config::Config,
+    state: &Path,
+    ticket: &herdr_shepherd::store::Ticket,
+    role_name: &str,
+    task: &str,
+) -> Result<herdr_shepherd::store::AgentRecord, ShepherdError> {
+    let resolved = roles::resolve(cfg)?;
+    let role = resolved
+        .roles
+        .iter()
+        .find(|r| r.name == role_name)
+        .cloned()
+        .ok_or_else(|| ShepherdError::Usage(format!("unknown role: {role_name}")))?;
+    let worktree = ticket
+        .worktree
+        .clone()
+        .ok_or_else(|| ShepherdError::Usage("ticket has no worktree".into()))?;
+    let workspace_id = ticket
+        .workspace_id
+        .clone()
+        .ok_or_else(|| ShepherdError::Usage("ticket has no workspace".into()))?;
+    let bin = std::env::current_exe().map_err(anyhow::Error::from)?;
+    let prompt = format!(
+        "Ticket {}: {}\n{}\nAcceptance: {:?}\nTask: {task}\nStay on branch {} in worktree {}. Never switch branches or write outside it. Never read .env*, Credentials/, *.pem, *.key or other secret files. Never push, open PRs, or call GitHub. Label findings High (Blocker) | Mid | Low | Wish. Write JSON report inside the assigned worktree, run {} agent report --agent {{{{agent_name}}}} --report-file <path>, then remove the report file after success. JSON: {{\"status\":\"completed|blocked|failed\",\"summary\":\"text\",\"tests\":[],\"changed_paths\":[],\"blockers\":[],\"findings\":[],\"commit_sha\":null}}",
+        ticket.id,
+        ticket.title,
+        ticket.body,
+        ticket.acceptance,
+        ticket.branch,
+        worktree.display(),
+        bin.display()
+    );
+    let runners = role
+        .runners
+        .iter()
+        .map(|name| resolved.runners[name].clone())
+        .collect();
+    let tab_label = role.name.clone();
+    flock::spawn(
+        h,
+        store,
+        cfg,
+        LaunchRequest {
+            ticket: ticket.id.clone(),
+            role,
+            runners,
+            worktree,
+            workspace_id,
+            tab_label,
+            prompt,
+            state_dir: state.into(),
+        },
+    )
+}

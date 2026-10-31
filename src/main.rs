@@ -1,5 +1,6 @@
 mod cli_flock;
 mod cli_pr;
+mod cli_ticket;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, error::ErrorKind};
@@ -116,9 +117,38 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum TicketCommands {
+    Add {
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        body_file: PathBuf,
+        #[arg(long)]
+        acceptance_file: Option<PathBuf>,
+        #[arg(long = "type", default_value = "feat")]
+        kind: String,
+        #[arg(long)]
+        base: Option<String>,
+    },
+    Cancel {
+        id: String,
+    },
+    Dispatch,
+    Transition {
+        id: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
     List,
-    Show { id: String },
-    Fetch { id: String },
+    Show {
+        id: String,
+    },
+    Fetch {
+        id: String,
+    },
 }
 
 #[derive(serde::Serialize)]
@@ -310,6 +340,110 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 herdr_shepherd::store::Store::open(state_dir, &project)?.read()
             };
             match command {
+                TicketCommands::Add {
+                    id,
+                    title,
+                    body_file,
+                    acceptance_file,
+                    kind,
+                    base,
+                } => {
+                    let store = herdr_shepherd::store::Store::open(&state_dir(cli), &project)?;
+                    let cfg = herdr_shepherd::trusted::committed_config(
+                        &config::resolve_config_dir(cli.config_dir.as_deref()),
+                        &project,
+                        None,
+                        &state_dir(cli),
+                    )?;
+                    let resolved = herdr_shepherd::roles::resolve(&cfg)?;
+                    let acceptance = acceptance_file
+                        .as_deref()
+                        .map(cli_pr::read_text)
+                        .transpose()?
+                        .map(|text| {
+                            serde_json::from_str::<Vec<String>>(&text).unwrap_or_else(|_| {
+                                text.lines()
+                                    .filter(|s| !s.trim().is_empty())
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                        })
+                        .unwrap_or_default();
+                    let ticket = herdr_shepherd::ticket::intake::add(
+                        &store,
+                        &herdr_shepherd::ticket::intake::IntakeRequest {
+                            id: id.clone(),
+                            title: title.clone(),
+                            body: cli_pr::read_text(body_file)?,
+                            acceptance,
+                            kind: kind.clone(),
+                            base: base.clone(),
+                        },
+                        &resolved.shepherd.integration_branch,
+                        &herdr_shepherd::launch::now(),
+                    )?;
+                    herdr_shepherd::hooks::emit(
+                        &cfg,
+                        "ticket.queued",
+                        &serde_json::json!({"ticket":ticket.id}),
+                    );
+                    output::emit(cli.json, &ticket, || {
+                        serde_json::to_string_pretty(&ticket).expect("serializable")
+                    });
+                }
+                TicketCommands::Cancel { id } => {
+                    let store = herdr_shepherd::store::Store::open(&state_dir(cli), &project)?;
+                    let cfg = herdr_shepherd::trusted::committed_config(
+                        &config::resolve_config_dir(cli.config_dir.as_deref()),
+                        &project,
+                        None,
+                        &state_dir(cli),
+                    )?;
+                    let ticket = cli_ticket::cancel(herdr_client()?.as_ref(), &store, &cfg, id)?;
+                    output::emit(cli.json, &ticket, || {
+                        serde_json::to_string_pretty(&ticket).expect("serializable")
+                    });
+                }
+                TicketCommands::Dispatch => {
+                    let store = herdr_shepherd::store::Store::open(&state_dir(cli), &project)?;
+                    let dir = config::resolve_config_dir(cli.config_dir.as_deref());
+                    let cfg = herdr_shepherd::trusted::committed_config(
+                        &dir,
+                        &project,
+                        None,
+                        &state_dir(cli),
+                    )?;
+                    let result = cli_ticket::dispatch(
+                        herdr_client()?.as_ref(),
+                        &store,
+                        &cfg,
+                        &state_dir(cli),
+                        &dir,
+                    )?;
+                    output::emit(cli.json, &result, || {
+                        serde_json::to_string_pretty(&result).expect("serializable")
+                    });
+                }
+                TicketCommands::Transition { id, to, reason } => {
+                    let store = herdr_shepherd::store::Store::open(&state_dir(cli), &project)?;
+                    let cfg = herdr_shepherd::trusted::committed_config(
+                        &config::resolve_config_dir(cli.config_dir.as_deref()),
+                        &project,
+                        None,
+                        &state_dir(cli),
+                    )?;
+                    let to = serde_json::from_value(serde_json::json!(to))
+                        .map_err(|_| ShepherdError::Usage("unknown ticket state".into()))?;
+                    let reason = reason
+                        .as_ref()
+                        .map(|r| serde_json::from_value(serde_json::json!(r)))
+                        .transpose()
+                        .map_err(|_| ShepherdError::Usage("unknown blocked reason".into()))?;
+                    let ticket = cli_ticket::transition(&store, &cfg, id, to, reason)?;
+                    output::emit(cli.json, &ticket, || {
+                        serde_json::to_string_pretty(&ticket).expect("serializable")
+                    });
+                }
                 TicketCommands::List => {
                     let data = read_store()?;
                     output::emit(cli.json, &data.tickets, || {
