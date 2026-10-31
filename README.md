@@ -4,7 +4,7 @@ Shepherd is a herdr plugin intended to take a ticket through planning, parallel 
 
 ## Install
 
-Requires Rust, herdr 0.9.5 or newer, and Git. `gh` supplies optional PR classifications and `du` supplies optional sizes. Linux is tested; the plugin also declares macOS support.
+Requires Rust 1.89 or newer, herdr 0.9.5 or newer, and Git. `gh` supplies optional PR classifications and `du` supplies optional sizes. Linux is tested; the plugin also declares macOS support.
 
 From this checkout:
 
@@ -32,7 +32,10 @@ Global options are `--json`, `--config-dir PATH`, and `--state-dir PATH`.
 Ticket inspection requires `--state-dir` or `HERDR_PLUGIN_STATE_DIR`. State lives
 in `projects/<sha256 of canonical project path>/state.json`, with a per-project
 lock covering each update and a synced atomic replacement. Ticket inspection
-does not change stored ticket data.
+does not change stored ticket data. Reads use shared locks; opening and reading
+a missing store returns empty data without creating its state directory.
+Writers create the directory on the first update. Corrupt-file errors name
+`state.json` and recommend preserving it and restoring a known-good backup.
 
 The library's ticket state machine includes `ci_wait`, which consumes a ticket
 slot. Review, QA, and red CI bounces share a revision counter; exceeding the cap

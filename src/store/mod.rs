@@ -32,7 +32,6 @@ impl Store {
     pub fn open(state_dir: &Path, project_root: &Path) -> Result<Self, ShepherdError> {
         let project_root = fs::canonicalize(project_root).context("resolve project root")?;
         let root = state_dir.join("projects").join(project_hash(&project_root));
-        fs::create_dir_all(&root).context("create project state directory")?;
         Ok(Self { root, project_root })
     }
 
@@ -41,8 +40,11 @@ impl Store {
     }
 
     pub fn read(&self) -> Result<StoreData, ShepherdError> {
-        let _lock =
-            lock::Lock::acquire(&self.root.join("state.lock")).context("lock project state")?;
+        let _lock = match lock::Lock::acquire_shared(&self.root.join("state.lock")) {
+            Ok(lock) => lock,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(self.empty_data()),
+            Err(err) => return Err(anyhow::Error::new(err).context("lock project state").into()),
+        };
         self.read_unlocked()
     }
 
@@ -50,6 +52,7 @@ impl Store {
         &self,
         f: impl FnOnce(&mut StoreData) -> Result<T, ShepherdError>,
     ) -> Result<T, ShepherdError> {
+        fs::create_dir_all(&self.root).context("create project state directory")?;
         let _lock =
             lock::Lock::acquire(&self.root.join("state.lock")).context("lock project state")?;
         let mut data = self.read_unlocked()?;
@@ -63,20 +66,29 @@ impl Store {
         let path = self.root.join("state.json");
         match fs::read(&path) {
             Ok(bytes) => {
-                let data: StoreData =
-                    serde_json::from_slice(&bytes).context("decode project state")?;
-                self.validate(&data)?;
+                let recovery = || {
+                    format!(
+                        "invalid project state at {}; preserve the file and restore a known-good backup before retrying",
+                        path.display()
+                    )
+                };
+                let data: StoreData = serde_json::from_slice(&bytes).with_context(recovery)?;
+                self.validate(&data).with_context(recovery)?;
                 Ok(data)
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(StoreData {
-                schema_version: 1,
-                project_root: self.project_root.clone(),
-                lead: None,
-                tickets: Vec::new(),
-                agents: Vec::new(),
-                pending_pings: Vec::new(),
-            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(self.empty_data()),
             Err(err) => Err(anyhow::Error::new(err).context("read project state").into()),
+        }
+    }
+
+    fn empty_data(&self) -> StoreData {
+        StoreData {
+            schema_version: 1,
+            project_root: self.project_root.clone(),
+            lead: None,
+            tickets: Vec::new(),
+            agents: Vec::new(),
+            pending_pings: Vec::new(),
         }
     }
 

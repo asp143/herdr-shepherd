@@ -1,6 +1,43 @@
 use herdr_shepherd::store::{Store, Ticket};
 
 #[test]
+fn missing_store_read_does_not_create_state_directory() {
+    let project = tempfile::tempdir().unwrap();
+    let state = project.path().join("missing-state");
+    let store = Store::open(&state, project.path()).unwrap();
+    assert!(store.read().unwrap().tickets.is_empty());
+    assert!(!state.exists());
+    store
+        .update(|data| {
+            data.pending_pings.push("created by writer".into());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(store.read().unwrap().pending_pings, ["created by writer"]);
+}
+
+#[test]
+fn read_can_share_an_existing_read_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), dir.path()).unwrap();
+    store.update(|_| Ok(())).unwrap();
+    let lock = std::fs::File::open(store.root().join("state.lock")).unwrap();
+    lock.lock_shared().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || sender.send(store.read()).unwrap());
+    let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+    drop(lock);
+    reader.join().unwrap();
+    assert!(
+        result
+            .expect("read must share the held read lock")
+            .unwrap()
+            .tickets
+            .is_empty()
+    );
+}
+
+#[test]
 fn roundtrip_store() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
@@ -116,9 +153,12 @@ fn failed_update_does_not_persist_mutations() {
 fn corrupt_store_is_not_overwritten() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), dir.path()).unwrap();
+    store.update(|_| Ok(())).unwrap();
     let path = store.root().join("state.json");
     std::fs::write(&path, "broken").unwrap();
-    assert!(store.read().is_err());
+    let error = store.read().unwrap_err().to_string();
+    assert!(error.contains(path.to_str().unwrap()));
+    assert!(error.contains("restore"));
     assert!(store.update(|_| Ok(())).is_err());
     assert_eq!(std::fs::read_to_string(path).unwrap(), "broken");
 }
@@ -127,6 +167,7 @@ fn corrupt_store_is_not_overwritten() {
 fn unsupported_schema_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), dir.path()).unwrap();
+    store.update(|_| Ok(())).unwrap();
     let mut data = store.read().unwrap();
     data.schema_version = 2;
     std::fs::write(
