@@ -78,6 +78,37 @@ impl GhBackend {
 }
 
 impl PrBackend for GhBackend {
+    fn requested_reviewers(&self, gate: &Gate, number: u64) -> Result<Vec<String>, ShepherdError> {
+        GhBackend::requested_reviewers(self, gate, number)
+    }
+
+    fn author(&self, worktree: &Path) -> Result<String, ShepherdError> {
+        let text = read_gate(worktree)?
+            .gh(&["api", "user", "--jq", ".login"], worktree)
+            .map_err(unavailable)?;
+        let author = text.trim();
+        if author.is_empty() {
+            return Err(unavailable("GitHub returned an empty author"));
+        }
+        Ok(author.into())
+    }
+    fn comments(
+        &self,
+        worktree: &Path,
+        number: u64,
+    ) -> Result<Vec<super::PrComment>, ShepherdError> {
+        let gate = read_gate(worktree)?;
+        let mut comments = Vec::new();
+        for (kind, review) in [("pulls", true), ("issues", false)] {
+            let route = format!("repos/{{owner}}/{{repo}}/{kind}/{number}/comments");
+            let text = gate
+                .gh(&["api", &route, "--paginate", "--slurp"], worktree)
+                .map_err(unavailable)?;
+            comments.extend(parse_comments(&text, review)?);
+        }
+        Ok(comments)
+    }
+
     fn view(&self, worktree: &Path, branch: &str) -> Result<Option<PrStatus>, ShepherdError> {
         let gate = Gate {
             policy: BranchPolicy::new(&[], None, None)?,
@@ -390,5 +421,78 @@ mod tests {
             parse_view("{}"),
             Err(ShepherdError::GithubUnavailable(_))
         ));
+    }
+}
+
+fn read_gate(worktree: &Path) -> Result<Gate, ShepherdError> {
+    Ok(Gate {
+        policy: BranchPolicy::new(&[], None, None)?,
+        ticket_branch: String::new(),
+        worktree: worktree.into(),
+        state_dir: crate::gate::state_dir(),
+        config_dir: crate::config::resolve_config_dir(None),
+    })
+}
+
+pub fn parse_comments(text: &str, review: bool) -> Result<Vec<super::PrComment>, ShepherdError> {
+    let pages: Vec<Vec<Value>> = serde_json::from_str(text).map_err(unavailable)?;
+    pages
+        .into_iter()
+        .flatten()
+        .map(|raw| {
+            Ok(super::PrComment {
+                id: raw
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| unavailable("comment has no numeric id"))?,
+                author: raw
+                    .pointer("/user/login")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| unavailable("comment has no author"))?
+                    .into(),
+                path: raw.get("path").and_then(Value::as_str).map(str::to_owned),
+                line: raw.get("line").and_then(Value::as_u64),
+                body: raw
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| unavailable("comment has no body"))?
+                    .into(),
+                review,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod comment_tests {
+    use super::*;
+
+    #[test]
+    fn paginated_review_and_issue_comments_keep_context() {
+        let comments = parse_comments(r#"[[{"id":11,"user":{"login":"reviewer"},"path":"src/lib.rs","line":7,"body":"Check the edge"}],[{"id":12,"user":{"login":"another"},"path":"src/main.rs","line":null,"body":"Old line"}]]"#, true).unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].id, 11);
+        assert_eq!(comments[0].author, "reviewer");
+        assert_eq!(comments[0].path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(comments[0].line, Some(7));
+        assert!(comments[0].review);
+        assert_eq!(comments[1].line, None);
+        let issue = parse_comments(
+            r#"[[{"id":11,"user":{"login":"reviewer"},"body":"Question"}]]"#,
+            false,
+        )
+        .unwrap();
+        assert!(!issue[0].review);
+        assert_eq!(issue[0].path, None);
+    }
+
+    #[test]
+    fn malformed_comment_response_errors() {
+        for text in ["{}", "[[{}]]", r#"[[{"id":1,"body":"Question"}]]"#] {
+            assert_eq!(
+                parse_comments(text, true).unwrap_err().code(),
+                "github_unavailable"
+            );
+        }
     }
 }

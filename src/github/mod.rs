@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{error::ShepherdError, gate::Gate};
 
 pub mod codeowners;
-#[cfg(test)]
+#[cfg(any(test, debug_assertions, feature = "test-support"))]
 pub mod fake;
 pub mod gh;
 
@@ -50,7 +50,36 @@ pub struct PrStatus {
     pub comment_ids: Vec<u64>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PrComment {
+    pub id: u64,
+    pub author: String,
+    pub path: Option<String>,
+    pub line: Option<u64>,
+    pub body: String,
+    pub review: bool,
+}
+
 pub trait PrBackend {
+    fn requested_reviewers(
+        &self,
+        _gate: &Gate,
+        _number: u64,
+    ) -> Result<Vec<String>, ShepherdError> {
+        Ok(vec![])
+    }
+
+    fn comments(&self, _worktree: &Path, _number: u64) -> Result<Vec<PrComment>, ShepherdError> {
+        Err(ShepherdError::GithubUnavailable(
+            "comment reads are unsupported".into(),
+        ))
+    }
+    fn author(&self, _worktree: &Path) -> Result<String, ShepherdError> {
+        Err(ShepherdError::GithubUnavailable(
+            "author reads are unsupported".into(),
+        ))
+    }
+
     fn view(&self, worktree: &Path, branch: &str) -> Result<Option<PrStatus>, ShepherdError>;
     fn push(&self, gate: &Gate) -> Result<(), ShepherdError>;
     fn create(

@@ -117,6 +117,41 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum TicketCommands {
+    Pr {
+        id: String,
+        #[arg(long)]
+        summary_file: PathBuf,
+        #[arg(long)]
+        changes_file: PathBuf,
+        #[arg(long)]
+        testing_file: PathBuf,
+    },
+    Comments {
+        id: String,
+        #[arg(long)]
+        new: bool,
+    },
+    Reply {
+        id: String,
+        #[arg(long)]
+        comment: u64,
+        #[arg(long)]
+        body_file: PathBuf,
+    },
+    Revise {
+        id: String,
+        #[arg(long, value_delimiter = ',')]
+        comments: Vec<u64>,
+        #[arg(long)]
+        task_file: PathBuf,
+    },
+    Ack {
+        id: String,
+        #[arg(long)]
+        comment: u64,
+        #[arg(long)]
+        body_file: PathBuf,
+    },
     Add {
         #[arg(long)]
         id: Option<String>,
@@ -340,6 +375,16 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 herdr_shepherd::store::Store::open(state_dir, &project)?.read()
             };
             match command {
+                TicketCommands::Pr { .. }
+                | TicketCommands::Comments { .. }
+                | TicketCommands::Reply { .. }
+                | TicketCommands::Revise { .. }
+                | TicketCommands::Ack { .. } => {
+                    let result = run_ticket_pr(command, &project, cli)?;
+                    output::emit(cli.json, &result, || {
+                        serde_json::to_string_pretty(&result).expect("serializable")
+                    });
+                }
                 TicketCommands::Add {
                     id,
                     title,
@@ -692,4 +737,139 @@ fn main() {
         output::emit_error(cli.json, &error);
         std::process::exit(error.exit_code());
     }
+}
+
+fn github_client() -> Result<Box<dyn herdr_shepherd::github::PrBackend>, ShepherdError> {
+    #[cfg(debug_assertions)]
+    if let Some(directory) = std::env::var_os("SHEPHERD_FAKE_GITHUB") {
+        return Ok(Box::new(herdr_shepherd::github::fake::DiskBackend::open(
+            Path::new(&directory),
+        )?));
+    }
+    Ok(Box::new(herdr_shepherd::github::gh::GhBackend))
+}
+
+fn run_ticket_pr(
+    command: &TicketCommands,
+    project: &Path,
+    cli: &Cli,
+) -> Result<serde_json::Value, ShepherdError> {
+    use herdr_shepherd::ticket::{pr, pr_body};
+    let state = state_dir(cli);
+    let store = herdr_shepherd::store::Store::open(&state, project)?;
+    let id = match command {
+        TicketCommands::Pr { id, .. }
+        | TicketCommands::Comments { id, .. }
+        | TicketCommands::Reply { id, .. }
+        | TicketCommands::Revise { id, .. }
+        | TicketCommands::Ack { id, .. } => id,
+        _ => unreachable!("PR command"),
+    };
+    // Validate human-facing text before trusted config can query GitHub.
+    let body = match command {
+        TicketCommands::Reply { body_file, .. } | TicketCommands::Ack { body_file, .. } => {
+            let text = cli_pr::read_text(body_file)?;
+            pr::validate_body(&text)?;
+            Some(text)
+        }
+        _ => None,
+    };
+    let data = store.read()?;
+    let ticket = data
+        .tickets
+        .iter()
+        .find(|t| t.id == *id)
+        .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
+    let content = if let TicketCommands::Pr {
+        summary_file,
+        changes_file,
+        testing_file,
+        ..
+    } = command
+    {
+        let lines = |path: &Path| -> Result<Vec<String>, ShepherdError> {
+            let text = cli_pr::read_text(path)?;
+            Ok(
+                serde_json::from_str::<Vec<String>>(&text).unwrap_or_else(|_| {
+                    text.lines()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                }),
+            )
+        };
+        let summary = cli_pr::read_text(summary_file)?;
+        let changes = lines(changes_file)?;
+        let testing = lines(testing_file)?;
+        pr_body::check_attribution(&pr_body::build_title(ticket))?;
+        pr::validate_body(&pr_body::build_body(ticket, &summary, &changes, &testing))?;
+        Some((summary, changes, testing))
+    } else {
+        None
+    };
+    let dir = config::resolve_config_dir(cli.config_dir.as_deref());
+    let cfg = herdr_shepherd::trusted::committed_config(&dir, project, None, &state)?;
+    if let TicketCommands::Revise {
+        comments,
+        task_file,
+        ..
+    } = command
+    {
+        let t = pr::revise(
+            &store,
+            id,
+            comments,
+            &cli_pr::read_text(task_file)?,
+            &herdr_shepherd::launch::now(),
+            herdr_shepherd::roles::resolve(&cfg)?
+                .shepherd
+                .max_revision_rounds,
+        )?;
+        return serde_json::to_value(t).map_err(|e| anyhow::Error::from(e).into());
+    }
+    let gh = github_client()?;
+    if let TicketCommands::Comments { new, .. } = command {
+        return serde_json::to_value(pr::comments(&store, gh.as_ref(), id, *new)?)
+            .map_err(|e| anyhow::Error::from(e).into());
+    }
+    let path = ticket
+        .worktree
+        .as_deref()
+        .ok_or_else(|| ShepherdError::Usage("ticket has no worktree".into()))?;
+    let mut gate = cli_pr::gate(path, &cfg, Some(&ticket.base), Some(&ticket.branch), &state)?;
+    gate.config_dir = dir;
+    let t = match command {
+        TicketCommands::Pr { .. } => {
+            let (summary, changes, testing) = content.expect("read PR content");
+            pr::open(
+                &store,
+                gh.as_ref(),
+                &gate,
+                &cfg,
+                id,
+                &summary,
+                &changes,
+                &testing,
+                &herdr_shepherd::launch::now(),
+            )?
+        }
+        TicketCommands::Reply { comment, .. } => pr::reply(
+            &store,
+            gh.as_ref(),
+            &gate,
+            id,
+            *comment,
+            body.as_deref().expect("read body"),
+        )?,
+        TicketCommands::Ack { comment, .. } => pr::ack(
+            &store,
+            gh.as_ref(),
+            &gate,
+            id,
+            *comment,
+            body.as_deref().expect("read body"),
+        )?,
+        _ => unreachable!("handled PR command"),
+    };
+    serde_json::to_value(t).map_err(|e| anyhow::Error::from(e).into())
 }

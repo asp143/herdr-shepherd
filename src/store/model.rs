@@ -59,12 +59,18 @@ pub struct Ticket {
     pub revision_round: u32,
     pub findings: Vec<Finding>,
     pub pr_number: Option<u64>,
+    #[serde(default)]
+    pub pr_reviewers_pending: Vec<String>,
     pub children: Vec<ChildWorktree>,
     pub history: Vec<Transition>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default)]
+    pub comments: Vec<CommentRecord>,
+    #[serde(default)]
+    pub revision_task: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -153,4 +159,27 @@ pub struct LeadRecord {
     pub tab_id: Option<String>,
     pub pane_id: Option<String>,
     pub started_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CommentRecord {
+    pub id: u64,
+    pub author: String,
+    pub path: Option<String>,
+    pub line: Option<u64>,
+    pub body: String,
+    #[serde(default)]
+    pub triaged: bool,
+    #[serde(default)]
+    pub verdict: Option<String>,
+    #[serde(default)]
+    pub ack_sha: Option<String>,
+    #[serde(default)]
+    pub acknowledged: bool,
+    #[serde(default = "review_comment")]
+    pub review: bool,
+}
+
+fn review_comment() -> bool {
+    true
 }
