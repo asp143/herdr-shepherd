@@ -35,6 +35,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Emit configured lifecycle hooks.
+    Hooks {
+        #[command(subcommand)]
+        command: HooksCommand,
+    },
     /// Remove a verified merged ticket worktree.
     Cleanup {
         #[arg(long)]
@@ -117,6 +122,15 @@ enum HookCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum HooksCommand {
+    Emit {
+        event: String,
+        #[arg(long)]
+        json_file: PathBuf,
+    },
+}
+
 fn state_dir(cli: &Cli) -> PathBuf {
     cli.state_dir
         .clone()
@@ -125,6 +139,26 @@ fn state_dir(cli: &Cli) -> PathBuf {
 
 fn run(cli: &Cli) -> Result<(), ShepherdError> {
     match &cli.command {
+        Commands::Hooks {
+            command: HooksCommand::Emit { event, json_file },
+        } => {
+            if !herdr_shepherd::hooks::known_event(event) {
+                return Err(ShepherdError::Usage(format!(
+                    "unknown lifecycle event: {event}"
+                )));
+            }
+            let payload = serde_json::from_str(&cli_pr::read_text(json_file)?)
+                .map_err(|error| ShepherdError::Usage(format!("invalid event JSON: {error}")))?;
+            let root = resolve_project_root(None)?;
+            let cfg = config::load(
+                &config::resolve_config_dir(cli.config_dir.as_deref()),
+                Some(&root),
+            )?;
+            herdr_shepherd::hooks::emit(&cfg, event, &payload);
+            output::emit(cli.json, &serde_json::json!({"event":event}), || {
+                format!("shepherd: emitted {event}")
+            });
+        }
         Commands::Cleanup {
             worktree,
             dry_run,

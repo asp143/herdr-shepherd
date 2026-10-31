@@ -693,3 +693,39 @@ fn uncontained_ticket_without_merged_head_proof_is_refused() {
     assert!(repo.h.removals.borrow().is_empty());
     assert!(repo.ticket.exists());
 }
+
+#[test]
+fn cleanup_emits_lifecycle_after_workspace_removal() {
+    let mut repo = Repo::new();
+    repo.merge();
+    let emitted = repo._dir.path().join("event.json");
+    repo.cfg.raw.insert(
+        "hooks".into(),
+        toml::Value::Array(vec![toml::Value::Table(toml::Table::from_iter([
+            ("on".into(), toml::Value::String("ticket.cleaned_up".into())),
+            (
+                "command".into(),
+                toml::Value::Array(
+                    [
+                        "sh",
+                        "-c",
+                        "cat > \"$1\"",
+                        "hook",
+                        emitted.to_str().unwrap(),
+                    ]
+                    .into_iter()
+                    .map(|s| toml::Value::String(s.into()))
+                    .collect(),
+                ),
+            ),
+        ]))]),
+    );
+    let report = cleanup::run(repo.preflight(false).unwrap(), false).unwrap();
+    let event: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(emitted).unwrap()).unwrap();
+    assert_eq!(
+        event,
+        serde_json::json!({"worktree":report.worktree,"branch":"feat/t","pr":1})
+    );
+    assert!(!repo.ticket.exists());
+}

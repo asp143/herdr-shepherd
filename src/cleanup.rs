@@ -666,12 +666,21 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
     })();
     if !dry_run {
         match &result {
-            Ok(_) => notify(
-                p.herdr,
-                p.cfg,
-                "Shepherd cleanup complete",
-                &p.target.branch,
-            ),
+            Ok(report) => {
+                notify(
+                    p.herdr,
+                    p.cfg,
+                    "Shepherd cleanup complete",
+                    &p.target.branch,
+                );
+                crate::hooks::emit(
+                    p.cfg,
+                    "ticket.cleaned_up",
+                    &serde_json::json!({
+                        "worktree": report.worktree, "branch": report.branch, "pr": report.pr,
+                    }),
+                );
+            }
             Err(error) => notify(
                 p.herdr,
                 p.cfg,

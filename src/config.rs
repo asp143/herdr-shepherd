@@ -51,6 +51,26 @@ pub enum ConfigSource {
     Project(PathBuf),
 }
 
+pub(crate) fn known_hook_event(event: &str) -> bool {
+    matches!(
+        event,
+        "ticket.queued"
+            | "ticket.started"
+            | "ticket.stage_changed"
+            | "ticket.blocked"
+            | "ticket.pr_opened"
+            | "ticket.pr_comment"
+            | "ticket.revised"
+            | "ticket.merged"
+            | "ticket.cleaned_up"
+            | "ticket.closed"
+            | "agent.spawned"
+            | "agent.retired"
+            | "agent.unblocked"
+            | "agent.escalated"
+    )
+}
+
 pub fn resolve_config_dir(cli: Option<&Path>) -> PathBuf {
     cli.map(Path::to_path_buf)
         .or_else(|| env::var_os("HERDR_PLUGIN_CONFIG_DIR").map(PathBuf::from))
@@ -116,6 +136,15 @@ pub fn load(config_dir: &Path, project_root: Option<&Path>) -> Result<Config, Sh
     if matches!(source, ConfigSource::Project(_)) && raw.contains_key("upkeep") {
         warnings.push("[upkeep] in project config is ignored".into());
     }
+    if let Some(hooks) = raw.get("hooks").and_then(toml::Value::as_array) {
+        for hook in hooks {
+            if let Some(event) = hook.get("on").and_then(toml::Value::as_str)
+                && !known_hook_event(event)
+            {
+                warnings.push(format!("unknown lifecycle hook event: {event}"));
+            }
+        }
+    }
     let schema_version = match raw.get("schema_version") {
         None => 1,
         Some(toml::Value::Integer(1)) => 1,
@@ -139,6 +168,22 @@ pub fn load(config_dir: &Path, project_root: Option<&Path>) -> Result<Config, Sh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_event_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("shepherd.toml"),
+            "[[hooks]]\non = 'ticket.typo'\ncommand = ['true']\n",
+        )
+        .unwrap();
+        let cfg = load(dir.path(), None).unwrap();
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|warning| warning.contains("ticket.typo"))
+        );
+    }
 
     #[test]
     fn defaults_when_no_files() {
