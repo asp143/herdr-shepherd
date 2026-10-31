@@ -92,154 +92,165 @@ fn poll_ticket(
         )
         .map(|outcome| outcome != crate::ticket::merge::MergeOutcome::Unchanged);
     }
-    crate::ticket::pr::comments(store, gh, &ticket.id, false)?;
-    let checks = if ticket
-        .ci_head_sha
-        .as_ref()
-        .is_some_and(|sha| status.head_oid.as_ref() == Some(sha))
-    {
-        status.checks
-    } else {
-        Checks::Pending
-    };
-    if ticket.state == TicketState::CiWait && checks == Checks::Failing {
-        let checks = gh.failed_checks(path, status.number)?;
-        let details = checks
-            .iter()
-            .map(|check| format!("- {}: {}", check.name, check.url))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let task = format!(
-            "Fix failing CI for {} ({}). Reproduce the failures before changing code, run the failing checks, and send the complete diff through reviewer and QA before pushing the existing PR.\n{}",
-            ticket.id, status.url, details,
-        );
-        let cap = crate::roles::resolve(cfg)?.shepherd.max_revision_rounds;
-        let changed = store.update(|data| {
-            let Some(current) = data
-                .tickets
-                .iter_mut()
-                .find(|current| same_ci_generation(current, ticket))
-            else {
-                return Ok(false);
-            };
-            crate::ticket::state::transition_with_limit(
-                current,
-                TicketState::Building,
-                None,
-                &now.to_string(),
-                cap,
-            )?;
-            current.ci_none_since = None;
-            if current.state == TicketState::Building {
-                current.ci_failure_task = Some(task.clone());
+    // Comment transport and payload failures must not hold up CI state changes.
+    // This scope also releases lifecycle locks before pickup acquires them.
+    let ci_result = (|| -> Result<bool, ShepherdError> {
+        let checks = if ticket
+            .ci_head_sha
+            .as_ref()
+            .is_some_and(|sha| status.head_oid.as_ref() == Some(sha))
+        {
+            status.checks
+        } else {
+            Checks::Pending
+        };
+        if ticket.state == TicketState::CiWait && checks == Checks::Failing {
+            let checks = gh.failed_checks(path, status.number)?;
+            let details = checks
+                .iter()
+                .map(|check| format!("- {}: {}", check.name, check.url))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let task = format!(
+                "Fix failing CI for {} ({}). Reproduce the failures before changing code, run the failing checks, and send the complete diff through reviewer and QA before pushing the existing PR.\n{}",
+                ticket.id, status.url, details,
+            );
+            let cap = crate::roles::resolve(cfg)?.shepherd.max_revision_rounds;
+            let changed = store.update(|data| {
+                let Some(current) = data
+                    .tickets
+                    .iter_mut()
+                    .find(|current| same_ci_generation(current, ticket))
+                else {
+                    return Ok(false);
+                };
+                crate::ticket::state::transition_with_limit(
+                    current,
+                    TicketState::Building,
+                    None,
+                    &now.to_string(),
+                    cap,
+                )?;
+                current.ci_none_since = None;
+                if current.state == TicketState::Building {
+                    current.ci_failure_task = Some(task.clone());
+                }
+                Ok(true)
+            })?;
+            if changed {
+                let state = store
+                    .read()?
+                    .tickets
+                    .iter()
+                    .find(|t| t.id == ticket.id)
+                    .map(|t| t.state);
+                if state == Some(TicketState::Blocked) {
+                    crate::notify::Notifier::new(h, cfg.upkeep.notifications).send(
+                        &format!("{}: CI revision loop cap reached", ticket.id),
+                        &status.url,
+                    );
+                    crate::hooks::emit(
+                        cfg,
+                        "ticket.blocked",
+                        &serde_json::json!({"ticket":ticket.id,"reason":"loop_cap"}),
+                    );
+                } else {
+                    crate::lead::ping_lead(
+                        h,
+                        store,
+                        &format!(
+                            "{}: CI failed; run ticket dispatch to start the fix and complete reviewer and QA",
+                            ticket.id
+                        ),
+                    );
+                }
+                crate::hooks::emit(
+                    cfg,
+                    "ticket.stage_changed",
+                    &serde_json::json!({"ticket":ticket.id,"from":"ci_wait","to":state}),
+                );
             }
-            Ok(true)
-        })?;
-        if changed {
-            let state = store
+            return Ok(changed);
+        }
+        let no_checks_ready = if ticket.state == TicketState::CiWait {
+            store.update(|data| {
+                let Some(current) = data
+                    .tickets
+                    .iter_mut()
+                    .find(|current| same_ci_generation(current, ticket))
+                else {
+                    return Ok(false);
+                };
+                if checks == Checks::None {
+                    let since = current
+                        .ci_none_since
+                        .as_deref()
+                        .and_then(|value| value.parse::<u64>().ok());
+                    let since = match since {
+                        Some(since) => since,
+                        None => {
+                            current.ci_none_since = Some(now.to_string());
+                            now
+                        }
+                    };
+                    Ok(now.saturating_sub(since) >= 600)
+                } else {
+                    current.ci_none_since = None;
+                    Ok(false)
+                }
+            })?
+        } else {
+            false
+        };
+        if ticket.state == TicketState::CiWait && (checks == Checks::Passing || no_checks_ready) {
+            let _dispatch = crate::ticket::revise::dispatch_lock(store, &ticket.id)?;
+            if !store
                 .read()?
                 .tickets
                 .iter()
-                .find(|t| t.id == ticket.id)
-                .map(|t| t.state);
-            if state == Some(TicketState::Blocked) {
+                .any(|current| same_ci_generation(current, ticket))
+            {
+                return Ok(false);
+            }
+            crate::ticket::merge::retire_flock(store, h, &ticket.id)?;
+            let changed = store.update(|data| {
+                let Some(current) = data
+                    .tickets
+                    .iter_mut()
+                    .find(|current| same_ci_generation(current, ticket))
+                else {
+                    return Ok(false);
+                };
+                crate::ticket::state::transition(
+                    current,
+                    TicketState::PrOpen,
+                    None,
+                    &now.to_string(),
+                )?;
+                current.ci_none_since = None;
+                Ok(true)
+            })?;
+            if changed {
                 crate::notify::Notifier::new(h, cfg.upkeep.notifications).send(
-                    &format!("{}: CI revision loop cap reached", ticket.id),
+                    &format!("{}: PR #{} ready for review", ticket.id, status.number),
                     &status.url,
                 );
                 crate::hooks::emit(
                     cfg,
-                    "ticket.blocked",
-                    &serde_json::json!({"ticket":ticket.id,"reason":"loop_cap"}),
-                );
-            } else {
-                crate::lead::ping_lead(
-                    h,
-                    store,
-                    &format!(
-                        "{}: CI failed; run ticket dispatch to start the fix and complete reviewer and QA",
-                        ticket.id
-                    ),
+                    "ticket.stage_changed",
+                    &serde_json::json!({"ticket":ticket.id,"from":"ci_wait","to":"pr_open"}),
                 );
             }
-            crate::hooks::emit(
-                cfg,
-                "ticket.stage_changed",
-                &serde_json::json!({"ticket":ticket.id,"from":"ci_wait","to":state}),
-            );
+            return Ok(changed);
         }
-        notify_comments(h, store, cfg, &ticket.id)?;
-        return Ok(changed);
+        Ok(false)
+    })();
+    let pickup = crate::ticket::pr::comments(store, gh, &ticket.id, false)
+        .and_then(|_| notify_comments(h, store, cfg, &ticket.id));
+    if let Err(error) = pickup {
+        eprintln!("shepherd: {}: PR comment pickup: {error}", ticket.id);
     }
-    let no_checks_ready = if ticket.state == TicketState::CiWait {
-        store.update(|data| {
-            let Some(current) = data
-                .tickets
-                .iter_mut()
-                .find(|current| same_ci_generation(current, ticket))
-            else {
-                return Ok(false);
-            };
-            if checks == Checks::None {
-                let since = current
-                    .ci_none_since
-                    .as_deref()
-                    .and_then(|value| value.parse::<u64>().ok());
-                let since = match since {
-                    Some(since) => since,
-                    None => {
-                        current.ci_none_since = Some(now.to_string());
-                        now
-                    }
-                };
-                Ok(now.saturating_sub(since) >= 600)
-            } else {
-                current.ci_none_since = None;
-                Ok(false)
-            }
-        })?
-    } else {
-        false
-    };
-    if ticket.state == TicketState::CiWait && (checks == Checks::Passing || no_checks_ready) {
-        let _dispatch = crate::ticket::revise::dispatch_lock(store, &ticket.id)?;
-        if !store
-            .read()?
-            .tickets
-            .iter()
-            .any(|current| same_ci_generation(current, ticket))
-        {
-            return Ok(false);
-        }
-        crate::ticket::merge::retire_flock(store, h, &ticket.id)?;
-        let changed = store.update(|data| {
-            let Some(current) = data
-                .tickets
-                .iter_mut()
-                .find(|current| same_ci_generation(current, ticket))
-            else {
-                return Ok(false);
-            };
-            crate::ticket::state::transition(current, TicketState::PrOpen, None, &now.to_string())?;
-            current.ci_none_since = None;
-            Ok(true)
-        })?;
-        if changed {
-            crate::notify::Notifier::new(h, cfg.upkeep.notifications).send(
-                &format!("{}: PR #{} ready for review", ticket.id, status.number),
-                &status.url,
-            );
-            crate::hooks::emit(
-                cfg,
-                "ticket.stage_changed",
-                &serde_json::json!({"ticket":ticket.id,"from":"ci_wait","to":"pr_open"}),
-            );
-        }
-        notify_comments(h, store, cfg, &ticket.id)?;
-        return Ok(changed);
-    }
-    notify_comments(h, store, cfg, &ticket.id)?;
-    Ok(false)
+    ci_result
 }
 
 fn same_ci_generation(current: &Ticket, observed: &Ticket) -> bool {
@@ -477,6 +488,100 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
+        }
+    }
+
+    struct CommentFailureBackend {
+        fake: FakeBackend,
+        store: Store,
+        fail_comments: std::cell::Cell<bool>,
+        pickup_states: std::cell::RefCell<Vec<TicketState>>,
+    }
+    impl PrBackend for CommentFailureBackend {
+        fn view(&self, path: &Path, branch: &str) -> Result<Option<PrStatus>, ShepherdError> {
+            self.fake.view(path, branch)
+        }
+        fn comments(
+            &self,
+            path: &Path,
+            number: u64,
+        ) -> Result<Vec<crate::github::PrComment>, ShepherdError> {
+            self.pickup_states
+                .borrow_mut()
+                .push(self.store.read()?.tickets[0].state);
+            if self.fail_comments.replace(false) {
+                return Err(ShepherdError::GithubUnavailable(
+                    "comment fixture unavailable".into(),
+                ));
+            }
+            self.fake.comments(path, number)
+        }
+        fn push(&self, gate: &crate::gate::Gate) -> Result<(), ShepherdError> {
+            self.fake.push(gate)
+        }
+        fn create(
+            &self,
+            gate: &crate::gate::Gate,
+            base: &str,
+            title: &str,
+            body: &str,
+        ) -> Result<PrStatus, ShepherdError> {
+            self.fake.create(gate, base, title, body)
+        }
+        fn add_reviewers(
+            &self,
+            gate: &crate::gate::Gate,
+            number: u64,
+            reviewers: &[String],
+        ) -> Result<(), ShepherdError> {
+            self.fake.add_reviewers(gate, number, reviewers)
+        }
+        fn reply(
+            &self,
+            gate: &crate::gate::Gate,
+            number: u64,
+            comment: Option<u64>,
+            body: &str,
+        ) -> Result<(), ShepherdError> {
+            self.fake.reply(gate, number, comment, body)
+        }
+    }
+
+    #[test]
+    fn comment_outage_does_not_block_ci_and_retries_pickup() {
+        for (checks, expected, round) in [
+            (Checks::Passing, TicketState::PrOpen, 0),
+            (Checks::Failing, TicketState::Building, 1),
+        ] {
+            let fixture = Fixture::new(TicketState::CiWait);
+            let fake = FakeBackend::new(vec![
+                Ok(Some(Fixture::status(checks))),
+                Ok(Some(Fixture::status(checks))),
+            ]);
+            *fake.comments.borrow_mut() = crate::github::gh::parse_comments(
+                include_str!("../../tests/fixtures/gh_comments_nullable.json"),
+                true,
+            )
+            .unwrap();
+            let gh = CommentFailureBackend {
+                fake,
+                store: fixture.store.clone(),
+                fail_comments: std::cell::Cell::new(true),
+                pickup_states: Default::default(),
+            };
+            let report = tick_tickets(&fixture.h, &gh, &fixture.cfg, &fixture.state, 100);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert_eq!(report.updated, 1);
+            assert_eq!(fixture.ticket().state, expected);
+            assert_eq!(fixture.ticket().revision_round, round);
+            assert_eq!(*gh.pickup_states.borrow(), [expected]);
+            assert!(fixture.ticket().comments.is_empty());
+            let report = tick_tickets(&fixture.h, &gh, &fixture.cfg, &fixture.state, 101);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            let ticket = fixture.ticket();
+            assert_eq!(ticket.comments.len(), 4);
+            assert_eq!(ticket.comments[0].author, "ghost");
+            assert_eq!(ticket.comments[1].body, "");
         }
     }
 

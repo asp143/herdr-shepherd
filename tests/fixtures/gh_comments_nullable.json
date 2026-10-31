@@ -1,0 +1,10 @@
+[
+  [
+    {"id": 21, "user": null, "body": "Please check the empty input", "path": "src/parser.rs", "line": 3},
+    {"id": 22, "user": {"login": "reviewer"}, "body": null}
+  ],
+  [
+    {"id": 23, "user": null, "body": null},
+    {"id": 24, "user": {"login": "another"}, "body": "This comment stays available"}
+  ]
+]

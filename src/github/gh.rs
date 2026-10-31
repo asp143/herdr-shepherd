@@ -525,18 +525,21 @@ pub fn parse_comments(text: &str, review: bool) -> Result<Vec<super::PrComment>,
                     .get("id")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| unavailable("comment has no numeric id"))?,
-                author: raw
-                    .pointer("/user/login")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| unavailable("comment has no author"))?
-                    .into(),
+                author: if raw.get("user") == Some(&Value::Null) {
+                    "ghost".into()
+                } else {
+                    raw.pointer("/user/login")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| unavailable("comment has no author"))?
+                        .into()
+                },
                 path: raw.get("path").and_then(Value::as_str).map(str::to_owned),
                 line: raw.get("line").and_then(Value::as_u64),
-                body: raw
-                    .get("body")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| unavailable("comment has no body"))?
-                    .into(),
+                body: match raw.get("body") {
+                    Some(Value::Null) => String::new(),
+                    Some(Value::String(body)) => body.clone(),
+                    _ => return Err(unavailable("comment has no body")),
+                },
                 review,
             })
         })
@@ -603,6 +606,31 @@ pub fn parse_failed_checks(text: &str) -> Result<Vec<super::FailedCheck>, Shephe
 #[cfg(test)]
 mod comment_tests {
     use super::*;
+
+    #[test]
+    fn nullable_comment_fields_keep_the_entire_page() {
+        for review in [true, false] {
+            let comments = parse_comments(
+                include_str!("../../tests/fixtures/gh_comments_nullable.json"),
+                review,
+            )
+            .unwrap();
+            assert_eq!(comments.len(), 4);
+            assert_eq!(comments[0].author, "ghost");
+            assert_eq!(comments[0].body, "Please check the empty input");
+            assert_eq!(comments[1].author, "reviewer");
+            assert_eq!(comments[1].body, "");
+            assert_eq!(comments[2].author, "ghost");
+            assert_eq!(comments[2].body, "");
+            assert_eq!(comments[3].id, 24);
+            assert_eq!(comments[3].body, "This comment stays available");
+        }
+        let reviews = parse_reviews(
+            r#"[[{"id":25,"state":"CHANGES_REQUESTED","user":null,"body":"Check the guard"}]]"#,
+        )
+        .unwrap();
+        assert_eq!(reviews[0].author, "ghost");
+    }
 
     #[test]
     fn paginated_review_and_issue_comments_keep_context() {
