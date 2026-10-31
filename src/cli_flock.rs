@@ -251,16 +251,17 @@ pub fn spawn_task_request(
         .clone()
         .ok_or_else(|| ShepherdError::Usage("ticket has no workspace".into()))?;
     let bin = std::env::current_exe().map_err(anyhow::Error::from)?;
-    let prompt = format!(
-        "Ticket {}: {}\n{}\nAcceptance: {:?}\nTask: {task}\nStay on branch {} in worktree {}. Never switch branches or write outside it. Never read .env*, Credentials/, *.pem, *.key or other secret files. Never push, open PRs, or call GitHub. Label findings High (Blocker) | Mid | Low | Wish. Write JSON report inside the assigned worktree, run {} agent report --agent {{{{agent_name}}}} --report-file <path>, then remove the report file after success. JSON: {{\"status\":\"completed|blocked|failed\",\"summary\":\"text\",\"tests\":[],\"changed_paths\":[],\"blockers\":[],\"findings\":[],\"commit_sha\":null}}",
-        ticket.id,
-        ticket.title,
-        ticket.body,
-        ticket.acceptance,
-        ticket.branch,
-        worktree.display(),
-        bin.display()
-    );
+    let first = &resolved.runners[&role.runners[0]];
+    let harness = herdr_shepherd::harness::harness_for(&first.harness)?;
+    let prompt = herdr_shepherd::prompts::role_prompt(
+        &bin,
+        ticket,
+        &role,
+        task,
+        "{{agent_name}}",
+        harness.as_ref(),
+    )
+    .replace(harness.subagent_hint(), "{{subagent_hint}}");
     let runners = role
         .runners
         .iter()

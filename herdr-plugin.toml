@@ -36,3 +36,39 @@ command = ["bin/herdr-shepherd", "event"]
 
 [[startup]]
 command = ["bin/herdr-shepherd", "watch", "--detach"]
+
+[[actions]]
+id = "init"
+title = "Shepherd: Initialize project"
+contexts = ["workspace"]
+command = ["bin/herdr-shepherd", "init"]
+
+[[actions]]
+id = "start"
+title = "Shepherd: Start lead"
+contexts = ["workspace"]
+command = ["bin/herdr-shepherd", "start"]
+
+[[actions]]
+id = "resume"
+title = "Shepherd: Resume lead"
+contexts = ["workspace"]
+command = ["bin/herdr-shepherd", "resume"]
+
+[[actions]]
+id = "status"
+title = "Shepherd: Show ticket status"
+contexts = ["workspace"]
+command = ["bin/herdr-shepherd", "status"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["bin/herdr-shepherd", "event"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["bin/herdr-shepherd", "event"]
+
+[[events]]
+on = "pane.exited"
+command = ["bin/herdr-shepherd", "event"]

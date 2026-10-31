@@ -220,6 +220,10 @@ fn launch_reserved(
     }
     for runner in &req.runners {
         let harness = crate::harness::harness_for(&runner.harness)?;
+        record.task = req
+            .prompt
+            .replace("{{agent_name}}", &record.name)
+            .replace("{{subagent_hint}}", harness.subagent_hint());
         record.runner = runner.name.clone();
         record.status = AgentStatus::Starting;
         record.prompt_pending = true;

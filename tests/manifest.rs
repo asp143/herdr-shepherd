@@ -24,7 +24,25 @@ fn manifest_parses_and_matches_crate() {
         .iter()
         .map(|event| event["on"].as_str().unwrap())
         .collect();
-    assert_eq!(events, ["worktree.created", "worktree.removed"]);
+    assert_eq!(
+        events,
+        [
+            "worktree.created",
+            "worktree.removed",
+            "pane.agent_status_changed",
+            "pane.agent_detected",
+            "pane.exited"
+        ]
+    );
+    let actions: Vec<_> = manifest["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|action| action["id"].as_str().unwrap())
+        .collect();
+    for action in ["init", "start", "resume", "status"] {
+        assert!(actions.contains(&action), "missing {action}");
+    }
     assert_eq!(manifest["startup"].as_array().unwrap().len(), 1);
     assert_eq!(
         manifest["startup"][0]["command"],

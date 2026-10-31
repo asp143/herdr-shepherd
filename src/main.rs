@@ -37,6 +37,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Init {
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+    Start {
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+    Resume {
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+    Status {
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
     Agent {
         #[arg(long, global = true)]
         project_root: Option<PathBuf>,
@@ -201,6 +217,55 @@ fn state_dir(cli: &Cli) -> PathBuf {
 
 fn run(cli: &Cli) -> Result<(), ShepherdError> {
     match &cli.command {
+        Commands::Init { project_root } => {
+            let project = resolve_project_root(project_root.as_deref())?;
+            let report = herdr_shepherd::lead::init(&project)?;
+            output::emit(cli.json, &report, || {
+                format!(
+                    "Initialized {}\n{}",
+                    report.path.display(),
+                    report.recommendation
+                )
+            });
+        }
+        Commands::Start { project_root } | Commands::Resume { project_root } => {
+            let root = resolve_project_root(project_root.as_deref())?;
+            let state = state_dir(cli);
+            let dir = config::resolve_config_dir(cli.config_dir.as_deref());
+            let cfg = herdr_shepherd::trusted::committed_config(&dir, &root, None, &state)?;
+            let store = herdr_shepherd::store::Store::open(&state, &root)?;
+            let h = herdr_client()?;
+            let bin = std::env::current_exe().map_err(anyhow::Error::from)?;
+            let workspace = invoking_workspace()?;
+            let ctx = herdr_shepherd::lead::LeadContext {
+                bin: &bin,
+                state_dir: &state,
+                workspace_id: &workspace,
+            };
+            let report = if matches!(&cli.command, Commands::Start { .. }) {
+                herdr_shepherd::lead::start(h.as_ref(), &store, &cfg, &ctx)?
+            } else {
+                herdr_shepherd::lead::resume(h.as_ref(), &store, &cfg, &ctx)?
+            };
+            herdr_shepherd::watch::detach(&state, Some(&dir), None)?;
+            output::emit(cli.json, &report, || format!("Shepherd {}", report.name));
+        }
+        Commands::Status { project_root } => {
+            let root = resolve_project_root(project_root.as_deref())?;
+            let state = state_dir(cli);
+            let cfg = herdr_shepherd::trusted::committed_config(
+                &config::resolve_config_dir(cli.config_dir.as_deref()),
+                &root,
+                None,
+                &state,
+            )?;
+            let store = herdr_shepherd::store::Store::open(&state, &root)?;
+            let report = herdr_shepherd::lead::status(herdr_client()?.as_ref(), &store, &cfg)?;
+            output::emit(cli.json, &report, || {
+                serde_json::to_string_pretty(&report).expect("serializable")
+            });
+        }
+
         Commands::Agent {
             project_root,
             command,
@@ -609,6 +674,22 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
         }
     }
     Ok(())
+}
+
+fn invoking_workspace() -> Result<String, ShepherdError> {
+    let context = std::env::var("HERDR_PLUGIN_CONTEXT_JSON")
+        .ok()
+        .map(|text| serde_json::from_str::<serde_json::Value>(&text))
+        .transpose()
+        .map_err(|e| ShepherdError::Usage(format!("invalid plugin context: {e}")))?;
+    context
+        .as_ref()
+        .and_then(|c| c.get("workspace_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| std::env::var("HERDR_WORKSPACE_ID").ok())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ShepherdError::Usage("invoking herdr workspace is required".into()))
 }
 
 fn herdr_client() -> Result<Box<dyn Herdr>, ShepherdError> {
