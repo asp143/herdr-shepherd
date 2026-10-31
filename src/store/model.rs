@@ -60,6 +60,8 @@ pub struct Ticket {
     pub findings: Vec<Finding>,
     pub pr_number: Option<u64>,
     #[serde(default)]
+    pub qa_commit_sha: Option<String>,
+    #[serde(default)]
     pub ci_failure_task: Option<String>,
     #[serde(default)]
     pub ci_none_since: Option<String>,

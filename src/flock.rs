@@ -54,6 +54,11 @@ pub fn store_report(
             if rec.role == "researcher" {
                 ticket.research.push(report.summary.clone());
             }
+            if rec.role == "qa" {
+                ticket.qa_commit_sha = (report.status == "completed")
+                    .then(|| report.commit_sha.clone())
+                    .flatten();
+            }
         }
         Ok(rec)
     })
@@ -691,6 +696,26 @@ mod tests {
         assert_eq!(data.agents[0].status, crate::store::AgentStatus::Working);
         assert_eq!(data.agents[0].pane_id.as_deref(), Some("recovered-pane"));
     }
+    #[test]
+    fn completed_qa_records_tested_commit_for_pr_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("state"), dir.path()).unwrap();
+        let rec = stored_agent(&store);
+        store
+            .update(|data| {
+                data.agents[0].role = "qa".into();
+                Ok(())
+            })
+            .unwrap();
+        let sha = "a".repeat(40);
+        let report = serde_json::json!({"status":"completed","summary":"QA passed","tests":["cargo test"],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":sha}).to_string();
+        store_report(&store, &rec.name, &report).unwrap();
+        assert_eq!(
+            store.read().unwrap().tickets[0].qa_commit_sha.as_deref(),
+            Some(sha.as_str())
+        );
+    }
+
     #[test]
     fn report_stores_findings() {
         let dir = tempfile::tempdir().unwrap();

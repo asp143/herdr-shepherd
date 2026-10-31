@@ -150,12 +150,25 @@ pub fn open(
             }
             return Ok((t.clone(), false));
         }
+        let tested_sha = t.qa_commit_sha.as_deref().ok_or_else(|| {
+            ShepherdError::Usage(
+                "completed QA must report its commit SHA before opening a PR".into(),
+            )
+        })?;
+        let head = crate::gate::transport::PushTransport::open(&gate.state_dir, &gate.worktree)?
+            .verified_ticket_head(&t.branch)?;
+        if head != tested_sha {
+            return Err(ShepherdError::Conflict {
+                unit: 0,
+                range: "ticket HEAD differs from the QA-tested commit".into(),
+            });
+        }
         let reviewers = reviewers(gh, gate, &t.base)?;
         let existing = gh.view(&gate.worktree, &t.branch)?;
         if let Some(status) = &existing {
             validate_status(t, status)?;
         }
-        gh.push(gate)?;
+        gh.push_expected(gate, tested_sha)?;
         let status = match existing {
             Some(status) => status,
             None => gh.create(gate, &t.base, &title, &body)?,
@@ -879,6 +892,64 @@ mod tests {
     }
 
     #[test]
+    fn initial_and_ci_fix_push_reject_head_after_qa() {
+        for existing_pr in [None, Some(7)] {
+            let (dir, store) = ready_fixture();
+            let tested = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            let tested = String::from_utf8(tested.stdout).unwrap().trim().to_owned();
+            store
+                .update(|data| {
+                    data.tickets[0].qa_commit_sha = Some(tested);
+                    data.tickets[0].pr_number = existing_pr;
+                    Ok(())
+                })
+                .unwrap();
+            let result = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "untested change",
+                ])
+                .output()
+                .unwrap();
+            assert!(result.status.success());
+            let gh = FakeBackend::new(vec![Ok(Some(pr_status()))]);
+            let cfg = crate::config::load(&dir.path().join("cfg"), None).unwrap();
+            let result = open(
+                &store,
+                &gh,
+                &gate(dir.path()),
+                &cfg,
+                "T-1",
+                "Fix boundary",
+                &["Check input".into()],
+                &["cargo test".into()],
+                "2",
+            );
+            assert_eq!(result.unwrap_err().code(), "conflict");
+            assert!(gh.calls.borrow().is_empty());
+            assert_eq!(
+                store.read().unwrap().tickets[0].state,
+                TicketState::ReadyForPr
+            );
+        }
+    }
+
+    #[test]
     fn pr_sets_reviewers_from_codeowners() {
         let (dir, store) = fixture(TicketState::ReadyForPr);
         let git_cmd = |args: &[&str]| {
@@ -980,8 +1051,15 @@ mod tests {
             .args(["rev-parse", "main"])
             .output()
             .unwrap();
+        let head = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
         store
             .update(|data| {
+                data.tickets[0].qa_commit_sha =
+                    Some(String::from_utf8_lossy(&head.stdout).trim().into());
                 data.trust = Some(crate::store::ProjectTrust {
                     project_root: dir.into(),
                     common_git_dir: dir.join(".git"),
@@ -1077,6 +1155,9 @@ mod tests {
         }
         fn push(&self, g: &Gate) -> Result<(), ShepherdError> {
             self.gh.push(g)
+        }
+        fn push_expected(&self, g: &Gate, sha: &str) -> Result<(), ShepherdError> {
+            self.gh.push_expected(g, sha)
         }
         fn create(
             &self,

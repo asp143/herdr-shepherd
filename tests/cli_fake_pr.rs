@@ -61,6 +61,7 @@ fn fake_backend_pushes_local_branch_and_opens_pr() {
                 id: "S1".into(),
                 title: "Fix boundary".into(),
                 state: TicketState::ReadyForPr,
+                qa_commit_sha: Some(head.clone()),
                 branch: "feat/smoke".into(),
                 base: "main".into(),
                 worktree: Some(root.clone()),
