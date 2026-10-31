@@ -95,6 +95,34 @@ impl PrBackend for FakeBackend {
         Ok(())
     }
 
+    fn reply_id(
+        &self,
+        gate: &Gate,
+        number: u64,
+        comment_id: Option<u64>,
+        body: &str,
+    ) -> Result<Option<u64>, ShepherdError> {
+        self.reply(gate, number, comment_id, body)?;
+        let id = self
+            .comments
+            .borrow()
+            .iter()
+            .map(|comment| comment.id)
+            .max()
+            .unwrap_or(0)
+            .max(1_000_000)
+            + 1;
+        self.comments.borrow_mut().push(PrComment {
+            id,
+            author: self.author.borrow().clone(),
+            path: None,
+            line: None,
+            body: body.into(),
+            review: comment_id.is_some(),
+        });
+        Ok(Some(id))
+    }
+
     fn reply(
         &self,
         _: &Gate,
@@ -211,6 +239,41 @@ impl PrBackend for DiskBackend {
     ) -> Result<(), ShepherdError> {
         self.call(format!("reviewers {number} {reviewers:?}"), |_| Ok(()))
     }
+    fn reply_id(
+        &self,
+        gate: &Gate,
+        number: u64,
+        comment_id: Option<u64>,
+        body: &str,
+    ) -> Result<Option<u64>, ShepherdError> {
+        self.reply(gate, number, comment_id, body)?;
+        let mut state: DiskState =
+            serde_json::from_slice(&std::fs::read(&self.path).map_err(anyhow::Error::from)?)
+                .map_err(anyhow::Error::from)?;
+        let id = state
+            .comments
+            .iter()
+            .map(|comment| comment.id)
+            .max()
+            .unwrap_or(0)
+            .max(1_000_000)
+            + 1;
+        state.comments.push(PrComment {
+            id,
+            author: state.author.clone(),
+            path: None,
+            line: None,
+            body: body.into(),
+            review: comment_id.is_some(),
+        });
+        std::fs::write(
+            &self.path,
+            serde_json::to_vec_pretty(&state).map_err(anyhow::Error::from)?,
+        )
+        .map_err(anyhow::Error::from)?;
+        Ok(Some(id))
+    }
+
     fn reply(
         &self,
         _: &Gate,

@@ -107,6 +107,18 @@ pub trait PrBackend {
         number: u64,
         reviewers: &[String],
     ) -> Result<(), ShepherdError>;
+    /// Return the REST id when the backend can identify the created comment.
+    fn reply_id(
+        &self,
+        gate: &Gate,
+        number: u64,
+        comment_id: Option<u64>,
+        body: &str,
+    ) -> Result<Option<u64>, ShepherdError> {
+        self.reply(gate, number, comment_id, body)?;
+        Ok(None)
+    }
+
     fn reply(
         &self,
         gate: &Gate,

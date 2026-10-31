@@ -183,6 +183,38 @@ impl PrBackend for GhBackend {
         comment_id: Option<u64>,
         body: &str,
     ) -> Result<(), ShepherdError> {
+        self.submit_reply(gate, number, comment_id, body)
+            .map(|_| ())
+    }
+
+    fn reply_id(
+        &self,
+        gate: &Gate,
+        number: u64,
+        comment_id: Option<u64>,
+        body: &str,
+    ) -> Result<Option<u64>, ShepherdError> {
+        let output = self.submit_reply(gate, number, comment_id, body)?;
+        Ok(serde_json::from_str::<Value>(&output)
+            .ok()
+            .and_then(|raw| raw.get("id")?.as_u64())
+            .or_else(|| {
+                output
+                    .trim()
+                    .rsplit_once("#issuecomment-")
+                    .and_then(|(_, id)| id.parse().ok())
+            }))
+    }
+}
+
+impl GhBackend {
+    fn submit_reply(
+        &self,
+        gate: &Gate,
+        number: u64,
+        comment_id: Option<u64>,
+        body: &str,
+    ) -> Result<String, ShepherdError> {
         if let Some(id) = comment_id {
             let repository = gate.github_repository()?;
             let path = format!("repos/{repository}/pulls/{number}/comments/{id}/replies");
@@ -190,14 +222,12 @@ impl PrBackend for GhBackend {
                 &["api", "-X", "POST", &path, "-f", &format!("body={body}")],
                 &gate.worktree,
             )
-            .map(|_| ())
         } else {
             gate.gh_with_input(
                 &["pr", "comment", &number.to_string(), "--body-file", "-"],
                 &gate.worktree,
                 body.as_bytes(),
             )
-            .map(|_| ())
         }
     }
 }

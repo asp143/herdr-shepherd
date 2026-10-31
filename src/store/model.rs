@@ -61,6 +61,8 @@ pub struct Ticket {
     pub pr_number: Option<u64>,
     #[serde(default)]
     pub pr_reviewers_pending: Vec<String>,
+    #[serde(default)]
+    pub posted_replies: Vec<PostedReply>,
     pub children: Vec<ChildWorktree>,
     #[serde(default)]
     pub integration_ranges: Vec<String>,
@@ -77,6 +79,14 @@ pub struct Ticket {
     pub revision_run: Option<crate::ticket::revise::RevisionRun>,
     #[serde(default)]
     pub protection_warnings: Vec<crate::github::protection::ProtectionWarning>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PostedReply {
+    pub id: Option<u64>,
+    pub author: String,
+    pub body: String,
+    pub review: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

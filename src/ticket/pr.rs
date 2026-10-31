@@ -305,9 +305,12 @@ pub fn comments(
     id: &str,
     new_only: bool,
 ) -> Result<Vec<ListedComment>, ShepherdError> {
+    let _dispatch = super::revise::dispatch_lock(store, id)?;
     let snapshot = store.read()?;
     let t = ticket(&snapshot, id)?;
-    let number = require_pr(t)?;
+    let number = t
+        .pr_number
+        .ok_or_else(|| ShepherdError::Usage("ticket has no PR number".into()))?;
     let worktree = t
         .worktree
         .as_deref()
@@ -320,6 +323,12 @@ pub fn comments(
             .find(|t| t.id == id)
             .expect("validated ticket");
         for c in fresh {
+            if t.posted_replies.iter().any(|posted| {
+                (posted.review == c.review && posted.id == Some(c.id))
+                    || (posted.author.eq_ignore_ascii_case(&c.author) && posted.body == c.body)
+            }) {
+                continue;
+            }
             if !t
                 .comments
                 .iter()
@@ -370,12 +379,20 @@ pub fn reply(
             return Err(ShepherdError::Usage("comment already triaged".into()));
         }
         authorize(t, gate)?;
-        gh.reply(gate, number, t.comments[index].review.then_some(cid), body)?;
+        let author = gh.author(&gate.worktree)?;
+        let reply_id = gh.reply_id(gate, number, t.comments[index].review.then_some(cid), body)?;
+        let posted = crate::store::PostedReply {
+            id: reply_id,
+            author,
+            body: body.into(),
+            review: t.comments[index].review,
+        };
         let t = data
             .tickets
             .iter_mut()
             .find(|t| t.id == id)
             .expect("validated ticket");
+        t.posted_replies.push(posted);
         t.comments[index].triaged = true;
         t.comments[index].verdict = Some("declined".into());
         Ok::<_, ShepherdError>(t.clone())
@@ -388,6 +405,7 @@ pub fn reply(
             .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
         let index = selected(t, cid)?;
         t.comments[index] = updated.comments[index].clone();
+        t.posted_replies = updated.posted_replies.clone();
         Ok(t.clone())
     })
 }
@@ -470,12 +488,20 @@ pub fn ack(
             ));
         }
         authorize(t, gate)?;
-        gh.reply(gate, number, c.review.then_some(cid), body)?;
+        let author = gh.author(&gate.worktree)?;
+        let reply_id = gh.reply_id(gate, number, c.review.then_some(cid), body)?;
+        let posted = crate::store::PostedReply {
+            id: reply_id,
+            author,
+            body: body.into(),
+            review: c.review,
+        };
         let t = data
             .tickets
             .iter_mut()
             .find(|t| t.id == id)
             .expect("validated ticket");
+        t.posted_replies.push(posted);
         t.comments[index].acknowledged = true;
         Ok::<_, ShepherdError>(t.clone())
     })()?;
@@ -487,6 +513,7 @@ pub fn ack(
             .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
         let index = selected(t, cid)?;
         t.comments[index] = updated.comments[index].clone();
+        t.posted_replies = updated.posted_replies.clone();
         Ok(t.clone())
     })
 }
@@ -679,6 +706,74 @@ mod tests {
     }
 
     #[test]
+    fn own_replies_and_acks_are_not_ingested() {
+        for acknowledge in [false, true] {
+            let (dir, store) = fixture(TicketState::PrOpen);
+            let body = "The boundary is already checked; see parser.rs:12 abc123.";
+            store
+                .update(|data| {
+                    let ticket = &mut data.tickets[0];
+                    ticket.branch = "feat/t-1".into();
+                    ticket.worktree = Some(dir.path().into());
+                    let mut comment = comment(1);
+                    if acknowledge {
+                        comment.triaged = true;
+                        comment.verdict = Some("accepted".into());
+                        comment.ack_sha = Some("abc123".into());
+                    }
+                    ticket.comments.push(comment);
+                    Ok(())
+                })
+                .unwrap();
+            let gh = FakeBackend::new(vec![]);
+            if acknowledge {
+                ack(&store, &gh, &gate(dir.path()), "T-1", 1, body).unwrap();
+            } else {
+                reply(&store, &gh, &gate(dir.path()), "T-1", 1, body).unwrap();
+            }
+            let saved = store.read().unwrap();
+            assert!(saved.tickets[0].posted_replies[0].id.is_some());
+            gh.comments.borrow_mut()[0].author = "different-author".into();
+            gh.comments.borrow_mut()[0].body = "Edited after posting".into();
+            gh.comments.borrow_mut().extend([
+                crate::github::PrComment {
+                    id: 500,
+                    author: "fixture-author".into(),
+                    body: body.into(),
+                    path: None,
+                    line: None,
+                    review: true,
+                },
+                crate::github::PrComment {
+                    id: 501,
+                    author: "reviewer".into(),
+                    body: body.into(),
+                    path: None,
+                    line: None,
+                    review: true,
+                },
+                crate::github::PrComment {
+                    id: 502,
+                    author: "fixture-author".into(),
+                    body: "A separate concern".into(),
+                    path: None,
+                    line: None,
+                    review: true,
+                },
+            ]);
+            let new = comments(&store, &gh, "T-1", true).unwrap();
+            assert_eq!(
+                new.iter()
+                    .map(|comment| comment.comment.id)
+                    .collect::<Vec<_>>(),
+                [501, 502]
+            );
+            let saved = store.read().unwrap();
+            assert_eq!(saved.tickets[0].comments.len(), 3);
+        }
+    }
+
+    #[test]
     fn reply_declines_once_and_ack_requires_pushed_sha() {
         let (dir, store) = fixture(TicketState::PrOpen);
         store
@@ -725,7 +820,14 @@ mod tests {
         .unwrap();
         assert!(t.comments[1].acknowledged);
         assert!(ack(&store, &gh, &gate, "T-1", 2, "Fixed in abc123").is_err());
-        assert_eq!(gh.calls.borrow().len(), 2);
+        assert_eq!(
+            gh.calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("reply "))
+                .count(),
+            2
+        );
     }
 
     #[test]
