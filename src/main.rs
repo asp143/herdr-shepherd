@@ -98,6 +98,28 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
+    /// Inspect tickets for the invoking project.
+    Ticket {
+        #[arg(long, global = true)]
+        project_root: Option<PathBuf>,
+        #[command(subcommand)]
+        command: TicketCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum TicketCommands {
+    List,
+    Show { id: String },
+    Fetch { id: String },
+}
+
+#[derive(serde::Serialize)]
+struct ValidatedConfig {
+    #[serde(flatten)]
+    config: config::Config,
+    #[serde(flatten)]
+    resolved: herdr_shepherd::roles::Resolved,
 }
 
 #[derive(Subcommand)]
@@ -247,6 +269,48 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 return Err(error);
             }
         }
+        Commands::Ticket {
+            project_root,
+            command,
+        } => {
+            let project = resolve_project_root(project_root.as_deref())?;
+            let read_store = || {
+                let state_dir = cli.state_dir.as_deref().ok_or_else(|| {
+                    ShepherdError::Usage("--state-dir or HERDR_PLUGIN_STATE_DIR is required".into())
+                })?;
+                herdr_shepherd::store::Store::open(state_dir, &project)?.read()
+            };
+            match command {
+                TicketCommands::List => {
+                    let data = read_store()?;
+                    output::emit(cli.json, &data.tickets, || {
+                        serde_json::to_string_pretty(&data.tickets)
+                            .expect("tickets are serializable")
+                    });
+                }
+                TicketCommands::Show { id } => {
+                    let data = read_store()?;
+                    let ticket = data
+                        .tickets
+                        .iter()
+                        .find(|t| t.id == *id)
+                        .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
+                    output::emit(cli.json, ticket, || {
+                        serde_json::to_string_pretty(ticket).expect("ticket is serializable")
+                    });
+                }
+                TicketCommands::Fetch { id } => {
+                    let cfg = config::load(
+                        &config::resolve_config_dir(cli.config_dir.as_deref()),
+                        Some(&project),
+                    )?;
+                    let ticket = herdr_shepherd::ticket::source::fetch(&cfg, id)?;
+                    output::emit(cli.json, &ticket, || {
+                        serde_json::to_string_pretty(&ticket).expect("ticket is serializable")
+                    });
+                }
+            }
+        }
         Commands::Version => {
             let version = env!("CARGO_PKG_VERSION");
             output::emit(cli.json, &serde_json::json!({ "version": version }), || {
@@ -259,8 +323,12 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 &config::resolve_config_dir(cli.config_dir.as_deref()),
                 Some(&current),
             )?;
-            output::emit(cli.json, &cfg, || {
-                serde_json::to_string_pretty(&cfg).expect("config is serializable")
+            let validated = ValidatedConfig {
+                resolved: herdr_shepherd::roles::resolve(&cfg)?,
+                config: cfg,
+            };
+            output::emit(cli.json, &validated, || {
+                serde_json::to_string_pretty(&validated).expect("config is serializable")
             });
         }
         Commands::Keys { herdr_config } => {

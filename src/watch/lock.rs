@@ -1,11 +1,8 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::ErrorKind,
     os::unix::fs::OpenOptionsExt,
     path::Path,
 };
-
-use fs2::FileExt;
 
 use crate::error::ShepherdError;
 
@@ -30,9 +27,9 @@ pub(super) fn acquire_named(
         .mode(0o600)
         .open(state_dir.join(name))
         .map_err(anyhow::Error::from)?;
-    match file.try_lock_exclusive() {
+    match file.try_lock() {
         Ok(()) => Ok(Some(LockGuard { _file: file })),
-        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(None),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(error) => Err(anyhow::Error::from(error).into()),
     }
 }

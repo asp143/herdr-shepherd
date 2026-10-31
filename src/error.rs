@@ -8,6 +8,8 @@ pub enum ShepherdError {
     GithubUnavailable(String),
     Runtime(anyhow::Error),
     PolicyDenied(String),
+    Attribution,
+    NoTicketSource,
 }
 
 impl ShepherdError {
@@ -19,6 +21,8 @@ impl ShepherdError {
             Self::GithubUnavailable(_) => "github_unavailable",
             Self::Runtime(_) => "runtime",
             Self::PolicyDenied(_) => "policy_denied",
+            Self::Attribution => "attribution",
+            Self::NoTicketSource => "no_ticket_source",
         }
     }
 
@@ -28,6 +32,7 @@ impl ShepherdError {
             Self::HerdrUnavailable(_) => 3,
             Self::Runtime(_) | Self::GithubUnavailable(_) => 1,
             Self::PolicyDenied(_) => 4,
+            Self::Attribution | Self::NoTicketSource => 2,
         }
     }
 }
@@ -41,6 +46,10 @@ impl fmt::Display for ShepherdError {
             | Self::PolicyDenied(message) => f.write_str(message),
             Self::Config { path, message } => write!(f, "{}: {message}", path.display()),
             Self::Runtime(error) => write!(f, "{error:#}"),
+            Self::Attribution => f.write_str("human-facing text contains AI attribution"),
+            Self::NoTicketSource => {
+                f.write_str("no ticket source configured; paste the ticket text")
+            }
         }
     }
 }

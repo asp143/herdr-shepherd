@@ -1,10 +1,10 @@
 # herdr-shepherd
 
-Shepherd is a herdr plugin intended to take a ticket through planning, parallel coding, review, QA, and a pull request, then handle feedback and cleanup after the user merges. Phase 2 adds gated GitHub operations, credential-stripped agent environments, worktree push guards, PR sidebar status, verified cleanup, and lifecycle hooks. Ticket orchestration and automatic PR revision loops belong to later phases.
+Shepherd is a herdr plugin intended to take a ticket through planning, parallel coding, review, QA, and a pull request, then handle feedback and cleanup after the user merges. Phase 2 adds gated GitHub operations, credential-stripped agent environments, worktree push guards, PR sidebar status, verified cleanup, and lifecycle hooks. The core supplies ticket storage, state transitions, role and supervision settings, PR text helpers, and ticket fetching. Agent orchestration and automatic PR revision loops belong to later phases.
 
 ## Install
 
-Requires Rust, herdr 0.9.5 or newer, and Git. `gh` supplies GitHub PR operations and `du` supplies optional sizes. Detached watching uses `setsid`. Linux is tested; the plugin also declares macOS support.
+Requires Rust 1.89 or newer, herdr 0.9.5 or newer, and Git. `gh` supplies GitHub PR operations and `du` supplies optional sizes. Detached watching uses `setsid`. Linux is tested; the plugin also declares macOS support.
 
 From this checkout:
 
@@ -36,7 +36,37 @@ The binary is `bin/herdr-shepherd`. Add that directory to your PATH to use the s
 | `cleanup --worktree PATH [--dry-run] [--force-discard]` | Remove an owned, verified merged ticket workspace. |
 | `hooks emit EVENT --json-file FILE` | Emit a configured lifecycle event with a JSON payload. |
 
-Global options are `--json`, `--config-dir PATH`, and `--state-dir PATH`. Ticket state arrives in Phase 3; the watcher persists only its own reported token state.
+| `ticket list [--project-root PATH]` | List tickets in the invoking project's store. |
+| `ticket show <id> [--project-root PATH]` | Show a stored ticket and its history. |
+| `ticket fetch <id> [--project-root PATH]` | Fetch ticket JSON from the configured source without storing it. |
+
+Global options are `--json`, `--config-dir PATH`, and `--state-dir PATH`.
+Ticket inspection requires `--state-dir` or `HERDR_PLUGIN_STATE_DIR`. State lives
+in `projects/<sha256 of canonical project path>/state.json`, with a per-project
+lock covering each update and a synced atomic replacement. Ticket inspection
+does not change stored ticket data. Reads use shared locks; opening and reading
+a missing store returns empty data without creating its state directory.
+Writers create the directory on the first update. Corrupt-file errors name
+`state.json` and recommend preserving it and restoring a known-good backup.
+
+The library's ticket state machine includes `ci_wait`, which consumes a ticket
+slot. Review, QA, and red CI bounces share a revision counter; exceeding the cap
+blocks the ticket with `loop_cap`. `transition` uses the default cap of three;
+`transition_with_limit` accepts the project's resolved cap. Blocked tickets may
+resume only their recorded prior state, or be cancelled.
+PR-ready, open-PR, and merged tickets can also block for escalation or cleanup
+failure. Blocked tickets can fail; resuming a loop-cap block grants a fresh set
+of revision rounds.
+
+`ticket::pr_body` builds PR titles and the ordered Summary, Changes, Testing,
+optional Not addressed, and optional Ticket sections. The Ticket link uses
+`Ticket.url`; callers remove resolved findings before building, since remaining
+Mid/Low findings are treated as unaddressed. `check_attribution` rejects the
+specified attribution phrases with `attribution` (exit 2) while allowing
+technical references such as "Claude Code hook fix". Future GitHub writers must
+call that check before sending human-facing text.
+Attribution matching accepts Unicode whitespace between words, including NBSP
+and repeated spaces.
 
 Regroup preserves user labels such as `fix/foo`, skips children whose parent workspace is absent, and is idempotent. Nested generated prefixes are stripped in one run so another invocation does not rename again. Explicit `regroup` always runs; `[upkeep] regroup` controls automatic event handling.
 
@@ -51,6 +81,47 @@ Global settings come from `shepherd.toml` inside the first available location:
 3. `~/.config/herdr/plugins/config/herdr-shepherd`
 
 A project `.shepherd.toml` at the Git root replaces the global settings in full, except `[upkeep]`, which always comes from the global file. A project `[upkeep]` is ignored with a warning. Missing files use defaults; malformed files and unsupported schema versions are errors. Unknown sections are preserved for later phases.
+
+`validate-config` also resolves `[shepherd]`, `[roles.*]`, `[runners.*]`, and
+`[supervision]` from the selected file. Its existing output fields are retained,
+with `shepherd`, `roles`, `runners`, and `supervision` added alongside them.
+Defaults include planner, researcher, coder, reviewer, and QA roles, with the
+`codex-sol-high`, `omp-astra`, and `omp-glm-infra` runner catalog. Named role and
+runner entries override built-in fields; new roles default to the ticket
+worktree and `codex-sol-high`. No fields are merged between config files.
+Configured roles and runners retain file order, followed by unspecified
+built-ins in catalog order. The library uses `IndexMap<String, Runner>` for
+`Resolved.runners`. Unknown fields within orchestration sections and rules are
+configuration errors; each role must have at least one runner.
+
+Shepherd defaults are two concurrent tickets, six parallel agents, three
+revision rounds, and PR polling every 180 seconds. Supervision defaults are a
+30-second sweep, 120-second report grace, 20-minute stall threshold, and
+15-minute escalation threshold. User regex rules run before built-in
+`codex-trust`, `press-enter`, and `codex-update-notice` rules. Rule keys are
+limited to `enter`, `esc`, `y`, `n`, `1` through `9`, `down`, and `up`. This core
+resolves supervision configuration; executing those rules is a later module.
+Rules require a nonempty pattern and keys, unique names (including built-ins),
+and either no harness filter or one of `codex`, `omp`, `claude`, and `pi`.
+
+An optional ticket source is an argv array in the selected configuration:
+
+```toml
+[ticket_source]
+command = ["your-ticket-command", "--json"]
+```
+
+`ticket fetch <id>` appends the ID as one literal argument and allows 30 seconds
+for execution and stdout capture. The command must print JSON with string
+`id`, `title`, and `description` fields, an `acceptance_criteria` string array,
+and optional `url`. The returned ID must match the request, and the title must
+not be blank. Missing or empty configuration returns `no_ticket_source`
+(exit 2); paste the ticket text instead. Invalid JSON, invalid ticket content,
+execution failures, and timeouts are runtime errors (exit 1). Timeout errors
+and nonzero exit statuses have distinct messages. Sources run in an owned
+process group; timeouts kill the group, including descendants retaining
+stdout. Fetching requires no state directory and does not add a ticket to the
+store.
 
 Example global settings:
 
@@ -69,7 +140,7 @@ token_prefix = "shepherd_"
 
 All booleans default to `true`. `pr_status`, `notifications`, and `token_prefix` control the watcher. `model_badge` is reserved for agent orchestration. Unknown upkeep fields are errors, and the global schema version is validated even when a project config replaces it. Set `regroup = false` to disable auto-regroup, or `keybindings = false` to emit no key suggestions.
 
-Herdr access uses `HERDR_BIN_PATH` or `herdr` on PATH, and `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`. Event dispatch reads `HERDR_PLUGIN_EVENT` and `HERDR_PLUGIN_EVENT_JSON`. Config validation uses `HERDR_PLUGIN_CONTEXT_JSON` to find the invoking checkout, falling back to the current directory's Git root; `--project-root` overrides both. `--state-dir` takes precedence over `HERDR_PLUGIN_STATE_DIR`; Watcher state and locks, hook scripts, and agent shim files live in that state directory (fallback `~/.local/state/herdr/plugins/herdr-shepherd`). Concurrent automatic regroup events share an exclusive state-directory lock.
+Herdr access uses `HERDR_BIN_PATH` or `herdr` on PATH, and `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`. Event dispatch reads `HERDR_PLUGIN_EVENT` and `HERDR_PLUGIN_EVENT_JSON`. Config validation and ticket commands use `HERDR_PLUGIN_CONTEXT_JSON` to find the invoking checkout, falling back to the current directory's Git root; `--project-root` overrides both. `--state-dir` takes precedence over `HERDR_PLUGIN_STATE_DIR`; Watcher state and locks, hook scripts, and agent shim files live in that state directory (fallback `~/.local/state/herdr/plugins/herdr-shepherd`). Concurrent automatic regroup events share an exclusive state-directory lock.
 
 ## JSON interface
 
@@ -90,6 +161,8 @@ Errors use the same versioned envelope:
 | 0 | Success | — |
 | 1 | Runtime or GitHub failure | `runtime` or `github_unavailable` |
 | 2 | Usage or configuration error | `usage` or `config_invalid` |
+| 2 | Rejected human-facing attribution | `attribution` |
+| 2 | Ticket source is not configured | `no_ticket_source` |
 | 3 | Required herdr CLI or server unavailable | `herdr_unavailable` |
 | 4 | Safety policy refusal | `policy_denied` |
 

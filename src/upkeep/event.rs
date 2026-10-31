@@ -64,7 +64,7 @@ pub fn handle_event_in_state(
         .truncate(false)
         .open(state_dir.join("regroup.lock"))
         .map_err(anyhow::Error::from)?;
-    fs2::FileExt::lock_exclusive(&lock).map_err(anyhow::Error::from)?;
+    lock.lock().map_err(anyhow::Error::from)?;
     handle_event_inner(name, payload, cfg, h)
 }
 
