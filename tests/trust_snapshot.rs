@@ -294,3 +294,21 @@ fn snapshot_inside_project_state_never_loads_repository_includes() {
         "trunk"
     );
 }
+
+#[test]
+fn trust_probe_uses_explicit_repository() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = Repo::new();
+    repo.git(&["branch", "stable"]);
+    repo.git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/fixture/project.git",
+    ]);
+    let gh = repo._dir.path().join("gh");
+    fs::write(&gh, "#!/bin/sh\n[ \"$1\" = repo ] && [ \"$2\" = view ] && [ \"$3\" = https://github.com/fixture/project.git ] || exit 2\nprintf '%s\\n' '{\"defaultBranchRef\":{\"name\":\"stable\"}}'\n").unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+    let branch = trusted::default_branch_using(&repo.root, &repo.state, &gh).unwrap();
+    assert_eq!(branch.as_deref(), Some("stable"));
+}

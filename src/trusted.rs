@@ -422,14 +422,7 @@ fn capture(
                 .current_dir(store.root())
                 .env_remove("GH_REPO")
                 .env_remove("GH_HOST")
-                .args([
-                    "repo",
-                    "view",
-                    "--repo",
-                    &origin_url,
-                    "--json",
-                    "defaultBranchRef",
-                ]),
+                .args(["repo", "view", &origin_url, "--json", "defaultBranchRef"]),
             Duration::from_secs(20),
             None,
         );
