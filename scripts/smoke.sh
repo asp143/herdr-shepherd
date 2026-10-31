@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Manual only: real default-profile agents, isolated Herdr, no GitHub or push.
+# Manual only: real default profiles, isolated Herdr, fake GitHub, local pushes.
 # Usage: scripts/smoke.sh [--prebuilt] [--timeout-seconds 1200]
 set -euo pipefail
 script_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -7,8 +7,8 @@ if [[ "$PWD" != "$script_root" ]]; then
   printf 'Run this script from its worktree root: %s\n' "$script_root" >&2
   exit 2
 fi
-if [[ "$(git branch --show-current)" != feat/shepherd-phase3 ]]; then
-  printf 'The smoke must run on feat/shepherd-phase3.\n' >&2
+if [[ "$(git branch --show-current)" != feat/shepherd-phase4 ]]; then
+  printf 'The smoke must run on feat/shepherd-phase4.\n' >&2
   exit 2
 fi
 if [[ "${HERDR_ENV:-}" != 1 ]]; then
@@ -29,10 +29,13 @@ for required in herdr git python3 codex omp fuser; do
   command -v "$required" >/dev/null || { printf 'Missing executable: %s\n' "$required" >&2; exit 1; }
 done
 if (( ! prebuilt )); then
-  sh scripts/build.sh
+  cargo build --locked
+  mkdir -p bin
+  cp target/debug/herdr-shepherd bin/herdr-shepherd
 fi
 [[ -x bin/herdr-shepherd ]] || { printf 'Build bin/herdr-shepherd first.\n' >&2; exit 1; }
 exec python3 - "$script_root" "$timeout_seconds" <<'PY'
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -57,6 +60,7 @@ binary = worktree / "bin/herdr-shepherd"
 session = "smoke-" + root.name.rsplit("-", 1)[-1]
 state = root / "state/herdr/plugins/herdr-shepherd"
 plugin_config = root / "config/herdr/plugins/config/herdr-shepherd"
+fake = root / "fake-github"
 server = None
 sock = None
 owned_ids = set()
@@ -64,7 +68,7 @@ closed_ids = set()
 last_status = {}
 result = {"scratch": str(root), "session": session, "ok": False,
           "cleanup_errors": [], "observed_states": [], "pane_evidence": {},
-          "roles": [], "origin_unchanged": False}
+          "roles": [], "origin_unchanged": False, "pr_loop": {}}
 print(f"Smoke evidence: {root}", flush=True)
 def interrupted(signum, _frame):
     raise InterruptedError(f"Smoke interrupted by signal {signum}")
@@ -81,7 +85,9 @@ env.update({"XDG_CONFIG_HOME": str(root / "config"),
             "XDG_CACHE_HOME": str(root / "cache"),
             "HERDR_CONFIG_PATH": str(root / "config/herdr/config.toml"),
             "HERDR_STARTUP_CWD": str(repo), "SHELL": "/bin/sh",
-            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"})
+            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+            "SHEPHERD_FAKE_GITHUB": str(fake),
+            "SHEPHERD_TEST_ALLOW_LOCAL_ORIGIN": "allow-local-in-tmp"})
 # HOME and native harness authentication are retained; no credentials are read
 # or copied by this script. Agent runtime files follow each harness's defaults.
 
@@ -144,6 +150,38 @@ def shepherd(*args):
     if not value.get("ok"):
         raise RuntimeError(str(value.get("error")))
     return value["data"]
+
+def edit_fake(change):
+    with (fake / "github.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = fake / "github.json"
+        value = json.loads(path.read_text())
+        change(value)
+        pending = fake / "github.new"
+        pending.write_text(json.dumps(value) + "\n")
+        pending.replace(path)
+
+def fake_state():
+    with (fake / "github.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        return json.loads((fake / "github.json").read_text())
+
+def wait_ticket(predicate, label):
+    while time.monotonic() < deadline:
+        data = status()
+        remember_panes(data)
+        ticket = next((t for t in data.get("tickets", []) if t["id"] == "SMOKE-1"), None)
+        if ticket:
+            observed = ticket["state"]
+            if not result["observed_states"] or result["observed_states"][-1] != observed:
+                result["observed_states"].append(observed)
+                print(f"SMOKE-1: {observed} ({label})", flush=True)
+            if predicate(ticket):
+                return ticket, data
+            if observed in ("blocked", "failed", "closed"):
+                raise RuntimeError(f"SMOKE-1 {label}: {observed}: {ticket.get('blocked_reason')}")
+        time.sleep(2)
+    raise RuntimeError(f"SMOKE-1 timed out: {label}")
 
 def status():
     global last_status
@@ -210,6 +248,11 @@ def cleanup():
             status()
         except Exception as error:
             result["cleanup_errors"].append(f"Final status: {error}")
+        # Stop owned pollers before teardown can race their cleanup checks.
+        try:
+            stop_watchers()
+        except Exception as error:
+            result["cleanup_errors"].append(f"Stop scratch watcher: {error}")
         # This entire named server was created here. Discover only its resources.
         try:
             snapshot = h("api", "snapshot").get("snapshot", {})
@@ -269,8 +312,10 @@ def cleanup():
             after = git("ls-remote", "origin")
             result["origin_after"] = after
             result["origin_unchanged"] = after == result.get("origin_before")
-            if not result["origin_unchanged"]:
-                result["cleanup_errors"].append("Local origin refs changed")
+            expected_base = result.get("pr_loop", {}).get("revision_push")
+            result["origin_matches_simulated_merge"] = bool(expected_base) and git("ls-remote", "origin", "refs/heads/main").split()[0] == expected_base
+            if not result["origin_unchanged"] and not result["origin_matches_simulated_merge"]:
+                result["cleanup_errors"].append("Unexpected local origin refs")
         except Exception as error:
             result["cleanup_errors"].append(f"Check origin: {error}")
     result["owned_workspace_ids"] = sorted(owned_ids)
@@ -285,8 +330,9 @@ def cleanup():
 
 try:
     for directory in (repo, root / "runtime", root / "cache",
-                      root / "config/herdr", state, plugin_config):
+                      root / "config/herdr", state, plugin_config, fake):
         directory.mkdir(parents=True, exist_ok=True)
+    (fake / "github.json").write_text(json.dumps({"status": None, "comments": [], "author": "smoke-user", "protected": {"main": True}, "default_branch": "main", "calls": []}) + "\n")
     (root / "runtime").chmod(0o700)
     (root / "config/herdr/config.toml").write_text('''onboarding = false
 [terminal]
@@ -359,6 +405,9 @@ directory = "''' + str(root / "worktrees") + '''"
     result["invocation_pane_id"] = pane_id
     # Linking has no skip-build option; the plugin runs its normal build.
     save("plugin-link.json", h("plugin", "link", str(worktree), "--enabled", timeout=300))
+    # Plugin linking runs the release build; fake GitHub exists only in debug.
+    run(["cargo", "build", "--locked"], cwd=worktree, timeout=180)
+    shutil.copy2(worktree / "target/debug/herdr-shepherd", binary)
     shepherd("init", "--project-root", repo)
     defaults = tomllib.loads((repo / ".shepherd.toml").read_text())
     expected_codex = ["--yolo", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high"]
@@ -369,7 +418,7 @@ directory = "''' + str(root / "worktrees") + '''"
     result["runner_profiles"] = defaults["runners"]
     # Linking after server startup does not run [[startup]] retroactively.
     # Start the same public watcher explicitly, restricted to scratch state.
-    save("watch-start.json", shepherd("watch", "--detach"))
+    save("watch-start.json", shepherd("watch", "--detach", "--interval", "2"))
     assert (state / "watch.log").exists(), "Scratch watcher log is missing"
     holders = run(["fuser", state / "watch.lock"])
     assert holders.stdout.strip(), "Scratch watcher does not hold its lock"
@@ -405,7 +454,7 @@ directory = "''' + str(root / "worktrees") + '''"
         time.sleep(2)
     if lead_name is None:
         raise RuntimeError("Lead did not become ready for its tiny ticket")
-    task = '''Run ticket SMOKE-1: add hello.sh that prints exactly hello plus a newline, and test_hello.sh that checks it. This is a tiny local scratch shell project. Acceptance: sh hello.sh outputs hello; sh test_hello.sh exits 0; both files are committed on the ticket branch. Use planner, a single coder, reviewer, and QA with the configured default profiles. Research and parallel coders are unnecessary. The coder must demonstrate the missing hello check fails before implementing, then run the completed test. Drive all stages yourself using the public shepherd CLI and actual flock reports. Never edit repo code yourself. Never skip review or QA, never manually fabricate reports or edit state files. Never push, open PRs, invoke GitHub, merge, or touch projects outside this scratch root. Keep all ticket, task, and report files inside the assigned scratch checkout/worktree. Delegate the tiny work and stop at ready_for_pr after QA passes. Report status by SMOKE-1.'''
+    task = '''Run ticket SMOKE-1: add hello.sh that prints exactly hello plus a newline, and test_hello.sh that checks it. This is a tiny local scratch shell project. Acceptance: sh hello.sh outputs exactly hello plus one newline; sh test_hello.sh exits 0; both files are committed on the ticket branch. Use planner, a single coder, reviewer, and QA with the configured default profiles. Research and parallel coders are unnecessary. The coder must demonstrate the missing hello check fails before implementing, then run the completed test. Drive all stages yourself using the public shepherd CLI and actual flock reports. Never edit repo code yourself. Never skip review or QA or fabricate reports. After QA, use ticket pr with summary, changes, and testing files to open a ready-for-review PR through the fake backend. Only gated pushes to the disposable local bare remote are authorized. Never call real GitHub, merge, or touch projects outside this scratch root. Keep metadata files inside the assigned scratch checkout/worktree and remove temporary metadata when finished. Continue handling watcher pings: triage comments against the code, reply with evidence if incorrect, or use ticket revise and repeatedly ticket dispatch through coder/reviewer/QA, then ticket ack with the pushed SHA. Report status by SMOKE-1.'''
     (root / "ticket-prompt.txt").write_text(task + "\n")
     save("ticket-submission.json", h("agent", "prompt", lead_name, task,
                                       "--wait", "--until", "working", "--timeout", "15000"))
@@ -419,13 +468,13 @@ directory = "''' + str(root / "worktrees") + '''"
                 result["observed_states"].append(state_name)
                 print(f"SMOKE-1: {state_name}", flush=True)
                 save("result-progress.json", result)
-            if state_name in ("failed", "closed", "cleaned_up", "merged", "pr_open"):
+            if state_name in ("failed", "closed", "cleaned_up", "merged", "blocked"):
                 raise RuntimeError(f"Unexpected ticket state: {state_name}")
-            if state_name == "ready_for_pr":
+            if state_name == "ci_wait":
                 break
         time.sleep(3)
     else:
-        raise RuntimeError("Ticket did not reach ready_for_pr before its deadline")
+        raise RuntimeError("Ticket did not reach ci_wait before its deadline")
 
     ticket_wt = local(ticket["worktree"])
     assert git("branch", "--show-current", cwd=ticket_wt) == ticket["branch"]
@@ -449,7 +498,7 @@ directory = "''' + str(root / "worktrees") + '''"
         record = records[-1]
         expected = "omp-astra" if role == "reviewer" else "codex-sol-high"
         assert record["runner"] == expected, record
-        assert record["status"] == "reported", record
+        assert record["status"] in ("reported", "retired"), record
         assert record.get("report", {}).get("status") == "completed", record
         evidence = result["pane_evidence"].get(record["name"], {})
         tokens = evidence.get("tokens") or {}
@@ -457,7 +506,67 @@ directory = "''' + str(root / "worktrees") + '''"
         assert tokens.get("shepherd_model") == expected_model, (role, tokens)
         assert tokens.get("shepherd_stage") == role, (role, tokens)
         assert (evidence.get("tab") or {}).get("label") == role, (role, evidence)
-    assert git("ls-remote", "origin") == result["origin_before"], "Origin refs changed"
+    initial_agent_names = {agent["name"] for agent in agents}
+    first_sha = git("rev-parse", "HEAD", cwd=ticket_wt)
+    assert git("ls-remote", "origin", "refs/heads/" + ticket["branch"]).split()[0] == first_sha
+    result["pr_loop"]["initial_push"] = first_sha
+    # The fake provider supplies CI, while the actual watcher performs handoff.
+    edit_fake(lambda value: value["status"].update(checks="passing"))
+    ticket, data = wait_ticket(lambda t: t["state"] == "pr_open", "green CI handoff")
+    result["pr_loop"]["ci_handoff"] = True
+    wrong = {"id": 101, "author": "fixture-reviewer", "path": "hello.sh", "line": 1,
+             "body": "The default hello.sh output is goodbye. Change it to hello. Reproduce with sh hello.sh before deciding.", "review": True}
+    edit_fake(lambda value: value["comments"].append(wrong))
+    ticket, data = wait_ticket(lambda t: any(c["id"] == 101 and c.get("triaged") and c.get("verdict") == "declined" for c in t.get("comments", [])), "incorrect comment declined")
+    result["pr_loop"]["declined_reply"] = True
+    # Simulate a user commit introducing a precise acceptance failure. Fixture
+    # Git uses only the scratch local repositories; shepherd never merges.
+    (ticket_wt / "hello.sh").write_text("#!/bin/sh\nprintf hello\n")
+    git("-c", "core.hooksPath=/dev/null", "add", "hello.sh", cwd=ticket_wt)
+    git("-c", "core.hooksPath=/dev/null", "commit", "-m", "test(smoke): expose newline regression",
+        "-m", "Give the fake review a reproducible acceptance failure.", cwd=ticket_wt)
+    user_sha = git("rev-parse", "HEAD", cwd=ticket_wt)
+    git("fetch", ticket_wt, "HEAD:refs/heads/" + ticket["branch"], cwd=origin)
+    edit_fake(lambda value: value["status"].update(head_oid=user_sha))
+    valid = {"id": 102, "author": "fixture-reviewer", "path": "hello.sh", "line": 2,
+             "body": "The latest user commit prints hello without the required newline. Reproduce with sh hello.sh | od -An -tx1: expected 68 65 6c 6c 6f 0a. Restore exactly one newline and add an exact-byte regression test; run coder, reviewer, QA, push, and acknowledge with the commit SHA.", "review": True}
+    edit_fake(lambda value: value["comments"].append(valid))
+    ticket, data = wait_ticket(lambda t: t["state"] == "ci_wait" and any(c["id"] == 102 and c.get("verdict") == "accepted" for c in t.get("comments", [])), "reviewed revision pushed")
+    revision_sha = git("rev-parse", "HEAD", cwd=ticket_wt)
+    assert revision_sha != user_sha
+    assert git("ls-remote", "origin", "refs/heads/" + ticket["branch"]).split()[0] == revision_sha
+    assert run(["sh", "hello.sh"], cwd=ticket_wt).stdout == "hello\n"
+    run(["sh", "test_hello.sh"], cwd=ticket_wt)
+    revision_agents = [agent for agent in data["agents"] if agent["ticket"] == "SMOKE-1" and agent["name"] not in initial_agent_names]
+    for role in ("coder", "reviewer", "qa"):
+        records = [agent for agent in revision_agents if agent["role"] == role]
+        assert records, f"Missing revision {role} agent"
+        record = records[-1]
+        assert record.get("report", {}).get("status") == "completed", record
+        assert record["runner"] == ("omp-astra" if role == "reviewer" else "codex-sol-high"), record
+        evidence = result["pane_evidence"].get(record["name"], {})
+        assert (evidence.get("tokens") or {}).get("shepherd_stage") == role, (role, evidence)
+    result["pr_loop"]["revision_agents"] = [{key: agent.get(key) for key in ("name", "role", "runner", "status", "report")} for agent in revision_agents]
+    result["pr_loop"]["revision_push"] = revision_sha
+    ticket, data = wait_ticket(lambda t: any(c["id"] == 102 and c.get("acknowledged") for c in t.get("comments", [])), "revision acknowledgement")
+    assert any(revision_sha in line for line in fake_state()["calls"] if line.startswith("reply "))
+    result["pr_loop"]["acknowledged"] = True
+    edit_fake(lambda value: value["status"].update(checks="passing"))
+    ticket, data = wait_ticket(lambda t: t["state"] == "pr_open", "revision green CI")
+    # Provider fixture simulates the user's merge by advancing only its base.
+    git("fetch", ticket_wt, "HEAD:refs/heads/main", cwd=origin)
+    edit_fake(lambda value: value["status"].update(state="merged", merged_at="2026-11-01T00:00:00Z", head_oid=revision_sha))
+    ticket, data = wait_ticket(lambda t: t["state"] == "cleaned_up", "merged cleanup")
+    assert not ticket_wt.exists(), "Merged ticket worktree remains"
+    assert not git("ls-remote", "origin", "refs/heads/" + ticket["branch"]), "Remote ticket branch remains"
+    branch_check = run(["git", "show-ref", "--verify", "refs/heads/" + ticket["branch"]], check=False)
+    assert branch_check.returncode != 0, "Local ticket branch remains"
+    live_ids = {ws["workspace_id"] for ws in h("api", "snapshot").get("snapshot", {}).get("workspaces", [])}
+    assert ticket["workspace_id"] not in live_ids, "Ticket workspace remains"
+    result["pr_loop"]["merged_cleanup"] = True
+    result["ticket"] = ticket
+    result["final_status"] = data
+    save("fake-github-final.json", fake_state())
     result["ok"] = True
 except BaseException as error:
     result["error"] = f"{type(error).__name__}: {error}"

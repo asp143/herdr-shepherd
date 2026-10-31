@@ -163,11 +163,49 @@ struct DiskState {
 
 impl DiskBackend {
     pub fn open(directory: &Path) -> Result<Self, ShepherdError> {
-        let path = directory.join("github.json");
+        let backend = Self {
+            path: directory.join("github.json"),
+        };
+        let _lock = backend.lock()?;
         let _: DiskState =
-            serde_json::from_slice(&std::fs::read(&path).map_err(anyhow::Error::from)?)
+            serde_json::from_slice(&std::fs::read(&backend.path).map_err(anyhow::Error::from)?)
                 .map_err(anyhow::Error::from)?;
-        Ok(Self { path })
+        Ok(backend)
+    }
+
+    fn lock(&self) -> Result<std::fs::File, ShepherdError> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.path.with_file_name("github.lock"))
+            .map_err(anyhow::Error::from)?;
+        file.lock().map_err(anyhow::Error::from)?;
+        Ok(file)
+    }
+
+    fn update<T>(
+        &self,
+        operation: String,
+        f: impl FnOnce(&mut DiskState) -> Result<T, ShepherdError>,
+    ) -> Result<T, ShepherdError> {
+        let _lock = self.lock()?;
+        let mut state: DiskState =
+            serde_json::from_slice(&std::fs::read(&self.path).map_err(anyhow::Error::from)?)
+                .map_err(anyhow::Error::from)?;
+        state.calls.push(operation);
+        let result = f(&mut state);
+        let temporary = self
+            .path
+            .with_file_name(format!(".github-{}.tmp", std::process::id()));
+        std::fs::write(
+            &temporary,
+            serde_json::to_vec_pretty(&state).map_err(anyhow::Error::from)?,
+        )
+        .map_err(anyhow::Error::from)?;
+        std::fs::rename(temporary, &self.path).map_err(anyhow::Error::from)?;
+        result
     }
 
     fn call<T>(
@@ -175,16 +213,37 @@ impl DiskBackend {
         operation: String,
         f: impl FnOnce(&DiskState) -> Result<T, ShepherdError>,
     ) -> Result<T, ShepherdError> {
-        let mut state: DiskState =
-            serde_json::from_slice(&std::fs::read(&self.path).map_err(anyhow::Error::from)?)
-                .map_err(anyhow::Error::from)?;
-        state.calls.push(operation);
-        std::fs::write(
-            &self.path,
-            serde_json::to_vec_pretty(&state).map_err(anyhow::Error::from)?,
-        )
-        .map_err(anyhow::Error::from)?;
-        f(&state)
+        self.update(operation, |state| f(state))
+    }
+
+    fn local_head(gate: &Gate) -> Result<String, ShepherdError> {
+        let trust = crate::trusted::load_snapshot(&gate.state_dir, &gate.worktree)?;
+        let remote = Path::new(
+            trust
+                .push_url
+                .strip_prefix("file://")
+                .unwrap_or(&trust.push_url),
+        );
+        if !cfg!(debug_assertions)
+            || !gate
+                .state_dir
+                .canonicalize()
+                .is_ok_and(|path| path.starts_with("/tmp"))
+            || !gate
+                .worktree
+                .canonicalize()
+                .is_ok_and(|path| path.starts_with("/tmp"))
+            || !remote.is_absolute()
+            || !remote
+                .canonicalize()
+                .is_ok_and(|path| path.starts_with("/tmp"))
+        {
+            return Err(ShepherdError::PolicyDenied(
+                "fake pushes require debug scratch repositories in /tmp".into(),
+            ));
+        }
+        crate::gate::transport::PushTransport::open(&gate.state_dir, &gate.worktree)?
+            .verified_ticket_head(&gate.ticket_branch)
     }
 }
 
@@ -223,24 +282,38 @@ impl PrBackend for DiskBackend {
         self.call("author".into(), |s| Ok(s.author.clone()))
     }
     fn push(&self, gate: &Gate) -> Result<(), ShepherdError> {
-        crate::gate::check_push(
-            &crate::gate::parse_push_args(&["origin", &gate.ticket_branch]),
-            &gate.ticket_branch,
-            &gate.policy,
-        )?;
-        self.call(format!("push {}", gate.ticket_branch), |_| Ok(()))
+        let head = Self::local_head(gate)?;
+        gate.git_push(&["origin", &gate.ticket_branch])?;
+        self.update(format!("push {}", gate.ticket_branch), |state| {
+            if let Some(status) = &mut state.status {
+                status.head_oid = Some(head);
+                status.checks = super::Checks::Pending;
+            }
+            Ok(())
+        })
     }
     fn create(
         &self,
-        _: &Gate,
+        gate: &Gate,
         base: &str,
         title: &str,
         body: &str,
     ) -> Result<PrStatus, ShepherdError> {
-        self.call(format!("create {base} {title} {body}"), |s| {
-            s.status
-                .clone()
-                .ok_or_else(|| ShepherdError::GithubUnavailable("fake PR status missing".into()))
+        let head = Self::local_head(gate)?;
+        self.update(format!("create {base} {title} {body}"), |state| {
+            let status = state.status.get_or_insert_with(|| PrStatus {
+                number: 1,
+                url: "https://github.com/fake/shepherd/pull/1".into(),
+                state: super::PrState::Open,
+                merged_at: None,
+                base: base.into(),
+                head: gate.ticket_branch.clone(),
+                head_oid: Some(head),
+                checks: super::Checks::Pending,
+                review: super::ReviewDecision::None,
+                comment_ids: vec![],
+            });
+            Ok(status.clone())
         })
     }
     fn add_reviewers(
@@ -253,40 +326,32 @@ impl PrBackend for DiskBackend {
     }
     fn reply_id(
         &self,
-        gate: &Gate,
+        _: &Gate,
         number: u64,
         comment_id: Option<u64>,
         body: &str,
     ) -> Result<Option<u64>, ShepherdError> {
-        self.reply(gate, number, comment_id, body)?;
-        let mut state: DiskState =
-            serde_json::from_slice(&std::fs::read(&self.path).map_err(anyhow::Error::from)?)
-                .map_err(anyhow::Error::from)?;
-        let id = state
-            .comments
-            .iter()
-            .map(|comment| comment.id)
-            .max()
-            .unwrap_or(0)
-            .max(1_000_000)
-            + 1;
-        state.comments.push(PrComment {
-            kind: None,
-            id,
-            author: state.author.clone(),
-            path: None,
-            line: None,
-            body: body.into(),
-            review: comment_id.is_some(),
-        });
-        std::fs::write(
-            &self.path,
-            serde_json::to_vec_pretty(&state).map_err(anyhow::Error::from)?,
-        )
-        .map_err(anyhow::Error::from)?;
-        Ok(Some(id))
+        self.update(format!("reply {number} {comment_id:?} {body}"), |state| {
+            let id = state
+                .comments
+                .iter()
+                .map(|comment| comment.id)
+                .max()
+                .unwrap_or(0)
+                .max(1_000_000)
+                + 1;
+            state.comments.push(PrComment {
+                kind: None,
+                id,
+                author: state.author.clone(),
+                path: None,
+                line: None,
+                body: body.into(),
+                review: comment_id.is_some(),
+            });
+            Ok(Some(id))
+        })
     }
-
     fn reply(
         &self,
         _: &Gate,

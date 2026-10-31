@@ -187,6 +187,36 @@ fn save(store: &Store, record: &AgentRecord) -> Result<(), ShepherdError> {
     })
 }
 
+#[cfg(debug_assertions)]
+fn forward_fixture_env(
+    source: &HashMap<String, String>,
+    state: &Path,
+    worktree: &Path,
+    env: &mut HashMap<String, String>,
+) {
+    let scratch = |path: &Path| {
+        path.canonicalize()
+            .is_ok_and(|path| path.starts_with("/tmp"))
+    };
+    let Some(fake) = source.get("SHEPHERD_FAKE_GITHUB") else {
+        return;
+    };
+    if !scratch(state) || !scratch(worktree) || !scratch(Path::new(fake)) {
+        return;
+    }
+    env.insert("SHEPHERD_FAKE_GITHUB".into(), fake.clone());
+    if source
+        .get("SHEPHERD_TEST_ALLOW_LOCAL_ORIGIN")
+        .map(String::as_str)
+        == Some("allow-local-in-tmp")
+    {
+        env.insert(
+            "SHEPHERD_TEST_ALLOW_LOCAL_ORIGIN".into(),
+            "allow-local-in-tmp".into(),
+        );
+    }
+}
+
 fn launch_reserved(
     h: &dyn Herdr,
     store: &Store,
@@ -221,6 +251,14 @@ fn launch_reserved(
     );
     if let Ok(value) = std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
         env.insert("HERDR_PLUGIN_CONFIG_DIR".into(), value);
+    }
+    #[cfg(debug_assertions)]
+    {
+        let fixture: HashMap<_, _> = ["SHEPHERD_FAKE_GITHUB", "SHEPHERD_TEST_ALLOW_LOCAL_ORIGIN"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok().map(|value| (key.into(), value)))
+            .collect();
+        forward_fixture_env(&fixture, &req.state_dir, &req.worktree, &mut env);
     }
     for runner in &req.runners {
         let harness = crate::harness::harness_for(&runner.harness)?;
@@ -401,6 +439,34 @@ mod tests {
             prompt: "Implement tiny ticket".into(),
             state_dir: state.into(),
         }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn scratch_launch_forwards_fake_provider_only_in_tmp() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let fake = dir.path().join("fake");
+        let state = dir.path().join("state");
+        std::fs::create_dir(&fake).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        let source = HashMap::from([
+            (
+                "SHEPHERD_FAKE_GITHUB".into(),
+                fake.to_string_lossy().into_owned(),
+            ),
+            (
+                "SHEPHERD_TEST_ALLOW_LOCAL_ORIGIN".into(),
+                "allow-local-in-tmp".into(),
+            ),
+        ]);
+        let mut forwarded = HashMap::new();
+        forward_fixture_env(&source, &state, dir.path(), &mut forwarded);
+        assert_eq!(forwarded, source);
+        forwarded.clear();
+        forward_fixture_env(&source, Path::new("/home"), dir.path(), &mut forwarded);
+        assert!(forwarded.is_empty());
+        forward_fixture_env(&source, &state, Path::new("/home"), &mut forwarded);
+        assert!(forwarded.is_empty());
     }
 
     #[test]
