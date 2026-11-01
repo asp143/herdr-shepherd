@@ -66,7 +66,10 @@ fn never_writes() {
         vec!["config", "user.name", "Fixture"],
         vec!["config", "user.email", "fixture@example.invalid"],
         vec!["add", "ordinary.txt"],
-        vec!["commit", "-m", "fixture"],
+        // Detached setup maintenance can remove objects/maintenance.lock
+        // after the snapshot. Keep that writer out of this purity check;
+        // prune's Git commands still run with their normal configuration.
+        vec!["-c", "maintenance.auto=false", "commit", "-m", "fixture"],
     ] {
         let out = Command::new("git")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
