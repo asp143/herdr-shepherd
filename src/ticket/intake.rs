@@ -108,7 +108,7 @@ pub fn add(
     if base.trim().is_empty() || base.starts_with('-') || base.contains(['\n', '\r']) {
         return Err(ShepherdError::Usage("invalid integration branch".into()));
     }
-    let ticket = Ticket {
+    let mut ticket = Ticket {
         id,
         branch: format!("{}/{slug}", request.kind),
         slug,
@@ -121,6 +121,27 @@ pub fn add(
         ..Ticket::default()
     };
     store.update(|data| {
+        if request.id.is_none() {
+            // Allocate under the store lock so concurrent intake reserves unique
+            // IDs. Git lists loose and packed refs, including other worktrees.
+            let branches = git(
+                &project,
+                &["for-each-ref", "--format=%(refname:strip=2)", "refs/heads/"],
+            )?;
+            let original_slug = ticket.slug.clone();
+            let mut suffix = 2;
+            while data
+                .tickets
+                .iter()
+                .any(|existing| existing.id == ticket.id || existing.branch == ticket.branch)
+                || branches.lines().any(|branch| branch == ticket.branch)
+            {
+                ticket.slug = format!("{original_slug}-{suffix}");
+                ticket.id.clone_from(&ticket.slug);
+                ticket.branch = format!("{}/{}", request.kind, ticket.slug);
+                suffix += 1;
+            }
+        }
         if data.tickets.iter().any(|existing| existing.id == ticket.id) {
             return Err(ShepherdError::Usage(format!(
                 "duplicate ticket id: {}",
@@ -421,11 +442,100 @@ mod tests {
         assert_eq!(ticket.base, "develop");
         assert_eq!(ticket.state, crate::store::TicketState::Queued);
         assert_eq!(ticket.acceptance, ["The test passes"]);
-        assert!(matches!(
-            add(&store, &request, "auto", "0002"),
-            Err(crate::error::ShepherdError::Usage(_))
-        ));
+        let error = add(&store, &request, "auto", "0002").unwrap_err();
+        assert!(matches!(error, ShepherdError::Usage(_)));
+        assert_eq!(error.to_string(), "duplicate ticket id: SYM-5567");
         assert_eq!(store.read().unwrap().tickets.len(), 1);
+    }
+
+    fn adhoc_request() -> IntakeRequest {
+        IntakeRequest {
+            id: None,
+            title: "Fix login banner".into(),
+            body: "Fix the typo in the login banner.\nKeep its styling.".into(),
+            acceptance: vec!["The login banner uses the corrected text".into()],
+            kind: "fix".into(),
+            base: Some("main".into()),
+        }
+    }
+
+    #[test]
+    fn adhoc_collisions_suffix_id_and_branch_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "--initial-branch", "main"]);
+        let store = Store::open(&dir.path().join("state"), dir.path()).unwrap();
+        let request = adhoc_request();
+        let first = add(&store, &request, "auto", "0001").unwrap();
+        assert_eq!(first.id, "fix-login-banner");
+        assert_eq!(first.branch, "fix/fix-login-banner");
+        for suffix in [2, 3] {
+            let mut next = request.clone();
+            next.body = format!("New request {suffix}");
+            let ticket = add(&store, &next, "auto", "0002").unwrap();
+            assert_eq!(ticket.id, format!("fix-login-banner-{suffix}"));
+            assert_eq!(ticket.slug, ticket.id);
+            assert_eq!(ticket.branch, format!("fix/fix-login-banner-{suffix}"));
+            assert_eq!(ticket.body, next.body);
+        }
+        let tickets = store.read().unwrap().tickets;
+        assert_eq!(tickets.len(), 3);
+        assert_eq!(tickets[0], first);
+    }
+
+    #[test]
+    fn adhoc_collisions_skip_local_branches_and_reserved_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "--initial-branch", "main"]);
+        git(dir.path(), &["commit", "--allow-empty", "-m", "initial"]);
+        git(dir.path(), &["branch", "fix/fix-login-banner"]);
+        git(dir.path(), &["branch", "fix/fix-login-banner-2"]);
+        let store = Store::open(&dir.path().join("state"), dir.path()).unwrap();
+        store
+            .update(|data| {
+                data.tickets.push(Ticket {
+                    id: "T-1".into(),
+                    branch: "fix/fix-login-banner-3".into(),
+                    ..Default::default()
+                });
+                data.tickets.push(Ticket {
+                    id: "fix-login-banner-4".into(),
+                    branch: "docs/other-branch".into(),
+                    ..Default::default()
+                });
+                Ok(())
+            })
+            .unwrap();
+        let ticket = add(&store, &adhoc_request(), "auto", "now").unwrap();
+        assert_eq!(ticket.id, "fix-login-banner-5");
+        assert_eq!(ticket.slug, "fix-login-banner-5");
+        assert_eq!(ticket.branch, "fix/fix-login-banner-5");
+        assert_eq!(
+            git(dir.path(), &["branch", "--list", "fix/fix-login-banner-5"]),
+            ""
+        );
+    }
+
+    #[test]
+    fn concurrent_adhoc_intake_reserves_distinct_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "--initial-branch", "main"]);
+        let store = Store::open(&dir.path().join("state"), dir.path()).unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let store = &store;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    add(store, &adhoc_request(), "auto", "now").unwrap();
+                });
+            }
+        });
+        let tickets = store.read().unwrap().tickets;
+        let ids: std::collections::HashSet<_> = tickets.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids.len(), 4);
+        assert!(ids.contains("fix-login-banner"));
+        assert!(ids.contains("fix-login-banner-4"));
     }
 
     #[test]
