@@ -746,8 +746,21 @@ pub fn supervise_project(
     };
     let data = store.read()?;
     let default = crate::trusted::default_branch(&data.project_root, state_dir)?;
-    for mut rec in data.agents.iter().filter(|a| active(a.status)).cloned() {
-        let Some(_operation) = crate::flock::try_agent_operation(store, &rec.name)? else {
+    for snapshot in data.agents.iter().filter(|a| active(a.status)) {
+        let Some(_operation) = crate::flock::try_agent_operation(store, &snapshot.name)? else {
+            continue;
+        };
+        // The snapshot only schedules work. A launcher or recovery may have
+        // completed delivery (or the agent may have reported/retired) before
+        // this lock was acquired. Observe the durable record and ownership now
+        // so a stale observation cannot erase a newly persisted quarantine.
+        let data = store.read()?;
+        let Some(mut rec) = data
+            .agents
+            .iter()
+            .find(|a| a.name == snapshot.name && active(a.status) && a.report.is_none())
+            .cloned()
+        else {
             continue;
         };
         report.observed += 1;
@@ -1213,6 +1226,181 @@ mod tests {
             .unwrap();
         save_observation(&store, &rec).unwrap();
         assert!(!store.read().unwrap().agents[0].prompt_pending);
+    }
+
+    /// Processing the first agent runs this callback after the sweep's snapshot
+    /// and before it can acquire the second agent's operation lock. No timing
+    /// assumptions or production scheduling hooks are needed.
+    fn before_second_agent(
+        store: &Store,
+        h: &FakeHerdr,
+        change: impl Fn(&Store, &str) + Send + 'static,
+    ) {
+        let target = store.read().unwrap().agents[0].clone();
+        let mut first = target.clone();
+        first.name = "sh-before-coder-1".into();
+        first.pane_id = Some("w1:p2".into());
+        first.tab_id = Some("w1:t2".into());
+        first.prompt_pending = true;
+        first.status = AgentStatus::Starting;
+        store
+            .update(|data| {
+                data.agents.insert(0, first.clone());
+                Ok(())
+            })
+            .unwrap();
+        let live = h.agent_records.borrow()[0].clone();
+        h.agent_records.borrow_mut().push(AgentInfo {
+            name: Some(first.name.clone()),
+            pane_id: first.pane_id.unwrap(),
+            agent_status: "idle".into(),
+            ..live
+        });
+        let store = store.clone();
+        *h.on_prompt.borrow_mut() = Some(Box::new(move |name| {
+            assert_eq!(
+                name, first.name,
+                "only the scheduling agent may be prompted"
+            );
+            let _operation = crate::flock::try_agent_operation(&store, &target.name)
+                .unwrap()
+                .expect("sweep has not acquired the second agent yet");
+            change(&store, &target.name);
+            crate::flock::store_report(&store, name, r#"{"status":"completed","summary":"scheduling callback completed","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+        }));
+    }
+
+    #[test]
+    fn sweep_snapshot_cannot_erase_concurrent_delivery_quarantine() {
+        for accepted in [false, true] {
+            for (status, screen) in [
+                ("idle", ""),
+                ("idle", "quota exhausted"),
+                ("blocked", "quota exhausted"),
+                ("blocked", "Trust this folder? Trust and continue"),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let (store, mut cfg, h) = fixture(dir.path());
+                cfg.raw = "[roles.coder]\nrunners=['omp-astra','codex-sol-high']\n"
+                    .parse()
+                    .unwrap();
+                store
+                    .update(|data| {
+                        let rec = &mut data.agents[0];
+                        rec.runner = "omp-astra".into();
+                        rec.status = AgentStatus::Starting;
+                        rec.prompt_pending = true;
+                        Ok(())
+                    })
+                    .unwrap();
+                let target = store.read().unwrap().agents[0].clone();
+                h.agent_records.borrow_mut()[0].agent = "omp".into();
+                h.agent_records.borrow_mut()[0].agent_status = status.into();
+                h.visible_cache
+                    .borrow_mut()
+                    .insert(target.name.clone(), screen.into());
+                before_second_agent(&store, &h, move |store, name| {
+                    let transport = FakeHerdr::new(vec![]);
+                    transport.prompt_results.borrow_mut().push_back((
+                        accepted,
+                        Err(ShepherdError::HerdrCommand {
+                            code: "timeout".into(),
+                            message: "acceptance unknown".into(),
+                        }),
+                    ));
+                    assert!(
+                        crate::flock::deliver_pending_prompt(&transport, store, name)
+                            .unwrap_err()
+                            .prompt_submission_uncertain()
+                    );
+                    assert_eq!(transport.calls.borrow().len(), 1);
+                    assert_eq!(
+                        transport.accepted_prompts.borrow().len(),
+                        usize::from(accepted)
+                    );
+                    assert!(store.read().unwrap().agents[1].prompt_delivery_uncertain());
+                });
+                for now in [1, 1000, 2000] {
+                    let sweep = supervise_project(&h, &store, &cfg, &dir.path().join("state"), now)
+                        .unwrap();
+                    assert!(sweep.errors.is_empty(), "{sweep:?}");
+                    let current = store.read().unwrap().agents[1].clone();
+                    assert!(current.prompt_delivery_uncertain(), "{status}: {screen}");
+                    assert!(!current.prompt_pending);
+                    assert_eq!(current.status, AgentStatus::Blocked);
+                    assert_eq!(current.runner, target.runner);
+                    assert_eq!(current.worktree, target.worktree);
+                    assert_eq!(current.pane_id, target.pane_id);
+                    assert_eq!(current.restarts, 0);
+                }
+                // Independent Working evidence may still release quarantine
+                // after the racing sweep, without a second task submission.
+                h.agent_records.borrow_mut()[0].agent_status = "working".into();
+                h.visible_cache
+                    .borrow_mut()
+                    .insert(target.name.clone(), "fixture task progress".into());
+                let sweep =
+                    supervise_project(&h, &store, &cfg, &dir.path().join("state"), 2001).unwrap();
+                assert!(sweep.errors.is_empty(), "{sweep:?}");
+                let current = store.read().unwrap().agents[1].clone();
+                assert!(!current.prompt_delivery_uncertain());
+                assert_eq!(current.status, AgentStatus::Working);
+                let calls = h.calls.borrow();
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|c| c.starts_with("prompt_agent"))
+                        .count(),
+                    1
+                );
+                assert!(!calls.iter().any(|c| c.starts_with("send_keys")
+                    || c.starts_with("start_agent")
+                    || c.starts_with("resume_agent")
+                    || c.starts_with("close_tab")));
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_snapshot_skips_concurrently_reported_or_retired_agent() {
+        for reported in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, cfg, h) = fixture(dir.path());
+            let target = store.read().unwrap().agents[0].clone();
+            before_second_agent(&store, &h, move |store, name| {
+                if reported {
+                    crate::flock::store_report(store, name, r#"{"status":"completed","summary":"real concurrent report","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+                } else {
+                    store
+                        .update(|data| {
+                            data.agents[1].status = AgentStatus::Retired;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            });
+            let sweep = supervise_project(&h, &store, &cfg, &dir.path().join("state"), 1).unwrap();
+            assert!(sweep.errors.is_empty(), "{sweep:?}");
+            assert_eq!(
+                sweep.observed, 1,
+                "finished agents must be revalidated before observation"
+            );
+            let current = store.read().unwrap().agents[1].clone();
+            assert_eq!(
+                current.status,
+                if reported {
+                    AgentStatus::Reported
+                } else {
+                    AgentStatus::Retired
+                }
+            );
+            if reported {
+                assert_eq!(current.report.unwrap().summary, "real concurrent report");
+            }
+            assert!(!h.calls.borrow().iter().any(|c| c
+                == &format!("read_visible {}", target.name)
+                || c.starts_with("send_keys")));
+        }
     }
     #[test]
     fn supervision_never_sends_keys_outside_owned_worktree() {
