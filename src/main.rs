@@ -155,6 +155,9 @@ enum TicketCommands {
         changes_file: PathBuf,
         #[arg(long)]
         testing_file: PathBuf,
+        /// JSON publication dispositions keyed by ticket ID and finding index.
+        #[arg(long)]
+        finding_dispositions_file: Option<PathBuf>,
     },
     Comments {
         id: String,
@@ -1009,6 +1012,7 @@ fn run_ticket_pr(
         summary_file,
         changes_file,
         testing_file,
+        finding_dispositions_file,
         ..
     } = command
     {
@@ -1027,8 +1031,18 @@ fn run_ticket_pr(
         let changes = lines(changes_file)?;
         let testing = lines(testing_file)?;
         pr_body::check_attribution(&pr_body::build_title(ticket))?;
-        pr::validate_body(&pr_body::build_body(ticket, &summary, &changes, &testing))?;
-        Some((summary, changes, testing))
+        let dispositions = finding_dispositions_file
+            .as_ref()
+            .map(|path| pr_body::FindingDispositions::parse(&cli_pr::read_text(path)?))
+            .transpose()?;
+        pr::validate_body(&pr_body::build_body_with_dispositions(
+            ticket,
+            &summary,
+            &changes,
+            &testing,
+            dispositions.as_ref(),
+        )?)?;
+        Some((summary, changes, testing, dispositions))
     } else {
         None
     };
@@ -1067,8 +1081,8 @@ fn run_ticket_pr(
     gate.config_dir = dir;
     let t = match command {
         TicketCommands::Pr { .. } => {
-            let (summary, changes, testing) = content.expect("read PR content");
-            pr::open(
+            let (summary, changes, testing, dispositions) = content.expect("read PR content");
+            pr::open_with_dispositions(
                 &store,
                 gh.as_ref(),
                 &gate,
@@ -1077,6 +1091,7 @@ fn run_ticket_pr(
                 &summary,
                 &changes,
                 &testing,
+                dispositions.as_ref(),
                 &herdr_shepherd::launch::now(),
             )?
         }
