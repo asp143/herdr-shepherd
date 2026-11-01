@@ -138,7 +138,11 @@ Global settings come from `shepherd.toml` inside the first available location:
 2. `HERDR_PLUGIN_CONFIG_DIR`
 3. `~/.config/herdr/plugins/config/herdr-shepherd`
 
-`validate-config` reads `.shepherd.toml` at the selected Git root. Runtime commands use the project configuration snapshot captured by `init`, `start`, or ticket startup; `config trust` explicitly replaces it. Project settings replace the global settings in full, except `[upkeep]`, which always comes from the global file. A project `[upkeep]` is ignored with a warning. Missing files use defaults; malformed files and unsupported schema versions are errors. Unknown sections are preserved for later phases.
+`validate-config` reads `.shepherd.toml` at the selected Git root. Runtime commands use the project configuration snapshot captured by `init`, `start`, or ticket startup; `config trust` explicitly replaces it. When a snapshot exists, `validate-config` warns if the on-disk file differs from it, including when either copy is missing. Validation never creates or refreshes a snapshot. To apply project config changes to runtime commands, commit them to the default branch, then run `config trust`.
+
+`config trust` captures only `.shepherd.toml` committed on the default branch. If a local file exists but that branch has no committed config, trust fails and preserves the stored snapshot. If local edits differ from the committed file, trust succeeds using the committed bytes and warns in both human and `--json` output that those edits were not captured. If neither copy exists, trust succeeds without project config, so a committed config can be removed. The `init` flow still snapshots the configuration it initializes.
+
+Project settings replace the global settings in full, except `[upkeep]`, which always comes from the global file. A project `[upkeep]` is ignored with a warning. Missing files use defaults; malformed files and unsupported schema versions are errors. Unknown sections are preserved for later phases.
 
 `validate-config` also resolves `[shepherd]`, `[roles.*]`, `[runners.*]`, and
 `[supervision]` from the selected file. Its existing output fields are retained,

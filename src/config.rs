@@ -1,6 +1,7 @@
 use std::{
     env, fs,
-    io::ErrorKind,
+    io::{ErrorKind, Read},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
@@ -97,13 +98,32 @@ fn read_table(path: &Path) -> Result<Option<toml::Table>, ShepherdError> {
     }
 }
 
+fn read_project_table(path: &Path) -> Result<Option<toml::Table>, ShepherdError> {
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(invalid(path, err)),
+    };
+    if !file.metadata().map_err(|err| invalid(path, err))?.is_file() {
+        return Err(invalid(path, "project config must be a regular file"));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|err| invalid(path, err))?;
+    text.parse().map(Some).map_err(|err| invalid(path, err))
+}
+
 pub fn load(config_dir: &Path, project_root: Option<&Path>) -> Result<Config, ShepherdError> {
     let global_path = config_dir.join("shepherd.toml");
     let global = read_table(&global_path)?;
     let project_path = project_root.map(|root| root.join(".shepherd.toml"));
     let project = project_path
         .as_deref()
-        .map(read_table)
+        .map(read_project_table)
         .transpose()?
         .flatten();
     from_tables(global_path, global, project_path, project)

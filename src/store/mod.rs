@@ -48,6 +48,17 @@ impl Store {
         self.read_unlocked()
     }
 
+    /// Read and validate state without creating a directory or lock file.
+    /// Atomic state replacement also permits reading when no lock exists yet.
+    pub fn read_only(&self) -> Result<StoreData, ShepherdError> {
+        let _lock = match lock::Lock::acquire_shared_existing(&self.root.join("state.lock")) {
+            Ok(lock) => Some(lock),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(anyhow::Error::new(err).context("lock project state").into()),
+        };
+        self.read_unlocked()
+    }
+
     pub fn update<T>(
         &self,
         f: impl FnOnce(&mut StoreData) -> Result<T, ShepherdError>,

@@ -10,6 +10,12 @@ pub(super) struct Lock {
 }
 
 impl Lock {
+    pub(super) fn acquire_shared_existing(path: &Path) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        file.lock_shared()?;
+        Ok(Self { _file: file })
+    }
+
     pub(super) fn acquire_shared(path: &Path) -> std::io::Result<Self> {
         let file = match File::open(path) {
             Ok(file) => file,
