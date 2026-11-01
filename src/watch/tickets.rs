@@ -243,6 +243,7 @@ fn poll_ticket(
             false
         };
         if ticket.state == TicketState::CiWait && (checks == Checks::Passing || no_checks_ready) {
+            let _hooks = crate::hooks::defer();
             let _dispatch = crate::ticket::revise::dispatch_lock(store, &ticket.id)?;
             if !store
                 .read()?

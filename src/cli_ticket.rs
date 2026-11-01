@@ -209,6 +209,20 @@ pub fn dispatch_with_backend(
                     Ok(())
                 })?;
             }
+            // Nested launch scopes cannot flush the CI retry's outer queue.
+            // Release dispatch and deliver hooks before reading public status.
+            drop(_ci_dispatch);
+            drop(_hooks);
+            let rec = if ci_build {
+                store
+                    .read()?
+                    .agents
+                    .into_iter()
+                    .find(|agent| agent.name == rec.name)
+                    .ok_or_else(|| ShepherdError::Usage("launch record disappeared".into()))?
+            } else {
+                rec
+            };
             Ok(Some(rec))
         })();
         match attempt {

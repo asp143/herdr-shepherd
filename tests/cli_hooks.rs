@@ -2,27 +2,44 @@ use std::{fs, process::Command};
 
 #[test]
 fn stage_change_hook_can_cancel_the_same_ticket() {
-    cancellation_hook_case("ticket.stage_changed", false);
+    cancellation_hook_case("ticket.stage_changed", "transition");
 }
 
 #[test]
 fn spawned_hook_can_cancel_the_same_ticket() {
-    cancellation_hook_case("agent.spawned", true);
+    cancellation_hook_case("agent.spawned", "spawn");
 }
 
-fn cancellation_hook_case(event: &str, spawn: bool) {
+#[test]
+fn ci_retry_dispatch_returns_agent_after_spawn_hook() {
+    cancellation_hook_case("agent.spawned", "dispatch");
+}
+
+fn cancellation_hook_case(event: &str, action: &str) {
     use herdr_shepherd::store::{Store, Ticket, TicketState};
 
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let config = dir.path().join("config");
     fs::create_dir(&config).unwrap();
+    if action == "dispatch" {
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        herdr_shepherd::trusted::ensure_snapshot(&state, dir.path()).unwrap();
+    }
     let store = Store::open(&state, dir.path()).unwrap();
     store
         .update(|data| {
             data.tickets.push(Ticket {
                 id: "T-1".into(),
                 state: TicketState::Building,
+                ci_failure_task: (action == "dispatch").then(|| "Fix CI".into()),
                 branch: "fix/ticket".into(),
                 worktree: Some(dir.path().into()),
                 workspace_id: Some("w1".into()),
@@ -57,14 +74,16 @@ fn cancellation_hook_case(event: &str, spawn: bool) {
     fs::write(&fake, "{}").unwrap();
     let mut cmd = Command::new(args[0]);
     cmd.args(&args[1..6])
-        .arg(if spawn { "agent" } else { "ticket" })
+        .arg(if action == "spawn" { "agent" } else { "ticket" })
         .args(&args[7..])
         .env("SHEPHERD_FAKE_HERDR", fake);
-    if spawn {
+    if action == "spawn" {
         let task = dir.path().join("task");
         fs::write(&task, "Implement one task").unwrap();
         cmd.args(["spawn", "--ticket", "T-1", "--role", "coder", "--task-file"])
             .arg(task);
+    } else if action == "dispatch" {
+        cmd.arg("dispatch");
     } else {
         cmd.args(["transition", "T-1", "--to", "reviewing"]);
     }
@@ -74,14 +93,20 @@ fn cancellation_hook_case(event: &str, spawn: bool) {
     let data = store.read().unwrap();
     let ticket = &data.tickets[0];
     assert_eq!(ticket.state, TicketState::Closed);
-    if spawn {
+    if action != "transition" {
         assert_eq!(data.agents.len(), 1);
         assert_eq!(
             data.agents[0].status,
             herdr_shepherd::store::AgentStatus::Retired
         );
         let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(result["data"]["status"], "retired");
+        let returned = if action == "dispatch" {
+            &result["data"]["started"][0]["agent"]
+        } else {
+            &result["data"]
+        };
+        assert_eq!(returned["status"], "retired");
+        assert_eq!(returned["name"], data.agents[0].name);
     } else {
         assert_eq!(ticket.history.len(), 2);
         assert_eq!(ticket.history[0].to, TicketState::Reviewing);
@@ -428,4 +453,106 @@ shift 4
     .unwrap();
     supervise::supervise_project(&h, &store, &cfg, &state, 2).unwrap();
     assert_eq!(inputs(), sent, "no input may follow completed cancellation");
+}
+
+#[test]
+fn passing_ci_hook_can_cancel_the_same_ticket() {
+    ci_handoff_cancellation_case(herdr_shepherd::github::Checks::Passing);
+}
+
+#[test]
+fn no_checks_ready_hook_can_cancel_the_same_ticket() {
+    ci_handoff_cancellation_case(herdr_shepherd::github::Checks::None);
+}
+
+fn ci_handoff_cancellation_case(checks: herdr_shepherd::github::Checks) {
+    use herdr_shepherd::{
+        config,
+        github::{PrState, PrStatus, ReviewDecision, fake::FakeBackend},
+        herdr::fake::FakeHerdr,
+        store::{Store, Ticket, TicketState},
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    fs::create_dir(&root).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let state = dir.path().join("state");
+    herdr_shepherd::trusted::ensure_snapshot(&state, &root).unwrap();
+    let config = dir.path().join("config");
+    fs::create_dir(&config).unwrap();
+    let fake = dir.path().join("fake.json");
+    fs::write(&fake, "{}").unwrap();
+    let before = dir.path().join("before.json");
+    let cancelled = dir.path().join("cancelled.json");
+    let command: toml::Value = vec![
+        "env".to_owned(), format!("SHEPHERD_FAKE_HERDR={}", fake.display()),
+        "sh".into(), "-c".into(),
+        r#"before=$1; cancelled=$2; shift 2; "$@" show T-1 > "$before" && "$@" cancel T-1 > "$cancelled""#.into(),
+        "hook".into(), before.display().to_string(), cancelled.display().to_string(),
+        env!("CARGO_BIN_EXE_herdr-shepherd").into(), "--json".into(),
+        "--state-dir".into(), state.display().to_string(),
+        "--config-dir".into(), config.display().to_string(),
+        "ticket".into(), "--project-root".into(), root.display().to_string(),
+    ].into();
+    fs::write(
+        config.join("shepherd.toml"),
+        format!(
+            "[[hooks]]\non = 'ticket.stage_changed'\ncommand = {command}\ntimeout_seconds = 1\n"
+        ),
+    )
+    .unwrap();
+    let cfg = config::load(&config, None).unwrap();
+    let store = Store::open(&state, &root).unwrap();
+    store
+        .update(|data| {
+            data.tickets.push(Ticket {
+                id: "T-1".into(),
+                state: TicketState::CiWait,
+                branch: "fix/ticket".into(),
+                base: "main".into(),
+                pr_number: Some(7),
+                ci_head_sha: Some("tested-head".into()),
+                ci_none_since: Some("0".into()),
+                worktree: Some(root.clone()),
+                ..Default::default()
+            });
+            Ok(())
+        })
+        .unwrap();
+    let gh = FakeBackend::new(vec![Ok(Some(PrStatus {
+        number: 7,
+        url: "https://example.invalid/pull/7".into(),
+        state: PrState::Open,
+        merged_at: None,
+        base: "main".into(),
+        head: "fix/ticket".into(),
+        head_oid: Some("tested-head".into()),
+        checks,
+        review: ReviewDecision::None,
+        comment_ids: vec![],
+    }))]);
+    let h = FakeHerdr::new(vec![]);
+    let report = herdr_shepherd::watch::tick_tickets(&h, &gh, &cfg, &state, 1000);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.polled, 1);
+    assert_eq!(report.updated, 1);
+    let ticket = &store.read().unwrap().tickets[0];
+    assert_eq!(ticket.state, TicketState::Closed);
+    assert_eq!(ticket.ci_head_sha.as_deref(), Some("tested-head"));
+    assert_eq!(ticket.history[0].to, TicketState::PrOpen);
+    assert_eq!(ticket.history[1].from, TicketState::PrOpen);
+    assert_eq!(ticket.history[1].to, TicketState::Closed);
+    let observed: serde_json::Value = serde_json::from_slice(&fs::read(before).unwrap()).unwrap();
+    assert_eq!(observed["data"]["state"], "pr_open");
+    let cancelled: serde_json::Value =
+        serde_json::from_slice(&fs::read(cancelled).unwrap()).unwrap();
+    assert_eq!(cancelled["ok"], true);
 }
