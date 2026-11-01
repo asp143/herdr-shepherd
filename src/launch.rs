@@ -217,6 +217,26 @@ fn forward_fixture_env(
     }
 }
 
+/// The launch operation owns a newly created tab before task submission.
+/// Reports remain independent of that operation and always win over fallback.
+fn current_launch(store: &Store, record: &AgentRecord) -> Result<bool, ShepherdError> {
+    Ok(store.read()?.agents.iter().any(|current| {
+        current == record
+            && current.report.is_none()
+            && current.status != AgentStatus::Retired
+            && !current.prompt_delivery_uncertain()
+    }))
+}
+
+fn owned_launch(h: &dyn Herdr, store: &Store, record: &AgentRecord) -> Result<bool, ShepherdError> {
+    let Some(info) = h.agent_get(&record.name)? else {
+        return Ok(false);
+    };
+    Ok(crate::supervise::owned_terminal(record, &info)
+        && crate::supervise::same_session(record, h.pane_session_ref(&info.pane_id)?.as_deref())
+        && current_launch(store, record)?)
+}
+
 fn launch_reserved(
     h: &dyn Herdr,
     store: &Store,
@@ -261,6 +281,9 @@ fn launch_reserved(
         forward_fixture_env(&fixture, &req.state_dir, &req.worktree, &mut env);
     }
     for runner in &req.runners {
+        if !current_launch(store, record)? {
+            return Ok(());
+        }
         let harness = crate::harness::harness_for(&runner.harness)?;
         record.task = req
             .prompt
@@ -277,14 +300,28 @@ fn launch_reserved(
             &record.name,
             harness.kind(),
             &pane,
-            &harness.launch_args(runner),
+            &harness.managed_args(harness.launch_args(runner), &req.state_dir)?,
             &env,
         )?;
+        if !current_launch(store, record)? {
+            return Ok(());
+        }
         if start == AgentStart::NotReady {
             let screen = h.read_visible(&record.name)?;
             if harness.provider_failure(&screen) {
+                // No task has crossed the prompt boundary, but verify the
+                // reserved recipient again before each destructive effect.
+                if !owned_launch(h, store, record)? {
+                    return Ok(());
+                }
                 h.send_keys(&record.name, &["esc".into()])?;
+                if !owned_launch(h, store, record)? {
+                    return Ok(());
+                }
                 h.close_tab(&tab)?;
+                if !current_launch(store, record)? {
+                    return Ok(());
+                }
                 record.status = AgentStatus::LaunchFailed;
                 record.observed = Some("provider_failure".into());
                 save(store, record)?;
@@ -300,31 +337,24 @@ fn launch_reserved(
             );
             return Ok(());
         }
-        match crate::flock::deliver_pending_prompt(h, store, &record.name) {
-            Ok(false) => {
-                if let Some(current) = store
-                    .read()?
-                    .agents
-                    .into_iter()
-                    .find(|a| a.name == record.name)
-                {
-                    *record = current;
-                }
-            }
-            Ok(true) => {
-                record.prompt_pending = false;
-                record.status = AgentStatus::Working;
-            }
-            Err(error) if error.herdr_code() == Some("agent_blocked") => {
-                record.status = AgentStatus::Blocked;
-            }
-            Err(error) if error.prompt_was_submitted() => {
-                // Accepted submissions must never be sent a second time solely
-                // because the observation deadline expired.
-                record.prompt_pending = false;
-                record.status = AgentStatus::Working;
-                record.observed = Some("prompt_delivery_uncertain".into());
-            }
+        let delivery = crate::flock::deliver_pending_prompt(h, store, &record.name);
+        // Delivery owns the durable claim, including an ambiguous outcome.
+        // Reload it before save so an error cannot restore a stale pending task.
+        if let Some(current) = store
+            .read()?
+            .agents
+            .into_iter()
+            .find(|a| a.name == record.name)
+        {
+            *record = current;
+        }
+        match delivery {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.herdr_code(),
+                    Some("agent_blocked" | "agent_not_ready")
+                ) || error.prompt_submission_uncertain() => {}
             Err(error) => return Err(error),
         }
         save(store, record)?;
@@ -470,6 +500,38 @@ mod tests {
     }
 
     #[test]
+    fn managed_omp_initial_launch_preserves_pinned_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let store = Store::open(&state, dir.path()).unwrap();
+        let h = FakeHerdr::new(vec![]);
+        let mut request = req(dir.path(), &state);
+        request.runners.remove(0);
+        request.runners[0].args.extend([
+            "--config".into(),
+            "custom.yml".into(),
+            "--no-title".into(),
+        ]);
+        let pinned = request.runners[0].args.clone();
+        let record = launch(&h, &store, request).unwrap();
+        let args = h.start_args.borrow();
+        assert_eq!(&args[0][..pinned.len()], pinned);
+        assert_eq!(args[0].len(), pinned.len() + 2);
+        assert_eq!(args[0][pinned.len()], "--config");
+        assert_eq!(
+            std::fs::read_to_string(&args[0][pinned.len() + 1]).unwrap(),
+            "paste:\n  largeMenuThreshold: 0\n"
+        );
+        assert_eq!(record.runner, "omp-astra");
+        assert_eq!(record.status, AgentStatus::Working);
+        assert_eq!(h.accepted_prompts.borrow().len(), 1);
+        assert_eq!(
+            h.start_envs.borrow()[0]["HERDR_PLUGIN_STATE_DIR"],
+            state.to_string_lossy()
+        );
+    }
+
+    #[test]
     fn active_launch_is_not_reconciled_as_missing() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
@@ -537,6 +599,207 @@ mod tests {
             "startup events must not duplicate the initial task"
         );
     }
+    // Transport errors do not tell us whether the application accepted a task.
+    // Exercise both runners through the same public launch and recovery flow.
+    #[test]
+    fn ambiguous_prompt_delivery_is_quarantined_without_duplicate_input() {
+        for runner in ["omp-astra", "codex-sol-high"] {
+            for accepted in [false, true] {
+                for code in ["timeout", "agent_prompt_stalled", "local_deadline"] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let state = dir.path().join("state");
+                    let store = Store::open(&state, dir.path()).unwrap();
+                    let h = FakeHerdr::new(vec![]);
+                    let error = if code == "local_deadline" {
+                        ShepherdError::Runtime(crate::proc::DeadlineExceeded.into())
+                    } else {
+                        ShepherdError::HerdrCommand {
+                            code: code.into(),
+                            message: "observation expired".into(),
+                        }
+                    };
+                    h.prompt_results
+                        .borrow_mut()
+                        .push_back((accepted, Err(error)));
+                    let mut request = req(dir.path(), &state);
+                    request.runners =
+                        vec![crate::roles::resolve(&cfg()).unwrap().runners[runner].clone()];
+                    let record = launch(&h, &store, request).unwrap();
+                    assert_eq!(record.status, AgentStatus::Blocked, "{runner}: {code}");
+                    assert!(
+                        !record.prompt_pending,
+                        "ambiguous delivery cannot be replayed"
+                    );
+                    assert_eq!(record.runner, runner);
+                    assert_eq!(record.worktree, dir.path());
+                    assert!(
+                        record
+                            .observed
+                            .as_deref()
+                            .unwrap()
+                            .contains("prompt_delivery_uncertain")
+                    );
+                    store
+                        .update(|data| {
+                            data.tickets.push(crate::store::Ticket {
+                                id: record.ticket.clone(),
+                                state: crate::store::TicketState::Building,
+                                worktree: Some(record.worktree.clone()),
+                                ..Default::default()
+                            });
+                            Ok(())
+                        })
+                        .unwrap();
+                    h.agent_records.borrow_mut()[0].cwd = Some(dir.path().into());
+                    for now in [100, 1000, 2000] {
+                        crate::flock::reconcile(&h, &store).unwrap();
+                        let sweep =
+                            crate::supervise::supervise_project(&h, &store, &cfg(), &state, now)
+                                .unwrap();
+                        assert!(sweep.errors.is_empty(), "{:?}", sweep.errors);
+                        let current = store.read().unwrap().agents.remove(0);
+                        assert_eq!(current.status, AgentStatus::Blocked);
+                        assert!(!current.prompt_pending);
+                    }
+                    assert_eq!(h.accepted_prompts.borrow().len(), usize::from(accepted));
+                    let calls = h.calls.borrow();
+                    assert_eq!(
+                        calls
+                            .iter()
+                            .filter(|c| c.starts_with("prompt_agent"))
+                            .count(),
+                        1
+                    );
+                    assert!(!calls.iter().any(|c| c.starts_with("send_keys")
+                        || c.starts_with("close_tab")
+                        || c.starts_with("resume_agent")));
+                    drop(calls);
+                    // Later independent working evidence can release quarantine,
+                    // including a user who manually submitted already staged text.
+                    h.agent_records.borrow_mut()[0].agent_status = "working".into();
+                    let sweep =
+                        crate::supervise::supervise_project(&h, &store, &cfg(), &state, 2001)
+                            .unwrap();
+                    assert!(sweep.errors.is_empty(), "{:?}", sweep.errors);
+                    assert_eq!(store.read().unwrap().agents[0].status, AgentStatus::Working);
+                    assert_eq!(
+                        h.calls
+                            .borrow()
+                            .iter()
+                            .filter(|c| c.starts_with("prompt_agent"))
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn proven_prompt_rejection_recovers_once_after_readiness() {
+        for code in ["agent_blocked", "agent_not_ready"] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = dir.path().join("state");
+            let store = Store::open(&state, dir.path()).unwrap();
+            store
+                .update(|data| {
+                    data.tickets.push(crate::store::Ticket {
+                        id: "T-1".into(),
+                        state: crate::store::TicketState::Building,
+                        worktree: Some(dir.path().into()),
+                        workspace_id: Some("w1".into()),
+                        ..Default::default()
+                    });
+                    Ok(())
+                })
+                .unwrap();
+            let h = FakeHerdr::new(vec![]);
+            h.prompt_results.borrow_mut().push_back((
+                false,
+                Err(ShepherdError::HerdrCommand {
+                    code: code.into(),
+                    message: "rejected before input".into(),
+                }),
+            ));
+            let record = launch(&h, &store, req(dir.path(), &state)).unwrap();
+            assert_eq!(record.status, AgentStatus::Blocked);
+            assert!(record.prompt_pending);
+            assert!(h.accepted_prompts.borrow().is_empty());
+            h.agent_records.borrow_mut()[0].cwd = Some(dir.path().into());
+            crate::flock::reconcile(&h, &store).unwrap();
+            crate::flock::reconcile(&h, &store).unwrap();
+            assert_eq!(h.accepted_prompts.borrow().len(), 1);
+            assert!(!store.read().unwrap().agents[0].prompt_pending);
+            assert_eq!(
+                h.calls
+                    .borrow()
+                    .iter()
+                    .filter(|c| c.starts_with("prompt_agent"))
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_prompt_claim_is_not_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let store = Store::open(&state, dir.path()).unwrap();
+        let h = FakeHerdr::new(vec![]);
+        *h.on_prompt.borrow_mut() = Some(Box::new(|_| panic!("dispatch interrupted")));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            launch(&h, &store, req(dir.path(), &state))
+        }));
+        assert!(result.is_err());
+        let record = store.read().unwrap().agents.remove(0);
+        assert!(!record.prompt_pending);
+        assert_eq!(record.status, AgentStatus::Blocked);
+        // A missing projection does not prove nonacceptance either.
+        h.agent_records.borrow_mut().clear();
+        crate::flock::reconcile(&h, &store).unwrap();
+        assert_eq!(store.read().unwrap().agents[0].status, AgentStatus::Blocked);
+        assert!(crate::flock::store_report(&store, &record.name, r#"{"status":"completed","summary":"late report","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).is_ok());
+        assert_eq!(
+            store.read().unwrap().agents[0].status,
+            AgentStatus::Reported
+        );
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|c| c.starts_with("prompt_agent"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn real_report_during_ambiguous_delivery_keeps_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let store = Store::open(&state, dir.path()).unwrap();
+        let h = FakeHerdr::new(vec![]);
+        let observed = store.clone();
+        *h.on_prompt.borrow_mut() = Some(Box::new(move |name| {
+            crate::flock::store_report(&observed, name, r#"{"status":"completed","summary":"real report","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+        }));
+        h.prompt_results.borrow_mut().push_back((
+            true,
+            Err(ShepherdError::HerdrCommand {
+                code: "timeout".into(),
+                message: "late observation".into(),
+            }),
+        ));
+        let record = launch(&h, &store, req(dir.path(), &state)).unwrap();
+        assert_eq!(record.status, AgentStatus::Reported);
+        assert_eq!(record.report.as_ref().unwrap().summary, "real report");
+        assert!(!record.prompt_pending);
+        crate::flock::reconcile(&h, &store).unwrap();
+        assert!(!crate::flock::deliver_pending_prompt(&h, &store, &record.name).unwrap());
+        assert_eq!(h.accepted_prompts.borrow().len(), 1);
+    }
+
     #[test]
     fn all_runners_fail_launch_failed() {
         let dir = tempfile::tempdir().unwrap();
@@ -632,6 +895,59 @@ mod tests {
     }
 
     #[test]
+    fn automatic_startup_fallback_preserves_report_and_retirement() {
+        for outcome in ["report", "retire", "uncertain"] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = dir.path().join("state");
+            let store = Store::open(&state, dir.path()).unwrap();
+            let h = FakeHerdr::new(vec![]);
+            h.start_results.borrow_mut().push_back(AgentStart::NotReady);
+            h.visible_screens
+                .borrow_mut()
+                .push_back("rate limit reached".into());
+            let callback_store = store.clone();
+            *h.on_start.borrow_mut() = Some(Box::new(move |name| match outcome {
+                "report" => {
+                    crate::flock::store_report(&callback_store, name, r#"{"status":"completed","summary":"real report","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+                }
+                "retire" => {
+                    callback_store
+                        .update(|data| {
+                            data.agents[0].status = AgentStatus::Retired;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                _ => {
+                    callback_store
+                        .update(|data| {
+                            data.agents[0].status = AgentStatus::Blocked;
+                            data.agents[0].set_prompt_delivery_uncertain(true);
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            }));
+            let record = launch(&h, &store, req(dir.path(), &state)).unwrap();
+            assert_eq!(record.runner, "codex-sol-high");
+            match outcome {
+                "report" => assert_eq!(record.report.unwrap().summary, "real report"),
+                "retire" => assert_eq!(record.status, AgentStatus::Retired),
+                _ => assert!(record.prompt_delivery_uncertain()),
+            }
+            assert_eq!(h.start_args.borrow().len(), 1);
+            assert!(
+                !h.calls
+                    .borrow()
+                    .iter()
+                    .any(|call| call.starts_with("send_keys ")
+                        || call.starts_with("close_tab ")
+                        || call.starts_with("prompt_agent "))
+            );
+        }
+    }
+
+    #[test]
     fn fallback_on_provider_failure() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
@@ -660,5 +976,12 @@ mod tests {
             .collect();
         assert_eq!(starts.len(), 2);
         assert!(starts[0].0 < close && close < starts[1].0);
+        let args = h.start_args.borrow();
+        assert!(!args[0].contains(&"--config".into()));
+        assert_eq!(args[1][args[1].len() - 2], "--config");
+        assert_eq!(
+            std::fs::read_to_string(args[1].last().unwrap()).unwrap(),
+            "paste:\n  largeMenuThreshold: 0\n"
+        );
     }
 }

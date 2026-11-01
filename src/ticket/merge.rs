@@ -98,7 +98,12 @@ pub(crate) fn retire_flock(store: &Store, h: &dyn Herdr, id: &str) -> Result<(),
                     | AgentStatus::Reported
             )
     }) {
-        crate::flock::cancel(h, store, &agent.name, false)?;
+        if !crate::flock::retire_automatically(h, store, &agent)? {
+            return Err(ShepherdError::PolicyDenied(format!(
+                "{}: automatic retirement deferred; resources kept",
+                agent.name
+            )));
+        }
     }
     Ok(())
 }
@@ -756,6 +761,255 @@ mod tests {
                 });
         }
     }
+    #[test]
+    fn automatic_terminal_retirement_keeps_unknown_or_busy_resources() {
+        for state in [TicketState::PrOpen, TicketState::Closed] {
+            for blocked_by in ["unknown", "busy", "session", "pane", "outside", "ticket"] {
+                let fixture = Fixture::new(state);
+                fixture.agent();
+                if blocked_by == "unknown" {
+                    fixture
+                        .store
+                        .update(|data| {
+                            data.agents[0].set_prompt_delivery_uncertain(true);
+                            data.agents[0].status = AgentStatus::Blocked;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                if blocked_by == "session" {
+                    fixture
+                        .store
+                        .update(|data| {
+                            data.agents[0].observed = Some(r#"{"session_ref":"saved"}"#.into());
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                if blocked_by == "pane" {
+                    fixture.h.fake.agent_records.borrow_mut()[0].pane_id = "w1:other".into();
+                }
+                if blocked_by == "outside" {
+                    fixture.h.fake.agent_records.borrow_mut()[0].cwd = Some(fixture.h.main.clone());
+                }
+                if blocked_by == "ticket" {
+                    fixture
+                        .store
+                        .update(|data| {
+                            data.agents[0].ticket = "other".into();
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                let _operation = (blocked_by == "busy").then(|| {
+                    crate::flock::try_agent_operation(&fixture.store, "coder")
+                        .unwrap()
+                        .unwrap()
+                });
+                // Terminal ticket policy may still advance/escalate, but cleanup must stop.
+                let result = fixture.run();
+                assert!(
+                    result.is_err() || result.unwrap() != MergeOutcome::CleanedUp,
+                    "{blocked_by}"
+                );
+                assert!(fixture.path.exists());
+                assert_ne!(fixture.ticket().state, TicketState::CleanedUp);
+                assert_ne!(
+                    fixture.store.read().unwrap().agents[0].status,
+                    AgentStatus::Retired
+                );
+                assert!(
+                    !fixture.h.fake.calls.borrow().iter().any(|call| call
+                        .starts_with("send_keys ")
+                        || call.starts_with("close_tab ")
+                        || call.starts_with("remove_worktree ")
+                        || call.starts_with("close_workspace ")),
+                    "{blocked_by}: {:?}",
+                    fixture.h.fake.calls.borrow()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_retirement_rechecks_project_ownership_after_transport() {
+        let fixture = Fixture::new(TicketState::PrOpen);
+        fixture.agent();
+        let store = fixture.store.clone();
+        let outside = fixture.h.main.clone();
+        *fixture.h.fake.on_get.borrow_mut() = Some(Box::new(move |_| {
+            store
+                .update(|data| {
+                    data.tickets[0].worktree = Some(outside.clone());
+                    Ok(())
+                })
+                .unwrap();
+        }));
+        assert!(retire_flock(&fixture.store, &fixture.h, "T1").is_err());
+        assert_eq!(
+            fixture.store.read().unwrap().agents[0].status,
+            AgentStatus::Working
+        );
+        assert!(
+            !fixture
+                .h
+                .fake
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("send_keys ") || call.starts_with("close_tab "))
+        );
+    }
+
+    #[test]
+    fn automatic_retirement_never_follows_a_reassigned_candidate() {
+        let fixture = Fixture::new(TicketState::PrOpen);
+        fixture.agent();
+        fixture
+            .store
+            .update(|data| {
+                let mut sibling = data.agents[0].clone();
+                sibling.name = "sibling".into();
+                sibling.pane_id = Some("w1:p2".into());
+                sibling.tab_id = Some("w1:t2".into());
+                data.agents.push(sibling);
+                let mut ticket = data.tickets[0].clone();
+                ticket.id = "T2".into();
+                data.tickets.push(ticket);
+                Ok(())
+            })
+            .unwrap();
+        let mut info = fixture.h.fake.agent_records.borrow()[0].clone();
+        info.name = Some("sibling".into());
+        info.pane_id = "w1:p2".into();
+        fixture.h.fake.agent_records.borrow_mut().push(info);
+        let store = fixture.store.clone();
+        *fixture.h.fake.on_send_keys.borrow_mut() = Some(Box::new(move |name| {
+            if name == "coder" {
+                store
+                    .update(|data| {
+                        data.agents[1].ticket = "T2".into();
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }));
+        let _ = retire_flock(&fixture.store, &fixture.h, "T1");
+        assert_eq!(
+            fixture.store.read().unwrap().agents[1].status,
+            AgentStatus::Working
+        );
+        assert!(
+            !fixture
+                .h
+                .fake
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("send_keys sibling ") || call == "close_tab w1:t2")
+        );
+    }
+
+    #[test]
+    fn automatic_retirement_preserves_reports_arriving_during_escape() {
+        let fixture = Fixture::new(TicketState::PrOpen);
+        fixture.agent();
+        let store = fixture.store.clone();
+        *fixture.h.fake.on_send_keys.borrow_mut() = Some(Box::new(move |name| {
+            crate::flock::store_report(&store, name, r#"{"status":"completed","summary":"real report","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+        }));
+        assert!(
+            !crate::flock::retire_automatically(
+                &fixture.h,
+                &fixture.store,
+                &fixture.store.read().unwrap().agents[0]
+            )
+            .unwrap()
+        );
+        let rec = fixture.store.read().unwrap().agents[0].clone();
+        assert_eq!(rec.status, AgentStatus::Reported);
+        assert_eq!(rec.report.as_ref().unwrap().summary, "real report");
+        assert!(
+            !fixture
+                .h
+                .fake
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("close_tab "))
+        );
+        *fixture.h.fake.on_send_keys.borrow_mut() = None;
+        assert!(
+            crate::flock::retire_automatically(
+                &fixture.h,
+                &fixture.store,
+                &fixture.store.read().unwrap().agents[0]
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            fixture
+                .h
+                .fake
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("send_keys "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .h
+                .fake
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("close_tab "))
+                .count(),
+            1
+        );
+        assert_eq!(fixture.store.read().unwrap().agents[0].report, rec.report);
+    }
+
+    #[test]
+    fn explicit_operator_cancel_can_retire_unknown_delivery() {
+        let fixture = Fixture::new(TicketState::PrOpen);
+        fixture.agent();
+        fixture
+            .store
+            .update(|data| {
+                data.agents[0].set_prompt_delivery_uncertain(true);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            crate::flock::cancel(&fixture.h, &fixture.store, "coder", false)
+                .unwrap()
+                .status,
+            AgentStatus::Retired
+        );
+        assert!(
+            fixture
+                .h
+                .fake
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("send_keys "))
+        );
+        assert!(
+            fixture
+                .h
+                .fake
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("close_tab "))
+        );
+        assert!(fixture.path.exists());
+    }
+
     #[test]
     fn transport_open_failure_escalates_and_notifies() {
         let fixture = Fixture::new(TicketState::PrOpen);

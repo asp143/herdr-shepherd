@@ -378,7 +378,9 @@ impl Herdr for CliHerdr {
         if until_working {
             args.extend(["--wait", "--until", "working", "--timeout", "30000"]);
         }
-        self.request(&args).map(|_| ())
+        self.request(&args)
+            .map(|_| ())
+            .map_err(ShepherdError::into_prompt_error)
     }
 
     fn send_keys(&self, name: &str, keys: &[String]) -> Result<(), ShepherdError> {
@@ -526,9 +528,72 @@ mod tests {
             .unwrap();
             let error = command_error(&output);
             assert_eq!(error.herdr_code(), expected);
-            assert_eq!(error.prompt_was_submitted(), expected == Some("timeout"));
+            assert!(
+                !error.prompt_submission_uncertain(),
+                "generic commands do not imply prompt dispatch"
+            );
         }
     }
+    #[test]
+    fn prompt_cli_preserves_argv_and_quarantines_unacknowledged_delivery() {
+        for (response, exit, code, uncertain) in [
+            (
+                r#"{"result":{"agent":{"agent_status":"working"}}}"#,
+                0,
+                None,
+                false,
+            ),
+            (
+                r#"{"error":{"code":"timeout","message":"private prompt text"}}"#,
+                1,
+                Some("timeout"),
+                true,
+            ),
+            (
+                r#"{"error":{"code":"agent_prompt_stalled","message":"private prompt text"}}"#,
+                1,
+                Some("agent_prompt_stalled"),
+                true,
+            ),
+            (
+                r#"{"error":{"code":"agent_blocked","message":"private prompt text"}}"#,
+                1,
+                Some("agent_blocked"),
+                false,
+            ),
+            (
+                r#"{"error":{"code":"agent_not_ready","message":"private prompt text"}}"#,
+                1,
+                Some("agent_not_ready"),
+                false,
+            ),
+            ("truncated acknowledgement", 0, None, true),
+            ("connection lost after dispatch", 1, None, true),
+        ] {
+            let (dir, h, _listener) = output_fixture(response);
+            let log = dir.path().join("argv");
+            std::fs::write(&log, "").unwrap();
+            std::fs::write(dir.path().join("exit-code"), format!("{exit}\n")).unwrap();
+            let writers = retain_fixture_writers(dir.path());
+            let result = h.prompt_agent("sh-fixture-researcher-1", "task with spaces", true);
+            drop(writers);
+            let diagnostic = format!("{result:?}");
+            if exit == 0 && !uncertain {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.herdr_code(), code);
+                assert_eq!(error.prompt_submission_uncertain(), uncertain);
+                assert!(!error.to_string().contains("private prompt text"));
+                assert!(!error.to_string().contains("task with spaces"));
+            }
+            assert_eq!(
+                std::fs::read_to_string(log).expect(&diagnostic),
+                "agent\nprompt\nsh-fixture-researcher-1\ntask with spaces\n--wait\n--until\nworking\n--timeout\n30000\n"
+            );
+        }
+    }
+
     #[test]
     fn metadata_uses_socket_tokens_and_null_clears() {
         use std::io::{BufRead, BufReader, Write};
@@ -616,11 +681,7 @@ mod tests {
     }
     #[test]
     fn start_agent_accepts_silent_run_and_text_wait() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("herdr.sock");
-        let _listener = UnixListener::bind(&socket).unwrap();
-        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/herdr-start.sh");
-        let h = CliHerdr { bin, socket };
+        let (dir, h, _listener) = start_fixture(r#"{"result":{"agent":{"agent_status":"idle"}}}"#);
         let values = HashMap::from([(
             "GIT_CONFIG_GLOBAL".into(),
             dir.path()
@@ -628,6 +689,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         )]);
+        let writers = retain_fixture_writers(dir.path());
         let result = h.start_agent(
             "sh-fixture-coder-1",
             "codex",
@@ -635,34 +697,13 @@ mod tests {
             &["--yolo".into(), "-m".into(), "gpt-6.1-sol".into()],
             &values,
         );
+        drop(writers);
         assert!(matches!(result, Ok(AgentStart::Ready)), "{result:?}");
     }
 
     #[test]
     fn claude_start_and_prompt_use_generic_readiness_contract() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("herdr.sock");
-        let _listener = UnixListener::bind(&socket).unwrap();
-        let bin = dir.path().join("herdr-fake");
-        std::fs::write(
-            &bin,
-            r#"#!/bin/sh
-case "$1 $2" in
-  'pane run' | 'pane wait-output') exit 0 ;;
-  'agent start')
-    printf '%s\n' "$@" > "${0%/*}/start-args"
-    printf '%s\n' '{"result":{"agent":{"agent_status":"idle"}}}' ;;
-  'agent prompt')
-    printf '%s\n' "$@" > "${0%/*}/prompt-args"
-    printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
-  *) exit 9 ;;
-esac
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let h = CliHerdr { bin, socket };
+        let (dir, h, _listener) = start_fixture(r#"{"result":{"agent":{"agent_status":"idle"}}}"#);
         let values = HashMap::from([(
             "GIT_CONFIG_GLOBAL".into(),
             dir.path()
@@ -697,6 +738,35 @@ esac
         );
     }
 
+    #[test]
+    fn start_agent_surfaces_unsupported_omp_overlay_without_retry() {
+        let (dir, h, _listener) = start_fixture(r#"{"error":{"code":"unsupported_config"}}"#);
+        let starts = dir.path().join("argv");
+        std::fs::write(&starts, "").unwrap();
+        std::fs::write(dir.path().join("exit-code"), "1\n").unwrap();
+        let values = HashMap::from([(
+            "GIT_CONFIG_GLOBAL".into(),
+            dir.path()
+                .join("agent.gitconfig")
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+        let harness = crate::harness::harness_for("omp").unwrap();
+        let args = harness
+            .managed_args(vec!["--model".into(), "fixture/probe".into()], dir.path())
+            .unwrap();
+        let writers = retain_fixture_writers(dir.path());
+        let error = h
+            .start_agent("sh-fixture-coder-1", "omp", "owned:p1", &args, &values)
+            .unwrap_err();
+        drop(writers);
+        assert_eq!(error.herdr_code(), Some("unsupported_config"));
+        let sent = std::fs::read_to_string(starts).unwrap();
+        assert_eq!(sent.lines().filter(|line| *line == "start").count(), 1);
+        assert_eq!(sent.lines().filter(|line| *line == "--config").count(), 1);
+        assert!(sent.ends_with(&format!("{}\n", args.last().unwrap())));
+    }
+
     fn output_fixture(text: &str) -> (tempfile::TempDir, CliHerdr, UnixListener) {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("herdr.sock");
@@ -708,14 +778,16 @@ esac
         (dir, CliHerdr { bin, socket }, listener)
     }
 
-    #[test]
-    fn output_fixture_runs_with_retained_writers() {
-        let screen = "Trust 'this folder'?\nTrust and continue\n";
-        let (dir, h, _listener) = output_fixture(screen);
-        // A concurrent fork can retain a fixture writer until exec, even with
-        // CLOEXEC and after the creating thread has closed its own descriptor.
-        // Hold the same writable-inode state deterministically during capture.
-        let writers: Vec<_> = std::fs::read_dir(dir.path())
+    fn start_fixture(text: &str) -> (tempfile::TempDir, CliHerdr, UnixListener) {
+        let (dir, mut h, listener) = output_fixture(text);
+        h.bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/herdr-start.sh");
+        (dir, h, listener)
+    }
+
+    fn retain_fixture_writers(dir: &Path) -> Vec<std::fs::File> {
+        // Model the writable inode a concurrent fork can retain until exec,
+        // even after the creating thread has closed its CLOEXEC descriptor.
+        let writers: Vec<_> = std::fs::read_dir(dir)
             .unwrap()
             .map(Result::unwrap)
             .filter(|entry| entry.file_type().unwrap().is_file())
@@ -727,6 +799,14 @@ esac
             })
             .collect();
         assert!(!writers.is_empty());
+        writers
+    }
+
+    #[test]
+    fn output_fixture_runs_with_retained_writers() {
+        let screen = "Trust 'this folder'?\nTrust and continue\n";
+        let (dir, h, _listener) = output_fixture(screen);
+        let writers = retain_fixture_writers(dir.path());
         let result = h.read_visible("sh-fixture-coder-1");
         drop(writers);
         assert_eq!(result.unwrap(), screen);

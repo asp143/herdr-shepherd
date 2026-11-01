@@ -396,7 +396,12 @@ pub fn integrate(
                 for rec in store.read()?.agents.into_iter().filter(|a| {
                     a.ticket == id && a.worktree == child.path && a.status == AgentStatus::Reported
                 }) {
-                    herdr_shepherd::flock::cancel(h, store, &rec.name, false)?;
+                    if !herdr_shepherd::flock::retire_automatically(h, store, &rec)? {
+                        return Err(ShepherdError::PolicyDenied(format!(
+                            "{}: automatic retirement deferred; child resources kept",
+                            rec.name
+                        )));
+                    }
                 }
                 children::cleanup_integrated(h, &path, std::slice::from_ref(child))?;
                 store.update(|data| {

@@ -8,6 +8,18 @@ use crate::{error::ShepherdError, roles::Runner};
 pub trait Harness {
     fn kind(&self) -> &'static str;
     fn launch_args(&self, runner: &Runner) -> Vec<String>;
+    /// Apply shepherd-owned transport settings without changing the pinned runner.
+    fn managed_args(
+        &self,
+        args: Vec<String>,
+        state_dir: &std::path::Path,
+    ) -> Result<Vec<String>, ShepherdError> {
+        if self.kind() == "omp" {
+            omp::managed_args(args, state_dir)
+        } else {
+            Ok(args)
+        }
+    }
     fn subagent_hint(&self) -> &'static str;
     fn provider_failure(&self, screen: &str) -> bool;
     fn resume_args(&self, runner: &Runner, session_ref: Option<&str>) -> Vec<String> {
@@ -54,6 +66,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn managed_omp_overlay_precedes_literal_argument_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = vec![
+            "--config=custom.yml".into(),
+            "--".into(),
+            "positional prompt".into(),
+        ];
+        let args = harness_for("omp")
+            .unwrap()
+            .managed_args(pinned.clone(), dir.path())
+            .unwrap();
+        assert_eq!(args[0], pinned[0]);
+        assert_eq!(args[1], "--config");
+        assert_eq!(&args[3..], &pinned[1..]);
+        assert_eq!(
+            std::fs::read_to_string(&args[2]).unwrap(),
+            "paste:\n  largeMenuThreshold: 0\n"
+        );
+    }
+
+    #[test]
+    fn managed_omp_overlay_failure_is_not_silently_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("unavailable");
+        std::fs::write(&state, "synthetic non-directory").unwrap();
+        assert!(
+            harness_for("omp")
+                .unwrap()
+                .managed_args(vec![], &state)
+                .is_err()
+        );
+        for kind in ["codex", "claude", "pi"] {
+            let args = vec!["--configured-option".into()];
+            assert_eq!(
+                harness_for(kind)
+                    .unwrap()
+                    .managed_args(args.clone(), &state)
+                    .unwrap(),
+                args
+            );
+        }
+    }
+
+    #[test]
     fn codex_args_verbatim() {
         let runner = Runner {
             name: "codex-sol-high".into(),
@@ -67,7 +123,13 @@ mod tests {
             ],
         };
         assert_eq!(
-            harness_for("codex").unwrap().launch_args(&runner),
+            harness_for("codex")
+                .unwrap()
+                .managed_args(
+                    harness_for("codex").unwrap().launch_args(&runner),
+                    std::path::Path::new("/does-not-exist-synthetic-fixture"),
+                )
+                .unwrap(),
             runner.args
         );
     }

@@ -15,15 +15,23 @@ pub type StartObserver = Box<dyn Fn(&str) + Send>;
 
 pub struct FakeHerdr {
     pub on_start: RefCell<Option<StartObserver>>,
+    pub on_prompt: RefCell<Option<StartObserver>>,
+    pub on_send_keys: RefCell<Option<StartObserver>>,
+    pub on_get: RefCell<Option<StartObserver>>,
     pub workspaces: RefCell<Vec<Workspace>>,
     pub calls: RefCell<Vec<String>>,
     pub notify_error: Cell<bool>,
     pub agent_records: RefCell<Vec<AgentInfo>>,
+    pub agent_get_results: RefCell<VecDeque<Option<AgentInfo>>>,
     pub start_results: RefCell<VecDeque<AgentStart>>,
+    /// Script transport outcomes independently of application acceptance.
+    pub prompt_results: RefCell<VecDeque<(bool, Result<(), ShepherdError>)>>,
+    pub accepted_prompts: RefCell<Vec<String>>,
     pub visible_screens: RefCell<VecDeque<String>>,
     pub visible_cache: RefCell<HashMap<String, String>>,
     pub read_errors: RefCell<HashMap<String, String>>,
     pub panic_on_start: Cell<bool>,
+    pub start_args: RefCell<Vec<Vec<String>>>,
     pub start_envs: RefCell<Vec<HashMap<String, String>>>,
     pub pane_cwds: RefCell<HashMap<String, std::path::PathBuf>>,
     pub pane_sessions: RefCell<HashMap<String, String>>,
@@ -33,15 +41,22 @@ impl FakeHerdr {
     pub fn new(workspaces: Vec<Workspace>) -> Self {
         Self {
             on_start: RefCell::new(None),
+            on_prompt: RefCell::new(None),
+            on_send_keys: RefCell::new(None),
+            on_get: RefCell::new(None),
             workspaces: RefCell::new(workspaces),
             calls: RefCell::new(Vec::new()),
             notify_error: Cell::new(false),
             agent_records: RefCell::new(Vec::new()),
+            agent_get_results: RefCell::new(VecDeque::new()),
             start_results: RefCell::new(VecDeque::new()),
+            prompt_results: RefCell::new(VecDeque::new()),
+            accepted_prompts: RefCell::new(Vec::new()),
             visible_screens: RefCell::new(VecDeque::new()),
             visible_cache: RefCell::new(HashMap::new()),
             read_errors: RefCell::new(HashMap::new()),
             panic_on_start: Cell::new(false),
+            start_args: RefCell::new(Vec::new()),
             start_envs: RefCell::new(Vec::new()),
             pane_cwds: RefCell::new(HashMap::new()),
             pane_sessions: RefCell::new(HashMap::new()),
@@ -60,6 +75,9 @@ impl Herdr for FakeHerdr {
             .borrow_mut()
             .push(format!("create_tab {ws} {label} {}", cwd.display()));
         let sequence = self.calls.borrow().len();
+        self.pane_cwds
+            .borrow_mut()
+            .insert(format!("{ws}:p{sequence}"), cwd.into());
         Ok((format!("{ws}:t{sequence}"), format!("{ws}:p{sequence}")))
     }
     fn create_worktree(
@@ -100,6 +118,7 @@ impl Herdr for FakeHerdr {
         self.calls
             .borrow_mut()
             .push(format!("start_agent {name} {kind} {pane} -- {args:?}"));
+        self.start_args.borrow_mut().push(args.to_vec());
         self.start_envs.borrow_mut().push(env.clone());
         let result = self
             .start_results
@@ -115,7 +134,7 @@ impl Herdr for FakeHerdr {
                 "blocked"
             }
             .into(),
-            cwd: None,
+            cwd: self.pane_cwds.borrow().get(pane).cloned(),
             pane_id: pane.into(),
             workspace_id: None,
         });
@@ -123,6 +142,23 @@ impl Herdr for FakeHerdr {
             observer(name);
         }
         Ok(result)
+    }
+    fn agent_get(&self, name: &str) -> Result<Option<AgentInfo>, ShepherdError> {
+        let info = self
+            .agent_get_results
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or_else(|| {
+                self.agent_records
+                    .borrow()
+                    .iter()
+                    .find(|agent| agent.name.as_deref() == Some(name))
+                    .cloned()
+            });
+        if let Some(observer) = self.on_get.borrow().as_ref() {
+            observer(name);
+        }
+        Ok(info)
     }
     fn prompt_agent(
         &self,
@@ -133,6 +169,9 @@ impl Herdr for FakeHerdr {
         self.calls
             .borrow_mut()
             .push(format!("prompt_agent {name} {text} {until_working}"));
+        if let Some(observer) = self.on_prompt.borrow().as_ref() {
+            observer(name);
+        }
         if self
             .agent_records
             .borrow()
@@ -144,12 +183,23 @@ impl Herdr for FakeHerdr {
                 message: "agent is blocked".into(),
             });
         }
-        Ok(())
+        let (accepted, result) = self
+            .prompt_results
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or((true, Ok(())));
+        if accepted {
+            self.accepted_prompts.borrow_mut().push(name.into());
+        }
+        result
     }
     fn send_keys(&self, name: &str, keys: &[String]) -> Result<(), ShepherdError> {
         self.calls
             .borrow_mut()
             .push(format!("send_keys {name} {keys:?}"));
+        if let Some(observer) = self.on_send_keys.borrow().as_ref() {
+            observer(name);
+        }
         Ok(())
     }
     fn read_visible(&self, name: &str) -> Result<String, ShepherdError> {
