@@ -55,7 +55,7 @@ fn roundtrip_store() {
         })
         .unwrap();
     let reopened = Store::open(dir.path(), &project).unwrap().read().unwrap();
-    assert_eq!(reopened.schema_version, 1);
+    assert_eq!(reopened.schema_version, 2);
     assert_eq!(reopened.project_root, project);
     assert_eq!(reopened.tickets[0].id, "SYM-1");
     assert_eq!(reopened.tickets[0].title, "Keep state");
@@ -169,7 +169,7 @@ fn unsupported_schema_rejected() {
     let store = Store::open(dir.path(), dir.path()).unwrap();
     store.update(|_| Ok(())).unwrap();
     let mut data = store.read().unwrap();
-    data.schema_version = 2;
+    data.schema_version = 3;
     std::fs::write(
         store.root().join("state.json"),
         serde_json::to_vec(&data).unwrap(),
@@ -180,7 +180,7 @@ fn unsupported_schema_rejected() {
             .read()
             .unwrap_err()
             .to_string()
-            .contains("schema version 2")
+            .contains("schema version 3")
     );
     assert!(store.update(|_| Ok(())).is_err());
 }
@@ -198,7 +198,7 @@ fn invalid_metadata_update_does_not_replace_valid_store() {
     assert!(
         store
             .update(|data| {
-                data.schema_version = 2;
+                data.schema_version = 3;
                 Ok(())
             })
             .is_err()

@@ -31,6 +31,11 @@ struct Observation {
     answered_hash: Option<String>,
     prompt_delivery_uncertain: bool,
     prompt_claim: Option<crate::store::PromptClaim>,
+    notice_episode: String,
+    lead_notice_sent: bool,
+    user_notified: bool,
+    escalated: bool,
+    denied: bool,
 }
 fn prior(rec: &AgentRecord) -> Observation {
     let mut observation: Observation = rec
@@ -44,6 +49,72 @@ fn prior(rec: &AgentRecord) -> Observation {
 fn remember(rec: &mut AgentRecord, observation: &Observation) {
     rec.observed = Some(serde_json::to_string(observation).expect("observation serializes"));
 }
+/// Track the condition, not its live screen or its current decision. A safe
+/// rule and a later escalation can both happen within one blocked episode.
+fn notice_episode(rec: &mut AgentRecord, condition: Option<&Condition>, stall_minutes: u64) {
+    let key = match condition {
+        Some(Condition::PromptDeliveryUncertain) => "prompt_delivery_uncertain",
+        Some(Condition::Blocked { .. }) => "blocked",
+        Some(Condition::IdleNoReport { .. }) => "idle",
+        Some(Condition::Stalled { since_min }) if *since_min >= stall_minutes => "stalled",
+        Some(Condition::Exited) => "exited",
+        Some(Condition::ProviderFailure) => "provider_failure",
+        _ => "",
+    };
+    let mut observation = prior(rec);
+    if observation.notice_episode != key {
+        observation.notice_episode = key.into();
+        observation.lead_notice_sent = false;
+        observation.user_notified = false;
+        observation.escalated = false;
+        observation.denied = false;
+        remember(rec, &observation);
+    }
+}
+
+fn is_lead(data: &StoreData, rec: &AgentRecord) -> bool {
+    rec.role == "lead"
+        || data
+            .lead
+            .as_ref()
+            .is_some_and(|lead| lead.agent_name == rec.name)
+}
+
+fn ask_lead(ctx: &ApplyContext<'_>, rec: &AgentRecord, text: &str) -> Result<(), ShepherdError> {
+    let notify_user = ctx.store.update(|data| {
+        let lead = is_lead(data, rec);
+        let Some(current) = data
+            .agents
+            .iter_mut()
+            .find(|a| a.name == rec.name && active(a.status))
+        else {
+            return Ok(false);
+        };
+        let mut observation = prior(current);
+        if lead {
+            let notify = !observation.user_notified;
+            observation.user_notified = true;
+            remember(current, &observation);
+            return Ok(notify);
+        }
+        if !observation.lead_notice_sent {
+            observation.lead_notice_sent = true;
+            remember(current, &observation);
+            data.enqueue_lead_episode_notice(
+                &crate::flock::compact_ping(text),
+                Some(&rec.ticket),
+                Some(&rec.name),
+            );
+        }
+        Ok(false)
+    })?;
+    if notify_user {
+        Notifier::new(ctx.h, ctx.cfg.upkeep.notifications)
+            .send(&format!("{} needs attention", rec.name), text);
+    }
+    Ok(())
+}
+
 fn seconds(text: &str, now: u64) -> u64 {
     text.parse().unwrap_or(now)
 }
@@ -341,7 +412,10 @@ fn block(
     text: &str,
 ) -> Result<(), ShepherdError> {
     let resolved = roles::resolve(ctx.cfg)?;
-    ctx.store.update(|data| {
+    let notify_user = ctx.store.update(|data| {
+        let lead = is_lead(data, rec);
+        let mut notify_user = false;
+        let mut ping_lead = false;
         if let Some(ticket) = data.tickets.iter_mut().find(|t| t.id == rec.ticket)
             && ticket.state != TicketState::Blocked
         {
@@ -361,20 +435,36 @@ fn block(
             current.status = AgentStatus::Blocked;
             let mut observation = prior(current);
             observation.last_action = Some(text.into());
+            notify_user = !observation.user_notified;
+            ping_lead = !lead && !observation.lead_notice_sent;
+            observation.user_notified = true;
+            observation.lead_notice_sent |= ping_lead;
+            match reason {
+                BlockedReason::Policy => observation.denied = true,
+                _ => observation.escalated = true,
+            }
             remember(current, &observation);
         }
-        Ok(())
+        if ping_lead {
+            data.enqueue_lead_episode_notice(
+                &crate::flock::compact_ping(text),
+                Some(&rec.ticket),
+                Some(&rec.name),
+            );
+        }
+        Ok(notify_user)
     })?;
     hooks::emit(
         ctx.cfg,
         "agent.escalated",
         &serde_json::json!({"ticket":rec.ticket,"agent":rec.name,"text":text}),
     );
-    Notifier::new(ctx.h, ctx.cfg.upkeep.notifications).send(
-        &format!("{}: {} needs attention", rec.ticket, rec.name),
-        text,
-    );
-    crate::flock::ping(ctx.h, ctx.store, text);
+    if notify_user {
+        Notifier::new(ctx.h, ctx.cfg.upkeep.notifications).send(
+            &format!("{}: {} needs attention", rec.ticket, rec.name),
+            text,
+        );
+    }
     Ok(())
 }
 
@@ -479,7 +569,7 @@ pub fn apply(
                 &serde_json::json!({"ticket":rec.ticket,"agent":rec.name,"rule":rule}),
             );
         }
-        Decision::AskLead { text } => crate::flock::ping(ctx.h, ctx.store, text),
+        Decision::AskLead { text } => ask_lead(ctx, rec, text)?,
         Decision::Deny { reason } => {
             if in_worktree {
                 ctx.h.send_keys(&rec.name, &["esc".into()])?;
@@ -875,6 +965,7 @@ pub fn supervise_project(
     // must wait for its project, ticket and agent locks, including nested apply.
     let _hooks = hooks::defer();
     let _guard = project_lock(store)?;
+    store.heal_pending_pings()?;
     let resolved = roles::resolve(cfg)?;
     let mut report = SweepReport {
         projects: 1,
@@ -909,6 +1000,11 @@ pub fn supervise_project(
                 .ok_or_else(|| ShepherdError::Usage(format!("unknown runner {}", rec.runner)))?;
             let harness = harness_for(&runner.harness)?;
             let (condition, live) = observe_at(h, &mut rec, &*harness, now, Some(&data))?;
+            notice_episode(
+                &mut rec,
+                condition.as_ref(),
+                resolved.supervision.stall_minutes,
+            );
             if rec.status == AgentStatus::Starting && live.is_none() {
                 return Ok(0);
             }
@@ -936,11 +1032,14 @@ pub fn supervise_project(
                     now,
                 );
                 let observation = prior(&rec);
-                if matches!(
-                    decision,
-                    Decision::AskLead { .. } | Decision::Escalate { .. } | Decision::Deny { .. }
-                ) && observation.last_action.as_deref() == Some(format!("{decision:?}").as_str())
-                {
+                let already_notified = match decision {
+                    Decision::AskLead { .. } if is_lead(&data, &rec) => observation.user_notified,
+                    Decision::AskLead { .. } => observation.lead_notice_sent,
+                    Decision::Escalate { .. } => observation.escalated,
+                    Decision::Deny { .. } => observation.denied,
+                    _ => false,
+                };
+                if already_notified {
                     decision = Decision::Nothing;
                 }
                 if let Some(nudged) = observation.last_nudge_at {
@@ -971,6 +1070,47 @@ pub fn supervise_project(
                         &decision,
                     )?;
                     acted += 1;
+                }
+                // Safe lead input and its escalation clock are independent.
+                // Recheck durable state and live status after keys, since the
+                // rule may have resolved the block or changed the terminal.
+                if matches!(decision, Decision::SendKeys { .. })
+                    && is_lead(&data, &rec)
+                    && !observation.escalated
+                    && now.saturating_sub(observation.condition_since)
+                        >= resolved.supervision.escalate_minutes.saturating_mul(60)
+                    && let Condition::Blocked { screen } = &condition
+                {
+                    let current = store
+                        .read()?
+                        .agents
+                        .into_iter()
+                        .find(|a| a.name == rec.name && active(a.status) && a.report.is_none());
+                    if let Some(current) = current
+                        && !prior(&current).escalated
+                        && h.agent_get(&current.name)?.is_some_and(|live| {
+                            live.agent_status == "blocked"
+                                && live.pane_id == rec.pane_id.as_deref().unwrap_or_default()
+                        })
+                    {
+                        apply(
+                            &ApplyContext {
+                                h,
+                                store,
+                                cfg,
+                                state_dir,
+                                now_s: now,
+                            },
+                            &current,
+                            &Decision::Escalate {
+                                text: format!(
+                                    "{}: {} still blocked: {screen}",
+                                    rec.ticket, rec.name
+                                ),
+                            },
+                        )?;
+                        acted += 1;
+                    }
                 }
             }
             // Safe rules can make an agent ready immediately, or by next sweep.
@@ -1076,6 +1216,9 @@ pub fn sweep_projects(h: &dyn Herdr, state_dir: &Path, global: &Config, now: u64
     };
     for store in stores {
         let result = (|| -> Result<Option<SweepReport>, ShepherdError> {
+            // Healing is independent of agents, configuration and cadence. In
+            // particular, an abandoned project's legacy queue must shrink too.
+            store.heal_pending_pings()?;
             let data = store.read()?;
             if !data.agents.iter().any(|a| active(a.status)) {
                 return Ok(None);
@@ -1304,6 +1447,297 @@ mod tests {
         });
         (store, cfg, h)
     }
+    fn as_lead(store: &Store, h: &FakeHerdr, root: &Path) {
+        store
+            .update(|data| {
+                let rec = &mut data.agents[0];
+                rec.name = "sh-69c8fe-lead".into();
+                rec.ticket.clear();
+                rec.role = "lead".into();
+                rec.runner = "claude-opus".into();
+                rec.worktree = root.into();
+                data.lead = Some(crate::store::LeadRecord {
+                    agent_name: rec.name.clone(),
+                    tab_id: rec.tab_id.clone(),
+                    pane_id: rec.pane_id.clone(),
+                    started_at: "0".into(),
+                    workspace_id: Some("w1".into()),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let mut records = h.agent_records.borrow_mut();
+        records[0].name = Some("sh-69c8fe-lead".into());
+        records[0].cwd = Some(root.into());
+        records[0].agent = "claude".into();
+    }
+
+    fn sweep_ok(h: &FakeHerdr, store: &Store, cfg: &Config, state: &Path, now: u64) {
+        let report = supervise_project(h, store, cfg, state, now).unwrap();
+        assert!(report.errors.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn blocked_lead_changing_screen_notifies_user_once_per_episode_and_keeps_safe_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg, h) = fixture(dir.path());
+        as_lead(&store, &h, dir.path());
+        let state = dir.path().join("state");
+        for now in 1..20 {
+            h.visible_cache
+                .borrow_mut()
+                .insert("sh-69c8fe-lead".into(), format!("Choose something: {now}"));
+            sweep_ok(&h, &store, &cfg, &state, now);
+        }
+        assert!(store.read().unwrap().pending_pings.is_empty());
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("notify "))
+                .count(),
+            1
+        );
+        // Reopening the store models restarting the supervisor, not a new episode.
+        let store = Store::open(&state, dir.path()).unwrap();
+        h.visible_cache
+            .borrow_mut()
+            .insert("sh-69c8fe-lead".into(), "A different dialog".into());
+        sweep_ok(&h, &store, &cfg, &state, 1000);
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("notify "))
+                .count(),
+            1
+        );
+        h.visible_cache.borrow_mut().insert(
+            "sh-69c8fe-lead".into(),
+            include_str!("../../tests/fixtures/claude-trust.txt").into(),
+        );
+        sweep_ok(&h, &store, &cfg, &state, 1001);
+        assert!(
+            h.calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("send_keys ")
+                    && call.contains("down")
+                    && call.contains("enter"))
+        );
+        h.agent_records.borrow_mut()[0].agent_status = "working".into();
+        sweep_ok(&h, &store, &cfg, &state, 1002);
+        h.agent_records.borrow_mut()[0].agent_status = "blocked".into();
+        h.visible_cache
+            .borrow_mut()
+            .insert("sh-69c8fe-lead".into(), "Choose something again".into());
+        sweep_ok(&h, &store, &cfg, &state, 1003);
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("notify "))
+                .count(),
+            2
+        );
+        assert!(store.read().unwrap().pending_pings.is_empty());
+        assert!(h.accepted_prompts.borrow().is_empty());
+    }
+
+    #[test]
+    fn blocked_flock_dedupes_screen_changes_resets_on_recovery_and_escalates_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg, h) = fixture(dir.path());
+        let state = dir.path().join("state");
+        let name = store.read().unwrap().agents[0].name.clone();
+        for now in 1..20 {
+            h.visible_cache
+                .borrow_mut()
+                .insert(name.clone(), format!("Choose something: {now}"));
+            sweep_ok(&h, &store, &cfg, &state, now);
+        }
+        assert_eq!(store.read().unwrap().pending_pings.len(), 1);
+        let store = Store::open(&state, dir.path()).unwrap();
+        for now in [1000, 1001, 1002] {
+            h.visible_cache
+                .borrow_mut()
+                .insert(name.clone(), format!("Still choose: {now}"));
+            sweep_ok(&h, &store, &cfg, &state, now);
+        }
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("notify "))
+                .count(),
+            1
+        );
+        assert_eq!(store.read().unwrap().pending_pings.len(), 1);
+        assert_eq!(
+            prior(&store.read().unwrap().agents[0])
+                .actions
+                .iter()
+                .filter(|action| action.contains("Escalate"))
+                .count(),
+            1
+        );
+        h.agent_records.borrow_mut()[0].agent_status = "working".into();
+        sweep_ok(&h, &store, &cfg, &state, 1003);
+        h.agent_records.borrow_mut()[0].agent_status = "blocked".into();
+        h.visible_cache
+            .borrow_mut()
+            .insert(name.clone(), "Choose something: 1".into());
+        sweep_ok(&h, &store, &cfg, &state, 1004);
+        assert_eq!(store.read().unwrap().pending_pings.len(), 2);
+    }
+
+    #[test]
+    fn answered_safe_dialog_that_remains_blocked_escalates_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg, h) = fixture(dir.path());
+        let state = dir.path().join("state");
+        h.visible_cache.borrow_mut().insert(
+            "sh-owned-coder-1".into(),
+            "Trust this folder? Trust and continue".into(),
+        );
+        for now in [1, 2, 899, 900, 1000, 1001] {
+            sweep_ok(&h, &store, &cfg, &state, now);
+        }
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("send_keys "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("notify "))
+                .count(),
+            1
+        );
+        let observation = prior(&store.read().unwrap().agents[0]);
+        assert_eq!(
+            observation
+                .actions
+                .iter()
+                .filter(|action| action.contains("Escalate"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn changing_safe_lead_dialogs_do_not_suppress_due_escalation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg, h) = fixture(dir.path());
+        as_lead(&store, &h, dir.path());
+        let state = dir.path().join("state");
+        for now in [1, 899, 900, 901, 1000, 1001] {
+            h.visible_cache.borrow_mut().insert(
+                "sh-69c8fe-lead".into(),
+                format!(
+                    "{}\nFrame {now}",
+                    include_str!("../../tests/fixtures/claude-trust.txt")
+                ),
+            );
+            sweep_ok(&h, &store, &cfg, &state, now);
+        }
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("send_keys "))
+                .count(),
+            6
+        );
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("notify "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            prior(&store.read().unwrap().agents[0])
+                .actions
+                .iter()
+                .filter(|action| action.contains("Escalate"))
+                .count(),
+            1
+        );
+        assert!(store.read().unwrap().pending_pings.is_empty());
+    }
+
+    #[test]
+    fn every_human_attention_path_for_a_lead_avoids_the_lead_queue() {
+        for condition in [
+            Condition::PromptDeliveryUncertain,
+            Condition::Blocked {
+                screen: "Choose a package".into(),
+            },
+            Condition::Stalled { since_min: 60 },
+            Condition::Exited,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, cfg, h) = fixture(dir.path());
+            as_lead(&store, &h, dir.path());
+            store
+                .update(|data| {
+                    data.agents[0].nudges = 1;
+                    data.agents[0].restarts = 1;
+                    Ok(())
+                })
+                .unwrap();
+            let rec = store.read().unwrap().agents[0].clone();
+            let settings = roles::resolve(&cfg).unwrap().supervision;
+            let decision = decide(
+                &rec,
+                &condition,
+                &settings,
+                &*harness_for("claude").unwrap(),
+                &BranchPolicy::new(&[], None, None).unwrap(),
+                true,
+                1,
+            );
+            assert!(matches!(decision, Decision::AskLead { .. }));
+            let state = dir.path().join("state");
+            let context = ApplyContext {
+                h: &h,
+                store: &store,
+                cfg: &cfg,
+                state_dir: &state,
+                now_s: 1,
+            };
+            apply(&context, &rec, &decision).unwrap();
+            apply(
+                &context,
+                &rec,
+                &Decision::Escalate {
+                    text: "still blocked".into(),
+                },
+            )
+            .unwrap();
+            assert!(
+                store.read().unwrap().pending_pings.is_empty(),
+                "{condition:?}"
+            );
+            assert_eq!(
+                h.calls
+                    .borrow()
+                    .iter()
+                    .filter(|call| call.starts_with("notify "))
+                    .count(),
+                1,
+                "{condition:?}"
+            );
+        }
+    }
+
     #[test]
     fn concurrent_pending_delivery_submits_only_once() {
         let dir = tempfile::tempdir().unwrap();

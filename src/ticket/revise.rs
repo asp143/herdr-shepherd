@@ -459,7 +459,7 @@ fn finish_revision(
         ticket.revision_run = None;
         ticket.revision_task = None;
         for notification in notifications {
-            data.enqueue_lead_ping(&notification);
+            data.enqueue_lead_notice(&notification, Some(id), None);
         }
         Ok(RevisionOutcome::Pushed { sha: head })
     })?;
@@ -494,7 +494,7 @@ fn block_push_conflict(
             Some(crate::store::BlockedReason::Conflict),
             now,
         )?;
-        data.enqueue_lead_ping(&message);
+        data.enqueue_lead_notice(&message, Some(id), None);
         Ok(())
     })?;
     crate::notify::Notifier::new(h, cfg.upkeep.notifications).send(&message, "");

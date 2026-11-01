@@ -62,6 +62,19 @@ impl Store {
         Ok(result)
     }
 
+    /// Heal with the same state lock as enqueue; routine cleanup only logs counts.
+    pub fn heal_pending_pings(&self) -> Result<usize, ShepherdError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let healed = self.update(|data| Ok(data.heal_pending_pings(now)))?;
+        if healed > 0 {
+            eprintln!("shepherd: healed {healed} queued notice(s)");
+        }
+        Ok(healed)
+    }
+
     fn read_unlocked(&self) -> Result<StoreData, ShepherdError> {
         let path = self.root.join("state.json");
         match fs::read(&path) {
@@ -72,7 +85,10 @@ impl Store {
                         path.display()
                     )
                 };
-                let data: StoreData = serde_json::from_slice(&bytes).with_context(recovery)?;
+                let mut data: StoreData = serde_json::from_slice(&bytes).with_context(recovery)?;
+                if data.schema_version == 1 {
+                    data.schema_version = 2;
+                }
                 self.validate(&data).with_context(recovery)?;
                 Ok(data)
             }
@@ -83,7 +99,7 @@ impl Store {
 
     fn empty_data(&self) -> StoreData {
         StoreData {
-            schema_version: 1,
+            schema_version: 2,
             project_root: self.project_root.clone(),
             trust: None,
             lead: None,
@@ -95,7 +111,7 @@ impl Store {
     }
 
     fn validate(&self, data: &StoreData) -> Result<(), ShepherdError> {
-        if data.schema_version != 1 {
+        if data.schema_version != 2 {
             return Err(anyhow::anyhow!(
                 "unsupported store schema version {}",
                 data.schema_version

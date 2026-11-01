@@ -1,4 +1,5 @@
 use crate::{gate::BranchPolicy, harness::Harness, roles::SupervisionSettings, store::AgentRecord};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Condition {
@@ -53,7 +54,11 @@ pub fn decide(
             .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
             .and_then(|v| v.get("condition_since").and_then(serde_json::Value::as_u64))
             .unwrap_or_else(|| rec.last_progress_at.parse().unwrap_or(now_s));
-        if now_s.saturating_sub(since) >= s.escalate_minutes.saturating_mul(60) {
+        let overdue = now_s.saturating_sub(since) >= s.escalate_minutes.saturating_mul(60);
+        // Flock escalation takes precedence over further automatic input. The
+        // lead can still accept safe keys; the sweep checks its due escalation
+        // separately so a changing safe dialog cannot indefinitely defer it.
+        if overdue && rec.role != "lead" {
             return Decision::Escalate {
                 text: format!("{}: {} still blocked: {screen}", rec.ticket, rec.name),
             };
@@ -66,12 +71,35 @@ pub fn decide(
                     .is_none_or(|kind| kind == harness.kind())
                     && rule.pattern.is_match(screen)
                 {
-                    return Decision::SendKeys {
-                        rule: rule.name.clone(),
-                        keys: rule.keys.clone(),
-                    };
+                    let hash = format!("{:x}", Sha256::digest(screen.as_bytes()));
+                    let already_answered = rec
+                        .observed
+                        .as_deref()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                        .and_then(|value| {
+                            value
+                                .get("answered_hash")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .is_some_and(|answered| answered == hash);
+                    if !already_answered {
+                        return Decision::SendKeys {
+                            rule: rule.name.clone(),
+                            keys: rule.keys.clone(),
+                        };
+                    }
+                    if !overdue {
+                        return Decision::Nothing;
+                    }
+                    break;
                 }
             }
+        }
+        if overdue {
+            return Decision::Escalate {
+                text: format!("{}: {} still blocked: {screen}", rec.ticket, rec.name),
+            };
         }
         return Decision::AskLead {
             text: format!("{}: {} blocked: {screen}", rec.ticket, rec.name),
