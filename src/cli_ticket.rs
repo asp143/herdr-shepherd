@@ -84,6 +84,7 @@ pub fn dispatch_with_backend(
         let mut entered_stage = None;
         let attempt = (|| {
             let ci_build = matches!(&action, scheduler::Action::ResumeCiBuild(_));
+            let _hooks = ci_build.then(herdr_shepherd::hooks::defer);
             let _ci_dispatch = if ci_build {
                 Some(herdr_shepherd::ticket::revise::dispatch_lock(store, &id)?)
             } else {
@@ -208,6 +209,20 @@ pub fn dispatch_with_backend(
                     Ok(())
                 })?;
             }
+            // Nested launch scopes cannot flush the CI retry's outer queue.
+            // Release dispatch and deliver hooks before reading public status.
+            drop(_ci_dispatch);
+            drop(_hooks);
+            let rec = if ci_build {
+                store
+                    .read()?
+                    .agents
+                    .into_iter()
+                    .find(|agent| agent.name == rec.name)
+                    .ok_or_else(|| ShepherdError::Usage("launch record disappeared".into()))?
+            } else {
+                rec
+            };
             Ok(Some(rec))
         })();
         match attempt {
@@ -256,13 +271,9 @@ pub fn cancel(
     cfg: &Config,
     id: &str,
 ) -> Result<herdr_shepherd::store::Ticket, ShepherdError> {
-    for rec in store.read()?.agents.into_iter().filter(|a| {
-        a.ticket == id && !matches!(a.status, AgentStatus::Retired | AgentStatus::LaunchFailed)
-    }) {
-        herdr_shepherd::flock::cancel(h, store, &rec.name, false)?;
-    }
     let resolved = roles::resolve(cfg)?;
-    let ticket = intake::cancel(
+    let ticket = intake::cancel_agents(
+        h,
         store,
         id,
         &launch::now(),
@@ -279,6 +290,8 @@ pub fn transition(
     to: TicketState,
     reason: Option<BlockedReason>,
 ) -> Result<herdr_shepherd::store::Ticket, ShepherdError> {
+    let dispatch = herdr_shepherd::ticket::revise::dispatch_lock(store, id)?;
+    let operation = herdr_shepherd::ticket::operation::exclusive(store, id)?;
     let cap = roles::resolve(cfg)?.shepherd.max_revision_rounds;
     let ticket = store.update(|data| {
         if data.agents.iter().any(|a| {
@@ -300,6 +313,9 @@ pub fn transition(
         transition_with_limit(t, to, reason, &launch::now(), cap)?;
         Ok(t.clone())
     })?;
+    // Hooks may reenter ticket commands after the transition is durable.
+    drop(operation);
+    drop(dispatch);
     let event = if ticket.state == TicketState::Blocked {
         "ticket.blocked"
     } else {
@@ -320,6 +336,9 @@ pub fn integrate(
     id: &str,
 ) -> Result<herdr_shepherd::ticket::children::IntegrateReport, ShepherdError> {
     use herdr_shepherd::ticket::children;
+    let _hooks = herdr_shepherd::hooks::defer();
+    let _dispatch = herdr_shepherd::ticket::revise::dispatch_lock(store, id)?;
+    let _operation = herdr_shepherd::ticket::operation::exclusive(store, id)?;
     let data = store.read()?;
     if data.agents.iter().any(|a| {
         a.ticket == id
@@ -388,7 +407,19 @@ pub fn integrate(
                     .iter_mut()
                     .find(|t| t.id == id)
                     .ok_or_else(|| ShepherdError::Usage("ticket disappeared".into()))?;
-                t.children = ticket.children.clone();
+                // Update only the identities whose Git integration completed.
+                // Retain any independently registered or recovered children.
+                for integrated in &ticket.children {
+                    if let Some(current) = t.children.iter_mut().find(|current| {
+                        current.unit == integrated.unit
+                            && current.path == integrated.path
+                            && current.branch == integrated.branch
+                            && current.base_sha == integrated.base_sha
+                            && current.workspace_id == integrated.workspace_id
+                    }) {
+                        current.integrated = integrated.integrated;
+                    }
+                }
                 t.integration_ranges = report.ranges.clone();
                 Ok(())
             })?;
@@ -406,7 +437,13 @@ pub fn integrate(
                 children::cleanup_integrated(h, &path, std::slice::from_ref(child))?;
                 store.update(|data| {
                     if let Some(t) = data.tickets.iter_mut().find(|t| t.id == id) {
-                        t.children.retain(|c| c.unit != child.unit);
+                        t.children.retain(|c| {
+                            c.unit != child.unit
+                                || c.path != child.path
+                                || c.branch != child.branch
+                                || c.base_sha != child.base_sha
+                                || c.workspace_id != child.workspace_id
+                        });
                     }
                     Ok(())
                 })?;

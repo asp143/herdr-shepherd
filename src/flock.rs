@@ -89,6 +89,7 @@ pub fn reconcile(
             AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
         )
     }) {
+        let _ticket_operation = crate::ticket::operation::shared(store, &rec.ticket)?;
         let Some(_operation) = try_agent_operation(store, &rec.name)? else {
             continue;
         };
@@ -368,6 +369,14 @@ pub fn deliver_pending_prompt(
     name: &str,
 ) -> Result<bool, ShepherdError> {
     use crate::store::AgentStatus;
+    let ticket = store
+        .read()?
+        .agents
+        .into_iter()
+        .find(|a| a.name == name)
+        .ok_or_else(|| ShepherdError::Usage(format!("unknown agent: {name}")))?
+        .ticket;
+    let _ticket_operation = crate::ticket::operation::shared(store, &ticket)?;
     std::fs::create_dir_all(store.root()).map_err(anyhow::Error::from)?;
     let hash = crate::store::project_hash(std::path::Path::new(name));
     let lock = std::fs::OpenOptions::new()

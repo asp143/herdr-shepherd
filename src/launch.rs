@@ -64,6 +64,8 @@ pub fn launch_configured(
     req: LaunchRequest,
     cfg: &Config,
 ) -> Result<AgentRecord, ShepherdError> {
+    let _hooks = crate::hooks::defer();
+    let _ticket_operation = crate::ticket::operation::shared(store, &req.ticket)?;
     let resolved = crate::roles::resolve(cfg)?;
     let first = req
         .runners
@@ -155,6 +157,9 @@ pub fn launch_configured(
         save(store, &record)?;
     }
     result?;
+    drop(_operation);
+    drop(_ticket_operation);
+    drop(_hooks);
     store
         .read()?
         .agents
@@ -847,6 +852,63 @@ mod tests {
                     && call.contains("shepherd_stage")
                     && call.contains("coder"))
         );
+    }
+
+    #[test]
+    fn cancellation_drains_direct_launch_before_retiring() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let store = Store::open(&state, dir.path()).unwrap();
+        store
+            .update(|data| {
+                data.tickets.push(crate::store::Ticket {
+                    id: "T-1".into(),
+                    state: crate::store::TicketState::Building,
+                    ..Default::default()
+                });
+                Ok(())
+            })
+            .unwrap();
+        let h = FakeHerdr::new(vec![]);
+        let observed = store.clone();
+        let (early_tx, early_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        *h.on_start.borrow_mut() = Some(Box::new(move |_| {
+            let observed = observed.clone();
+            let done = done_tx.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = crate::ticket::intake::cancel_agents(
+                    &FakeHerdr::new(vec![]),
+                    &observed,
+                    "T-1",
+                    "cancel",
+                    3,
+                );
+                let _ = tx.send(());
+                done.send(result).unwrap();
+            });
+            early_tx
+                .send(
+                    rx.recv_timeout(std::time::Duration::from_millis(200))
+                        .is_ok(),
+                )
+                .unwrap();
+        }));
+        let launched = launch(&h, &store, req(dir.path(), &state));
+        let cancelled = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            !early_rx.recv().unwrap(),
+            "cancellation returned before direct launch completed"
+        );
+        launched.unwrap();
+        cancelled.unwrap();
+        let data = store.read().unwrap();
+        assert_eq!(data.tickets[0].state, crate::store::TicketState::Closed);
+        assert_eq!(data.agents[0].status, AgentStatus::Retired);
+        assert!(!crate::flock::deliver_pending_prompt(&h, &store, &data.agents[0].name).unwrap());
     }
 
     #[test]

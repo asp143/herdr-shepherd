@@ -175,6 +175,16 @@ impl herdr_shepherd::herdr::Herdr for LocalHerdr {
         base: &str,
         path: &Path,
     ) -> Result<herdr_shepherd::herdr::Workspace, ShepherdError> {
+        if ok(repo, &["rev-parse", "--absolute-git-dir"])
+            != ok(
+                repo,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+        {
+            return Err(ShepherdError::HerdrUnavailable(
+                "linked_worktree_source".into(),
+            ));
+        }
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         ok(
             repo,
@@ -477,6 +487,15 @@ fn refuses_existing_cherry_pick_without_aborting_it() {
 
 #[test]
 fn cli_conflict_persists_both_ranges_and_blocks_ticket() {
+    cli_conflict_case(false);
+}
+
+#[test]
+fn cli_conflict_hook_can_cancel_the_same_ticket() {
+    cli_conflict_case(true);
+}
+
+fn cli_conflict_case(cancel_hook: bool) {
     use herdr_shepherd::store::{BlockedReason, Store, Ticket, TicketState};
     let repo = Repo::new();
     let one = repo.child(1);
@@ -502,6 +521,28 @@ fn cli_conflict_persists_both_ranges_and_blocks_ticket() {
         .unwrap();
     let fake = repo.dir.path().join("fake.json");
     fs::write(&fake, "{}").unwrap();
+    let config = repo.dir.path().join("cfg");
+    if cancel_hook {
+        fs::create_dir(&config).unwrap();
+        let command = toml::Value::try_from(vec![
+            env!("CARGO_BIN_EXE_herdr-shepherd"),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--config-dir",
+            config.to_str().unwrap(),
+            "ticket",
+            "--project-root",
+            repo.main.to_str().unwrap(),
+            "cancel",
+            "T-1",
+        ])
+        .unwrap();
+        fs::write(
+            config.join("shepherd.toml"),
+            format!("[[hooks]]\non = 'ticket.blocked'\ncommand = {command}\ntimeout_seconds = 1\n"),
+        )
+        .unwrap();
+    }
     let out = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
         .env("SHEPHERD_FAKE_HERDR", fake)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -509,7 +550,7 @@ fn cli_conflict_persists_both_ranges_and_blocks_ticket() {
         .args(["--json", "--state-dir"])
         .arg(&state)
         .args(["--config-dir"])
-        .arg(repo.dir.path().join("cfg"))
+        .arg(config)
         .args(["ticket", "--project-root"])
         .arg(&repo.main)
         .args(["integrate", "T-1"])
@@ -522,11 +563,22 @@ fn cli_conflict_persists_both_ranges_and_blocks_ticket() {
         String::from_utf8_lossy(&out.stdout)
     );
     let data = store.read().unwrap();
-    assert_eq!(data.tickets[0].state, TicketState::Blocked);
-    assert_eq!(
-        data.tickets[0].blocked_reason,
-        Some(BlockedReason::Conflict)
-    );
+    assert!(out.stderr.is_empty(), "{out:?}");
+    if cancel_hook {
+        assert_eq!(data.tickets[0].state, TicketState::Closed);
+        assert_eq!(data.tickets[0].history[0].to, TicketState::Blocked);
+        assert_eq!(
+            data.tickets[0].history[0].reason,
+            Some(BlockedReason::Conflict)
+        );
+        assert_eq!(data.tickets[0].history[1].from, TicketState::Blocked);
+    } else {
+        assert_eq!(data.tickets[0].state, TicketState::Blocked);
+        assert_eq!(
+            data.tickets[0].blocked_reason,
+            Some(BlockedReason::Conflict)
+        );
+    }
     let serialized = serde_json::to_value(&data.tickets[0]).unwrap();
     let ranges = serialized["integration_ranges"].as_array().unwrap();
     assert_eq!(ranges.len(), 2);
@@ -604,4 +656,60 @@ fn child_hook_uses_explicit_config_on_first_install() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("push blocked"));
     assert!(ok(&repo.main, &["ls-remote", "origin"]).is_empty());
+}
+
+#[test]
+fn child_uses_primary_source_and_ticket_tip() {
+    let repo = Repo::new();
+    ok(
+        &repo.ticket,
+        &["commit", "--allow-empty", "-m", "ticket progress"],
+    );
+    let tip = ok(&repo.ticket, &["rev-parse", "HEAD"]);
+    assert_ne!(tip, ok(&repo.main, &["rev-parse", "HEAD"]));
+    let state = repo.dir.path().join("state");
+    let config = repo.dir.path().join("selected-config");
+    let h = LocalHerdr::default();
+    let ticket = herdr_shepherd::store::Ticket {
+        id: "TINY".into(),
+        slug: "tiny".into(),
+        branch: "feat/tiny".into(),
+        worktree: Some(repo.ticket.clone()),
+        ..Default::default()
+    };
+    let child = herdr_shepherd::ticket::children::create_child_configured(
+        &h,
+        &ticket,
+        2,
+        &state,
+        Path::new(env!("CARGO_BIN_EXE_herdr-shepherd")),
+        &config,
+    )
+    .unwrap();
+    assert_eq!(child.base_sha, tip);
+    assert_eq!(ok(&child.path, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(child.branch, "feat/tiny--2");
+    assert_eq!(
+        h.workspaces.borrow()[0]
+            .worktree
+            .as_ref()
+            .unwrap()
+            .repo_root
+            .as_ref(),
+        Some(&repo.main)
+    );
+    assert!(
+        child.path.starts_with(
+            state
+                .join("children")
+                .join(herdr_shepherd::store::project_hash(&repo.ticket))
+        )
+    );
+    let hooks = ok(
+        &child.path,
+        &["config", "--worktree", "--get", "core.hooksPath"],
+    );
+    let hook = fs::read_to_string(Path::new(&hooks).join("pre-push")).unwrap();
+    assert!(hook.contains(config.to_str().unwrap()));
+    assert!(hook.contains(state.to_str().unwrap()));
 }

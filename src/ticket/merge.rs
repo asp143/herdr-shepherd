@@ -270,9 +270,12 @@ fn handle_with_context(
     if status.state == PrState::Open {
         return Ok(MergeOutcome::Unchanged);
     }
+    // Terminal and cleanup hooks can reenter the same ticket's ownership.
+    let _hooks = crate::hooks::defer();
     // Wait for any revision launch to persist its pane before reserving a
     // terminal state. Otherwise retirement can miss an agent still starting.
     let _dispatch = super::revise::dispatch_lock(store, id)?;
+    let _operation = super::operation::exclusive(store, id)?;
     let data = store.read()?;
     let Some(ticket) = data.tickets.iter().find(|ticket| ticket.id == id) else {
         return Ok(MergeOutcome::Unchanged);
@@ -1113,6 +1116,67 @@ mod tests {
     }
 
     #[test]
+    fn terminal_hooks_can_reenter_ticket_ownership() {
+        // Run cancellation from the shell hook's subprocess. Terminal tickets
+        // must reject it normally, rather than blocking under parent locks.
+        if let Some(root) = std::env::var_os("SHEPHERD_TEST_TERMINAL_HOOK_ROOT") {
+            let root = PathBuf::from(root);
+            let store = Store::open(&root.join("state"), &root.join("main")).unwrap();
+            let error = crate::ticket::intake::cancel_agents(
+                &FakeHerdr::new(vec![]),
+                &store,
+                "T1",
+                "hook",
+                3,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("illegal ticket transition"));
+            fs::write(root.join("reentered"), "cancel rejected").unwrap();
+            return;
+        }
+        for event in ["ticket.closed", "ticket.merged", "ticket.cleaned_up"] {
+            let mut fixture = Fixture::new(TicketState::PrOpen);
+            if event == "ticket.closed" {
+                fixture.status.state = PrState::Closed;
+            }
+            let command: toml::Value = vec![
+                "sh".to_owned(),
+                "-c".into(),
+                "exec env \"$@\"".into(),
+                "hook".into(),
+                format!(
+                    "SHEPHERD_TEST_TERMINAL_HOOK_ROOT={}",
+                    fixture._dir.path().display()
+                ),
+                std::env::current_exe().unwrap().display().to_string(),
+                "--exact".into(),
+                "ticket::merge::tests::terminal_hooks_can_reenter_ticket_ownership".into(),
+                "--nocapture".into(),
+            ]
+            .into();
+            let text =
+                format!("[[hooks]]\non = '{event}'\ncommand = {command}\ntimeout_seconds = 1\n");
+            fixture
+                .store
+                .update(|data| {
+                    data.trust.as_mut().unwrap().config_text = Some(text);
+                    Ok(())
+                })
+                .unwrap();
+            let expected = if event == "ticket.closed" {
+                MergeOutcome::Closed
+            } else {
+                MergeOutcome::CleanedUp
+            };
+            assert_eq!(fixture.run().unwrap(), expected);
+            assert!(
+                fixture._dir.path().join("reentered").exists(),
+                "{event} hook must acquire ownership and reject cancellation normally"
+            );
+        }
+    }
+
+    #[test]
     fn missing_merged_head_keeps_existing_remote_worktree() {
         let mut fixture = Fixture::new(TicketState::PrOpen);
         fixture.status.head_oid = None;
@@ -1554,6 +1618,44 @@ mod tests {
         assert_eq!(fixture.run().unwrap(), MergeOutcome::CleanedUp);
         assert_eq!(fixture.ticket().state, TicketState::CleanedUp);
     }
+    #[test]
+    fn terminal_pr_handling_drains_nonrevision_admission() {
+        let fixture = Fixture::new(TicketState::Building);
+        fixture.agent();
+        let store = fixture.store.clone();
+        let agent = store.update(|data| Ok(data.agents.remove(0))).unwrap();
+        let admission = crate::ticket::operation::shared(&store, "T1").unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let outcome = fixture.run();
+            finished_tx.send(()).unwrap();
+            (fixture, outcome)
+        });
+        started_rx.recv().unwrap();
+        let early = finished_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+        store
+            .update(|data| {
+                data.agents.push(agent);
+                Ok(())
+            })
+            .unwrap();
+        drop(admission);
+        let (fixture, outcome) = worker.join().unwrap();
+        assert!(
+            !early,
+            "terminal handling skipped an admitted nonrevision launch"
+        );
+        assert_eq!(outcome.unwrap(), MergeOutcome::CleanedUp);
+        assert_eq!(
+            fixture.store.read().unwrap().agents[0].status,
+            AgentStatus::Retired
+        );
+        assert!(fixture.h.fake.agent_records.borrow().is_empty());
+        assert!(!fixture.path.exists());
+    }
+
     #[test]
     fn merged_waits_for_inflight_revision_launch_before_retiring() {
         let fixture = Fixture::new(TicketState::Revising);

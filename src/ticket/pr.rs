@@ -133,7 +133,8 @@ pub fn open_with_dispositions(
     dispositions: Option<&super::pr_body::FindingDispositions>,
     now: &str,
 ) -> Result<Ticket, ShepherdError> {
-    let _dispatch = super::revise::dispatch_lock(store, id)?;
+    let hooks = crate::hooks::defer();
+    let dispatch = super::revise::dispatch_lock(store, id)?;
     let cap = crate::roles::resolve(cfg)?.shepherd.max_revision_rounds;
     let mut snapshot = store.read()?;
     let observed = ticket(&snapshot, id)?.clone();
@@ -269,40 +270,45 @@ pub fn open_with_dispositions(
             &serde_json::json!({"ticket":id,"pr":result.pr_number}),
         );
     }
-    if result.pr_reviewers_pending.is_empty() {
-        return Ok(result);
-    }
-    // Persist PR ownership before requesting reviewers. A failed request is
-    // retried on the existing PR without repeating its state transition/hook.
-    let number = result.pr_number.expect("persisted PR");
-    let requested = gh.requested_reviewers(gate, number)?;
-    let remaining: Vec<_> = result
-        .pr_reviewers_pending
-        .iter()
-        .filter(|owner| {
-            !requested
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(owner))
-        })
-        .cloned()
-        .collect();
-    if !remaining.is_empty() {
-        gh.add_reviewers(gate, number, &remaining)?;
-    }
-    store.update(|data| {
-        let t = data
-            .tickets
-            .iter_mut()
-            .find(|t| t.id == id)
-            .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
-        if t.pr_number != Some(number) || t.pr_reviewers_pending != result.pr_reviewers_pending {
-            return Err(ShepherdError::Usage(
-                "pending review request changed".into(),
-            ));
+    if !result.pr_reviewers_pending.is_empty() {
+        // Persist PR ownership before requesting reviewers. A failed request is
+        // retried on the existing PR without repeating its state transition/hook.
+        let number = result.pr_number.expect("persisted PR");
+        let requested = gh.requested_reviewers(gate, number)?;
+        let remaining: Vec<_> = result
+            .pr_reviewers_pending
+            .iter()
+            .filter(|owner| {
+                !requested
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(owner))
+            })
+            .cloned()
+            .collect();
+        if !remaining.is_empty() {
+            gh.add_reviewers(gate, number, &remaining)?;
         }
-        t.pr_reviewers_pending.clear();
-        Ok(t.clone())
-    })
+        store.update(|data| {
+            let t = data
+                .tickets
+                .iter_mut()
+                .find(|t| t.id == id)
+                .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
+            if t.pr_number != Some(number) || t.pr_reviewers_pending != result.pr_reviewers_pending
+            {
+                return Err(ShepherdError::Usage(
+                    "pending review request changed".into(),
+                ));
+            }
+            t.pr_reviewers_pending.clear();
+            Ok(())
+        })?;
+    }
+    // Hooks may cancel the ticket. Finish reviewer bookkeeping under dispatch,
+    // then deliver hooks and return the current record rather than our snapshot.
+    drop(dispatch);
+    drop(hooks);
+    Ok(ticket(&store.read()?, id)?.clone())
 }
 
 fn validate_status(t: &Ticket, status: &PrStatus) -> Result<(), ShepherdError> {

@@ -169,7 +169,53 @@ pub fn cancel(
     now: &str,
     max_revision_rounds: u32,
 ) -> Result<Ticket, ShepherdError> {
+    let _dispatch = super::revise::dispatch_lock(store, id)?;
+    let _operation = super::operation::exclusive(store, id)?;
+    close_ticket(store, id, now, max_revision_rounds)
+}
+
+/// Retire every admitted agent before closing. Keep admission excluded through
+/// the snapshot, external retirement, and terminal state transaction.
+pub fn cancel_agents(
+    h: &dyn crate::herdr::Herdr,
+    store: &Store,
+    id: &str,
+    now: &str,
+    max_revision_rounds: u32,
+) -> Result<Ticket, ShepherdError> {
+    let _dispatch = super::revise::dispatch_lock(store, id)?;
+    let _operation = super::operation::exclusive(store, id)?;
+    for agent in store.read()?.agents.into_iter().filter(|agent| {
+        agent.ticket == id
+            && !matches!(
+                agent.status,
+                crate::store::AgentStatus::Retired | crate::store::AgentStatus::LaunchFailed
+            )
+    }) {
+        crate::flock::cancel(h, store, &agent.name, false)?;
+    }
+    close_ticket(store, id, now, max_revision_rounds)
+}
+
+fn close_ticket(
+    store: &Store,
+    id: &str,
+    now: &str,
+    max_revision_rounds: u32,
+) -> Result<Ticket, ShepherdError> {
     store.update(|data| {
+        if data.agents.iter().any(|agent| {
+            agent.ticket == id
+                && !matches!(
+                    agent.status,
+                    crate::store::AgentStatus::Retired | crate::store::AgentStatus::LaunchFailed
+                )
+        }) {
+            return Err(ShepherdError::Usage(
+                "retire ticket agents before closing".into(),
+            ));
+        }
+
         let ticket = data
             .tickets
             .iter_mut()
@@ -216,6 +262,7 @@ pub fn start_ticket_with_backend(
 ) -> Result<Ticket, ShepherdError> {
     use crate::store::{BlockedReason, TicketState};
 
+    let _operation = super::operation::shared(store, id)?;
     let preflight = store.read()?;
     let at_capacity = |data: &crate::store::StoreData| {
         data.agents
