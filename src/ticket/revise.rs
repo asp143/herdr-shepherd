@@ -68,6 +68,7 @@ pub fn resume_revision(
     now: &str,
 ) -> Result<RevisionOutcome, ShepherdError> {
     use crate::store::{AgentStatus, BlockedReason};
+    let _hooks = crate::hooks::defer();
     let _lock = dispatch_lock(store, id)?;
     let settings = crate::roles::resolve(cfg)?.shepherd;
     let initial = store

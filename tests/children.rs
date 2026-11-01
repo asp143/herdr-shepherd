@@ -487,6 +487,15 @@ fn refuses_existing_cherry_pick_without_aborting_it() {
 
 #[test]
 fn cli_conflict_persists_both_ranges_and_blocks_ticket() {
+    cli_conflict_case(false);
+}
+
+#[test]
+fn cli_conflict_hook_can_cancel_the_same_ticket() {
+    cli_conflict_case(true);
+}
+
+fn cli_conflict_case(cancel_hook: bool) {
     use herdr_shepherd::store::{BlockedReason, Store, Ticket, TicketState};
     let repo = Repo::new();
     let one = repo.child(1);
@@ -512,6 +521,28 @@ fn cli_conflict_persists_both_ranges_and_blocks_ticket() {
         .unwrap();
     let fake = repo.dir.path().join("fake.json");
     fs::write(&fake, "{}").unwrap();
+    let config = repo.dir.path().join("cfg");
+    if cancel_hook {
+        fs::create_dir(&config).unwrap();
+        let command = toml::Value::try_from(vec![
+            env!("CARGO_BIN_EXE_herdr-shepherd"),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--config-dir",
+            config.to_str().unwrap(),
+            "ticket",
+            "--project-root",
+            repo.main.to_str().unwrap(),
+            "cancel",
+            "T-1",
+        ])
+        .unwrap();
+        fs::write(
+            config.join("shepherd.toml"),
+            format!("[[hooks]]\non = 'ticket.blocked'\ncommand = {command}\ntimeout_seconds = 1\n"),
+        )
+        .unwrap();
+    }
     let out = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
         .env("SHEPHERD_FAKE_HERDR", fake)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -519,7 +550,7 @@ fn cli_conflict_persists_both_ranges_and_blocks_ticket() {
         .args(["--json", "--state-dir"])
         .arg(&state)
         .args(["--config-dir"])
-        .arg(repo.dir.path().join("cfg"))
+        .arg(config)
         .args(["ticket", "--project-root"])
         .arg(&repo.main)
         .args(["integrate", "T-1"])
@@ -532,11 +563,22 @@ fn cli_conflict_persists_both_ranges_and_blocks_ticket() {
         String::from_utf8_lossy(&out.stdout)
     );
     let data = store.read().unwrap();
-    assert_eq!(data.tickets[0].state, TicketState::Blocked);
-    assert_eq!(
-        data.tickets[0].blocked_reason,
-        Some(BlockedReason::Conflict)
-    );
+    assert!(out.stderr.is_empty(), "{out:?}");
+    if cancel_hook {
+        assert_eq!(data.tickets[0].state, TicketState::Closed);
+        assert_eq!(data.tickets[0].history[0].to, TicketState::Blocked);
+        assert_eq!(
+            data.tickets[0].history[0].reason,
+            Some(BlockedReason::Conflict)
+        );
+        assert_eq!(data.tickets[0].history[1].from, TicketState::Blocked);
+    } else {
+        assert_eq!(data.tickets[0].state, TicketState::Blocked);
+        assert_eq!(
+            data.tickets[0].blocked_reason,
+            Some(BlockedReason::Conflict)
+        );
+    }
     let serialized = serde_json::to_value(&data.tickets[0]).unwrap();
     let ranges = serialized["integration_ranges"].as_array().unwrap();
     assert_eq!(ranges.len(), 2);

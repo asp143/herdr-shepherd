@@ -64,6 +64,7 @@ pub fn launch_configured(
     req: LaunchRequest,
     cfg: &Config,
 ) -> Result<AgentRecord, ShepherdError> {
+    let _hooks = crate::hooks::defer();
     let _ticket_operation = crate::ticket::operation::shared(store, &req.ticket)?;
     let resolved = crate::roles::resolve(cfg)?;
     let first = req
@@ -156,6 +157,9 @@ pub fn launch_configured(
         save(store, &record)?;
     }
     result?;
+    drop(_operation);
+    drop(_ticket_operation);
+    drop(_hooks);
     store
         .read()?
         .agents

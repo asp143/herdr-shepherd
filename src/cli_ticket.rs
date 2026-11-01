@@ -84,6 +84,7 @@ pub fn dispatch_with_backend(
         let mut entered_stage = None;
         let attempt = (|| {
             let ci_build = matches!(&action, scheduler::Action::ResumeCiBuild(_));
+            let _hooks = ci_build.then(herdr_shepherd::hooks::defer);
             let _ci_dispatch = if ci_build {
                 Some(herdr_shepherd::ticket::revise::dispatch_lock(store, &id)?)
             } else {
@@ -275,8 +276,8 @@ pub fn transition(
     to: TicketState,
     reason: Option<BlockedReason>,
 ) -> Result<herdr_shepherd::store::Ticket, ShepherdError> {
-    let _dispatch = herdr_shepherd::ticket::revise::dispatch_lock(store, id)?;
-    let _operation = herdr_shepherd::ticket::operation::exclusive(store, id)?;
+    let dispatch = herdr_shepherd::ticket::revise::dispatch_lock(store, id)?;
+    let operation = herdr_shepherd::ticket::operation::exclusive(store, id)?;
     let cap = roles::resolve(cfg)?.shepherd.max_revision_rounds;
     let ticket = store.update(|data| {
         if data.agents.iter().any(|a| {
@@ -298,6 +299,9 @@ pub fn transition(
         transition_with_limit(t, to, reason, &launch::now(), cap)?;
         Ok(t.clone())
     })?;
+    // Hooks may reenter ticket commands after the transition is durable.
+    drop(operation);
+    drop(dispatch);
     let event = if ticket.state == TicketState::Blocked {
         "ticket.blocked"
     } else {
@@ -318,6 +322,7 @@ pub fn integrate(
     id: &str,
 ) -> Result<herdr_shepherd::ticket::children::IntegrateReport, ShepherdError> {
     use herdr_shepherd::ticket::children;
+    let _hooks = herdr_shepherd::hooks::defer();
     let _dispatch = herdr_shepherd::ticket::revise::dispatch_lock(store, id)?;
     let _operation = herdr_shepherd::ticket::operation::exclusive(store, id)?;
     let data = store.read()?;

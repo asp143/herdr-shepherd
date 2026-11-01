@@ -443,6 +443,92 @@ fn complete_revision_agents(
 }
 
 #[test]
+fn revision_spawn_hook_can_cancel_the_same_ticket() {
+    if !local_transport_enabled("revision_spawn_hook_can_cancel_the_same_ticket") {
+        return;
+    }
+    revision_cancellation_hook_case("agent.spawned");
+}
+
+#[test]
+fn revision_push_hook_can_cancel_the_same_ticket() {
+    if !local_transport_enabled("revision_push_hook_can_cancel_the_same_ticket") {
+        return;
+    }
+    revision_cancellation_hook_case("ticket.revised");
+}
+
+fn revision_cancellation_hook_case(event: &str) {
+    let repo = Repo::new();
+    let store = stored_revision(&repo);
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+    let gh = PushBackend::new(&repo);
+    if event == "ticket.revised" {
+        complete_revision_agents(&repo, &store, &h, &gh);
+    }
+    let gate = repo.gate();
+    fs::create_dir(&gate.config_dir).unwrap();
+    let fake = repo.dir.path().join("hook-herdr.json");
+    fs::write(&fake, "{}").unwrap();
+    let command = toml::Value::try_from(vec![
+        "env".to_owned(),
+        format!("SHEPHERD_FAKE_HERDR={}", fake.display()),
+        env!("CARGO_BIN_EXE_herdr-shepherd").into(),
+        "--state-dir".into(),
+        gate.state_dir.display().to_string(),
+        "--config-dir".into(),
+        gate.config_dir.display().to_string(),
+        "ticket".into(),
+        "--project-root".into(),
+        repo.root.display().to_string(),
+        "cancel".into(),
+        "T-1".into(),
+    ])
+    .unwrap();
+    fs::write(
+        gate.config_dir.join("shepherd.toml"),
+        format!("[[hooks]]\non = '{event}'\ncommand = {command}\ntimeout_seconds = 1\n"),
+    )
+    .unwrap();
+    let cfg = herdr_shepherd::config::load(&gate.config_dir, None).unwrap();
+    let expected = git(&repo.root, &["rev-parse", "HEAD"]);
+    resume_revision(&h, &gh, &store, &cfg, &gate, "T-1", "hook").unwrap();
+    let data = store.read().unwrap();
+    assert_eq!(data.tickets[0].state, TicketState::Closed, "{event}");
+    assert!(
+        data.agents
+            .iter()
+            .all(|agent| agent.status == herdr_shepherd::store::AgentStatus::Retired)
+    );
+    let pushes = usize::from(event == "ticket.revised");
+    assert_eq!(gh.pushes.get(), pushes);
+    if pushes == 1 {
+        assert_eq!(
+            data.tickets[0].history.iter().rev().nth(1).unwrap().to,
+            TicketState::CiWait
+        );
+        assert_eq!(
+            git(
+                &repo.root,
+                &[
+                    "--git-dir",
+                    repo.remote.to_str().unwrap(),
+                    "rev-parse",
+                    "fix/ticket"
+                ]
+            ),
+            expected
+        );
+    }
+    assert!(resume_revision(&h, &gh, &store, &cfg, &gate, "T-1", "after hook").is_err());
+    assert_eq!(
+        gh.pushes.get(),
+        pushes,
+        "no push after hook cancellation returns"
+    );
+}
+
+#[test]
 fn cancellation_waits_for_revision_push_transaction() {
     if !local_transport_enabled("cancellation_waits_for_revision_push_transaction") {
         return;

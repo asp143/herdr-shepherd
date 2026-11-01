@@ -93,6 +93,7 @@ pub fn run(
             task_file,
             unit,
         } => {
+            let _hooks = herdr_shepherd::hooks::defer();
             let _ticket_operation = herdr_shepherd::ticket::operation::shared(&store, ticket)?;
             let _placement = spawn_placement_lock(&store)?;
             let resolved = roles::resolve(&cfg)?;
@@ -189,7 +190,7 @@ pub fn run(
                 ticket.branch = child.branch;
                 label = Some(format!("{}-{unit}", role.name));
             }
-            serde_json::to_value(spawn_task_request(
+            let rec = spawn_task_request(
                 h,
                 &store,
                 &cfg,
@@ -200,8 +201,18 @@ pub fn run(
                     task: &task,
                     tab_label: label.as_deref(),
                 },
-            )?)
-            .expect("serializable")
+            )?;
+            drop(_placement);
+            drop(_ticket_operation);
+            drop(_hooks);
+            // A synchronous spawn hook may have reported or retired the agent.
+            let rec = store
+                .read()?
+                .agents
+                .into_iter()
+                .find(|agent| agent.name == rec.name)
+                .ok_or_else(|| ShepherdError::Usage("launch record disappeared".into()))?;
+            serde_json::to_value(rec).expect("serializable")
         }
     };
     output::emit(json, &data, || {
