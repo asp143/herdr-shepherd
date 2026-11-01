@@ -145,48 +145,32 @@ pub fn integrate(
     let mut indices = Vec::new();
     for (index, child) in pending {
         let range = format!("{}..{}", child.base_sha, child.branch);
-        let already_contained = git(
-            ticket_wt,
-            &[
-                "merge-base",
-                "--is-ancestor",
-                &format!("refs/heads/{}", child.branch),
-                "HEAD",
-            ],
-        )
-        .is_ok();
-        // A store write can fail after every cherry-pick succeeds. Later unit
-        // picks have new SHAs, so ancestry alone cannot recognize that retry.
-        let already_applied = git(
-            ticket_wt,
-            &["cherry", "HEAD", &child.branch, &child.base_sha],
-        )?
-        .lines()
-        .all(|line| line.starts_with("- "))
-            && child_patch_present(ticket_wt, child, &child.branch, "HEAD")?;
-        if !already_contained
-            && !already_applied
-            && git(ticket_wt, &["rev-list", "--count", &range])? != "0"
-            && git(
+        let tip = git(ticket_wt, &["rev-parse", &child.branch])?;
+        let head = git(ticket_wt, &["rev-parse", "HEAD"])?;
+        for commit in unlanded_commits(ticket_wt, child, &tip, &head)? {
+            if git(
                 ticket_wt,
                 &[
                     "-c",
                     "commit.gpgsign=false",
                     "cherry-pick",
+                    "-x",
+                    "--keep-redundant-commits",
                     "--no-edit",
-                    &range,
+                    &commit,
                 ],
             )
             .is_err()
-        {
-            // Abort the current sequencer before undoing earlier units in this
-            // transaction. No child is marked integrated until all picks pass.
-            let _ = git(ticket_wt, &["cherry-pick", "--abort"]);
-            git(ticket_wt, &["reset", "--hard", &original_head])?;
-            return Err(ShepherdError::Conflict {
-                unit: child.unit,
-                range,
-            });
+            {
+                // Roll back only this invocation. Provenance from any earlier
+                // partial integration stays in history for the next retry.
+                let _ = git(ticket_wt, &["cherry-pick", "--abort"]);
+                git(ticket_wt, &["reset", "--hard", &original_head])?;
+                return Err(ShepherdError::Conflict {
+                    unit: child.unit,
+                    range,
+                });
+            }
         }
         units.push(child.unit);
         ranges.push(range);
@@ -320,7 +304,7 @@ pub fn create_child_configured(
     Ok(child)
 }
 
-/// Remove integrated child resources after proving their commits are present.
+/// Remove integrated child resources after proving their commits landed.
 ///
 /// The whole set is checked before the first removal. Worktree removal never
 /// forces dirty files away, and ref deletion compares the observed tip.
@@ -429,51 +413,57 @@ fn preflight_integrated(
     Ok(targets)
 }
 
-// Historical patch IDs also match commits later reverted. Require the net
-// child patch to reverse cleanly from the current ticket tree before treating
-// it as landed. --cached --check only reads the index; no checkout is changed.
-fn child_patch_present(
+// Ancestry proves direct containment, including integrations by older
+// binaries. Otherwise only explicit -x records on the ticket's first-parent
+// history count. Patch equivalence cannot distinguish unrelated or reverted
+// work. Read only the final line so inherited records in a picked message do
+// not claim that other commits landed here.
+fn unlanded_commits(
     ticket_wt: &Path,
     child: &ChildWorktree,
     tip: &str,
     head: &str,
-) -> Result<bool, ShepherdError> {
-    git(ticket_wt, &["diff", "--cached", "--quiet", head])?;
-    let patch = proc::capture(
-        Command::new("git").current_dir(ticket_wt).args([
-            "diff",
-            "--binary",
-            "--full-index",
-            "--no-ext-diff",
-            "--no-textconv",
-            &child.base_sha,
-            tip,
-            "--",
-        ]),
-        Duration::from_secs(30),
-        None,
+) -> Result<Vec<String>, ShepherdError> {
+    if git(ticket_wt, &["merge-base", "--is-ancestor", tip, head]).is_ok() {
+        return Ok(Vec::new());
+    }
+    git(
+        ticket_wt,
+        &["merge-base", "--is-ancestor", &child.base_sha, head],
     )?;
-    if !patch.status.success() {
-        return Err(anyhow::anyhow!("cannot inspect child patch: {}", patch.stderr.trim()).into());
-    }
-    if patch.stdout.is_empty() {
-        return Ok(true);
-    }
-    let output = proc::capture(
-        Command::new("git").current_dir(ticket_wt).args([
-            "apply",
+    let history = git(
+        ticket_wt,
+        &[
+            "log",
+            "--first-parent",
+            "--format=%B%x00",
+            &format!("{}..{head}", child.base_sha),
+        ],
+    )?;
+    let landed: HashSet<_> = history
+        .split('\0')
+        .filter_map(|message| {
+            message
+                .trim_end()
+                .lines()
+                .last()?
+                .strip_prefix("(cherry picked from commit ")?
+                .strip_suffix(')')
+        })
+        .collect();
+    Ok(git(
+        ticket_wt,
+        &[
+            "rev-list",
             "--reverse",
-            "--cached",
-            "--check",
-            "--whitespace=nowarn",
-            "-",
-        ]),
-        Duration::from_secs(30),
-        Some(patch.stdout.as_bytes()),
-    )?;
-    // Git only warns about a mode mismatch even under --cached --check.
-    // Any diagnostic leaves the presence proof uncertain, so retain the child.
-    Ok(output.status.success() && output.stderr.is_empty())
+            "--topo-order",
+            &format!("{}..{tip}", child.base_sha),
+        ],
+    )?
+    .lines()
+    .filter(|commit| !landed.contains(commit))
+    .map(str::to_owned)
+    .collect())
 }
 
 fn verify_integrated_tip(
@@ -491,13 +481,12 @@ fn verify_integrated_tip(
         ticket_wt,
         &["merge-base", "--is-ancestor", &child.base_sha, tip],
     )?;
-    let patches = git(ticket_wt, &["cherry", head, tip, &child.base_sha])?;
-    if patches.lines().any(|line| !line.starts_with("- "))
-        || !child_patch_present(ticket_wt, child, tip, head)?
-    {
-        return Err(ShepherdError::PolicyDenied(
-            "child commits are not integrated".into(),
-        ));
+    git(ticket_wt, &["diff", "--cached", "--quiet", head])?;
+    if !unlanded_commits(ticket_wt, child, tip, head)?.is_empty() {
+        return Err(ShepherdError::PolicyDenied(format!(
+            "child commits are not integrated; missing integration provenance. Review and merge {} into the ticket branch, then retry cleanup",
+            child.branch
+        )));
     }
     Ok(())
 }

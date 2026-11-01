@@ -445,3 +445,109 @@ fn revision_roles_open_ticket_tabs_without_creating_workspaces() {
         assert_eq!(f.store.read().unwrap().agents[0].worktree, f.ticket_path);
     }
 }
+
+fn assert_cleanup_receipt_blocks_admission(direct: bool) {
+    use herdr_shepherd::{
+        config,
+        herdr::fake::FakeHerdr,
+        launch::{LaunchRequest, launch_configured},
+        roles,
+        ticket::children::{cleanup_integrated_recorded, create_child_configured, integrate},
+    };
+    let f = PlacementFixture::new();
+    git(&f.root, &["config", "user.name", "Fixture"]);
+    git(
+        &f.root,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
+    let h = FakeHerdr::new(vec![]);
+    let mut ticket = f.store.read().unwrap().tickets.remove(0);
+    let child = create_child_configured(
+        &h,
+        &ticket,
+        1,
+        &f.state,
+        Path::new(env!("CARGO_BIN_EXE_herdr-shepherd")),
+        &f.config,
+    )
+    .unwrap();
+    fs::write(child.path.join("work"), "child work\n").unwrap();
+    git(&child.path, &["add", "work"]);
+    git(&child.path, &["commit", "-m", "child work"]);
+    ticket.children.push(child.clone());
+    integrate(&f.ticket_path, &mut ticket.children).unwrap();
+    f.store
+        .update(|data| {
+            data.tickets[0] = ticket.clone();
+            Ok(())
+        })
+        .unwrap();
+    git(&f.root, &["worktree", "lock", child.path.to_str().unwrap()]);
+    assert!(cleanup_integrated_recorded(&h, &f.store, &ticket).is_err());
+    assert_eq!(f.store.read().unwrap().tickets[0].child_cleanup.len(), 1);
+    assert!(child.path.exists());
+    h.calls.borrow_mut().clear();
+    let child_tip = git(&child.path, &["rev-parse", "HEAD"]);
+    let ticket_tip = git(&f.ticket_path, &["rev-parse", "HEAD"]);
+    let message = if direct {
+        let cfg = config::load(&f.config, None).unwrap();
+        let resolved = roles::resolve(&cfg).unwrap();
+        let role = resolved
+            .roles
+            .iter()
+            .find(|r| r.name == "coder")
+            .unwrap()
+            .clone();
+        let runners = role
+            .runners
+            .iter()
+            .map(|name| resolved.runners[name].clone())
+            .collect();
+        launch_configured(
+            &h,
+            &f.store,
+            LaunchRequest {
+                ticket: ticket.id.clone(),
+                role,
+                runners,
+                worktree: child.path.clone(),
+                workspace_id: "ticket-workspace".into(),
+                tab_label: "coder-1".into(),
+                prompt: "work".into(),
+                state_dir: f.state.clone(),
+            },
+            &cfg,
+        )
+        .unwrap_err()
+        .to_string()
+    } else {
+        let out = f.spawn("coder", Some(1));
+        assert!(
+            !out.status.success(),
+            "receipt-owned child was reused: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert!(message.contains("finish cleanup"), "{message}");
+    assert!(f.store.read().unwrap().agents.is_empty());
+    assert!(!h.calls.borrow().iter().any(|c| c.starts_with("create_tab")));
+    assert_eq!(git(&child.path, &["rev-parse", "HEAD"]), child_tip);
+    assert_eq!(git(&f.ticket_path, &["rev-parse", "HEAD"]), ticket_tip);
+    git(
+        &f.root,
+        &["worktree", "unlock", child.path.to_str().unwrap()],
+    );
+    cleanup_integrated_recorded(&h, &f.store, &f.store.read().unwrap().tickets.remove(0)).unwrap();
+    assert!(!child.path.exists());
+}
+
+#[test]
+fn cleanup_receipt_blocks_cli_unit_admission() {
+    assert_cleanup_receipt_blocks_admission(false);
+}
+
+#[test]
+fn cleanup_receipt_blocks_direct_launch_admission() {
+    assert_cleanup_receipt_blocks_admission(true);
+}

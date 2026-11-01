@@ -444,6 +444,16 @@ branch, and records both ranges in `Ticket.integration_ranges`. A resolver can
 merge the child branches locally, resolve conflicts, report, and rerun
 `ticket integrate` to recognize the contained commits.
 
+Integration records each picked child commit with Git's `cherry-pick -x`
+provenance, including commits that are empty on arrival. Retries recognize
+those records in the ticket's first-parent history and pick only missing
+commits. Later ticket edits or deliberate reverts do not undo that proof of
+integration. An old integrated child without provenance is retained unless
+its tip is an ancestor of the ticket. Review its work, merge the child branch
+locally (resolving conflicts if needed), then rerun `ticket integrate` to finish
+cleanup. A child with outstanding cleanup cannot be reused by another agent;
+finish cleanup first.
+
 Pane events and periodic sweeps supervise owned agents. Safe fixed-key dialog
 rules run only after policy and foreground-cwd checks, and revalidate the screen
 before input. Unknown dialogs go to the lead. Idle or stalled agents receive one

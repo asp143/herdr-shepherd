@@ -76,6 +76,20 @@ pub fn launch_configured(
         crate::harness::harness_for(&runner.harness)?;
     }
     let (mut record, _operation) = store.update(|data| {
+        let cwd = req
+            .worktree
+            .canonicalize()
+            .unwrap_or_else(|_| req.worktree.clone());
+        if data.tickets.iter().any(|ticket| {
+            ticket.child_cleanup.iter().any(|receipt| {
+                cwd.starts_with(&receipt.path) || req.worktree.starts_with(&receipt.child.path)
+            })
+        }) {
+            return Err(ShepherdError::Usage(
+                "child checkout has outstanding cleanup; finish cleanup before launching an agent"
+                    .into(),
+            ));
+        }
         if req.role.name != "lead"
             && data
                 .agents

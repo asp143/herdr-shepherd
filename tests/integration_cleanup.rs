@@ -561,7 +561,11 @@ fn retry_refuses_changed_resources_and_unintegrated_commits() {
                 assert_eq!(error, "child worktree ownership changed", "{change}");
             }
             "ticket-rewind" => {
-                assert_eq!(error, "child commits are not integrated", "{change}");
+                assert_eq!(
+                    error,
+                    "child commits are not integrated; missing integration provenance. Review and merge feat/t--1 into the ticket branch, then retry cleanup",
+                    "{change}"
+                );
             }
             _ => assert_eq!(error, "integration cleanup ownership changed", "{change}"),
         }
@@ -606,7 +610,9 @@ fn whole_set_preflight_retains_earlier_children() {
         let error = f.run().unwrap_err().to_string();
         let expected = match change {
             "dirty" => "child worktree must be clean before cleanup",
-            "unintegrated" => "child commits are not integrated",
+            "unintegrated" => {
+                "child commits are not integrated; missing integration provenance. Review and merge feat/t--2 into the ticket branch, then retry cleanup"
+            }
             "unguarded" => "child worktree ownership changed",
             "live" => "child still has an unowned or active agent",
             _ => unreachable!(),
@@ -738,4 +744,33 @@ fn reassigned_legacy_workspace_is_not_closed_after_removal() {
     assert_eq!(f.h.workspaces.borrow().len(), 1);
     assert!(!git(&f.ticket, &["branch", "--list", "feat/t--1"]).is_empty());
     assert_eq!(f.snapshot().children.len(), 2);
+}
+
+#[test]
+fn provenance_receipt_survives_later_edits_to_landed_lines() {
+    let f = Fixture::new(&[false, false]);
+    git(
+        &f.h.root,
+        &["worktree", "lock", f.child(1).to_str().unwrap()],
+    );
+    assert!(f.run().is_err());
+    assert_eq!(f.snapshot().child_cleanup.len(), 2);
+    fs::write(f.ticket.join("work-2"), "later ticket edit\n").unwrap();
+    git(&f.ticket, &["add", "work-2"]);
+    git(&f.ticket, &["commit", "-m", "edit integrated work"]);
+    git(
+        &f.h.root,
+        &["worktree", "unlock", f.child(1).to_str().unwrap()],
+    );
+    f.run().unwrap();
+    assert!(f.snapshot().children.is_empty());
+    assert!(f.snapshot().child_cleanup.is_empty());
+    for unit in [1, 2] {
+        assert!(!f.child(unit).exists());
+        assert!(git(&f.ticket, &["branch", "--list", &format!("feat/t--{unit}")]).is_empty());
+    }
+    assert_eq!(
+        fs::read_to_string(f.ticket.join("work-2")).unwrap(),
+        "later ticket edit\n"
+    );
 }
