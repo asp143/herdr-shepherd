@@ -443,3 +443,96 @@ fn integration_waits_for_admitted_spawn_and_keeps_live_work() {
     );
     assert!(f.root.exists());
 }
+
+#[test]
+fn integration_retires_only_child_tab_with_canonical_cwd() {
+    let f = Fixture::git_repo();
+    let base = git(&f.root, &["rev-parse", "HEAD"]);
+    let child = f.dir.path().join("native-child");
+    git(&f.root, &["config", "extensions.worktreeConfig", "true"]);
+    git(
+        &f.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "fix/ticket--1",
+            child.to_str().unwrap(),
+        ],
+    );
+    git(
+        &child,
+        &[
+            "config",
+            "--worktree",
+            "shepherd.ticketBranch",
+            "fix/ticket--1",
+        ],
+    );
+    fs::write(child.join("work.txt"), "child work\n").unwrap();
+    git(&child, &["add", "work.txt"]);
+    git(&child, &["commit", "-m", "child work"]);
+    let alias = f.dir.path().join("child-alias");
+    std::os::unix::fs::symlink(&child, &alias).unwrap();
+    f.store
+        .update(|data| {
+            data.tickets[0]
+                .children
+                .push(herdr_shepherd::store::ChildWorktree {
+                    unit: 1,
+                    branch: "fix/ticket--1".into(),
+                    path: child.clone(),
+                    workspace_id: None,
+                    base_sha: base.clone(),
+                    integrated: false,
+                });
+            for (name, pane, worktree) in
+                [("child", "w1:p1", &alias), ("sibling", "w1:p2", &f.root)]
+            {
+                data.agents.push(herdr_shepherd::store::AgentRecord {
+                    name: name.into(),
+                    ticket: "T-1".into(),
+                    role: "coder".into(),
+                    runner: "fake".into(),
+                    status: AgentStatus::Reported,
+                    pane_id: Some(pane.into()),
+                    tab_id: Some(pane.replace(":p", ":t")),
+                    worktree: worktree.clone(),
+                    task: "work".into(),
+                    report: None,
+                    observed: None,
+                    last_progress_at: "0".into(),
+                    nudges: 0,
+                    restarts: 0,
+                    prompt_pending: false,
+                });
+            }
+            Ok(())
+        })
+        .unwrap();
+    fs::write(f.dir.path().join("fake.json"), serde_json::to_vec(&serde_json::json!({"agents": [
+        {"name":"child", "agent":"fake", "agent_status":"idle", "cwd":child, "pane_id":"w1:p1", "workspace_id":null},
+        {"name":"sibling", "agent":"fake", "agent_status":"idle", "cwd":f.root, "pane_id":"w1:p2", "workspace_id":"w1"}
+    ]})).unwrap()).unwrap();
+    let out = f
+        .command("ticket")
+        .args(["integrate", "T-1"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!child.exists());
+    assert_eq!(
+        fs::read_to_string(f.root.join("work.txt")).unwrap(),
+        "child work\n"
+    );
+    let data = f.store.read().unwrap();
+    assert!(data.tickets[0].children.is_empty());
+    assert_eq!(data.agents[0].status, AgentStatus::Retired);
+    assert_eq!(data.agents[1].status, AgentStatus::Reported);
+    assert!(!git(&f.root, &["branch", "--list", "fix/ticket--1"]).contains("fix/ticket--1"));
+}

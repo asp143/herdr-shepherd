@@ -427,7 +427,13 @@ pub fn integrate(
             })?;
             for child in &ticket.children {
                 for rec in store.read()?.agents.into_iter().filter(|a| {
-                    a.ticket == id && a.worktree == child.path && a.status == AgentStatus::Reported
+                    a.ticket == id
+                        && a.status == AgentStatus::Reported
+                        && a.worktree
+                            .canonicalize()
+                            .ok()
+                            .zip(child.path.canonicalize().ok())
+                            .is_some_and(|(agent, child)| agent == child)
                 }) {
                     if !herdr_shepherd::flock::retire_automatically(h, store, &rec)? {
                         return Err(ShepherdError::PolicyDenied(format!(
