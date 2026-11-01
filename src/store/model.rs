@@ -72,6 +72,9 @@ pub struct Ticket {
     #[serde(default)]
     pub posted_replies: Vec<PostedReply>,
     pub children: Vec<ChildWorktree>,
+    /// Validated child removals that may need to resume after a partial failure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_cleanup: Vec<ChildCleanup>,
     #[serde(default)]
     pub integration_ranges: Vec<String>,
     pub history: Vec<Transition>,
@@ -110,6 +113,15 @@ pub struct ChildWorktree {
     pub base_sha: String,
     #[serde(default)]
     pub integrated: bool,
+}
+
+/// Persisted before removing a checkout; binds recovery to its owned identity
+/// and the exact branch tip authorized by cleanup preflight.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChildCleanup {
+    pub child: ChildWorktree,
+    pub path: PathBuf,
+    pub tip: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

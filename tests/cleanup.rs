@@ -58,6 +58,7 @@ struct LocalHerdr {
     rewrite_after_remove: RefCell<Option<(String, String)>>,
     require_object_before_remove: RefCell<Option<String>>,
     on_remove: RefCell<Option<Box<dyn FnOnce()>>>,
+    fail_after_checkout_removal: RefCell<bool>,
 }
 impl Herdr for LocalHerdr {
     fn workspaces(&self) -> Result<Vec<Workspace>, ShepherdError> {
@@ -118,7 +119,17 @@ impl Herdr for LocalHerdr {
             args.push("--force");
         }
         args.push(path.to_str().unwrap());
-        ok(&self.main, &args);
+        let output = git(&self.main, &args);
+        if !output.status.success() {
+            return Err(ShepherdError::Usage(
+                String::from_utf8_lossy(&output.stderr).into(),
+            ));
+        }
+        if self.fail_after_checkout_removal.replace(false) {
+            return Err(ShepherdError::Usage(
+                "injected failure after checkout removal".into(),
+            ));
+        }
         self.removals.borrow_mut().push(ws.into());
         if let Some((reference, tip)) = self.rewrite_after_remove.borrow_mut().take() {
             ok(&self.main, &["update-ref", &reference, &tip]);
@@ -217,6 +228,7 @@ impl Repo {
             rewrite_after_remove: RefCell::new(None),
             require_object_before_remove: RefCell::new(None),
             on_remove: RefCell::new(None),
+            fail_after_checkout_removal: RefCell::new(false),
         };
         let backend = Backend(PrStatus {
             number: 1,
@@ -1339,4 +1351,237 @@ fn concurrent_registration_between_removals_keeps_ticket_and_new_child() {
         .status
         .success()
     );
+}
+
+fn assert_cleanup_finished(repo: &Repo) {
+    assert!(!repo.ticket.exists());
+    let store = herdr_shepherd::store::Store::open(&repo.state, &repo.main).unwrap();
+    let data = store.read().unwrap();
+    assert!(data.tickets[0].children.is_empty());
+    assert!(data.tickets[0].child_cleanup.is_empty());
+    for branch in ["feat/t--1", "feat/t--2", "feat/t"] {
+        assert!(
+            !git(
+                &repo.main,
+                &["show-ref", "--verify", &format!("refs/heads/{branch}")]
+            )
+            .status
+            .success()
+        );
+    }
+    assert_eq!(repo.h.workspaces.borrow().len(), 1);
+    assert_eq!(
+        ok(&repo.main, &["worktree", "list", "--porcelain"])
+            .matches("worktree ")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn partial_child_cleanup_can_retry_after_unlock() {
+    for (first_legacy, second_legacy) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let repo = Repo::new();
+        let first = recorded_child(&repo, 1, first_legacy);
+        let second = recorded_child(&repo, 2, second_legacy);
+        repo.merge();
+        ok(&repo.main, &["worktree", "lock", second.to_str().unwrap()]);
+        let error = cleanup::run(repo.preflight(false).unwrap(), false).unwrap_err();
+        assert!(error.to_string().contains("locked"), "{error}");
+        assert!(!first.exists());
+        assert!(second.exists());
+        assert!(repo.ticket.exists());
+        ok(
+            &repo.main,
+            &["worktree", "unlock", second.to_str().unwrap()],
+        );
+        let retry = repo
+            .preflight(false)
+            .unwrap_or_else(|error| panic!("retry preflight: {error}"));
+        cleanup::run(retry, false).unwrap();
+        assert!(!second.exists());
+        assert_cleanup_finished(&repo);
+    }
+}
+
+#[test]
+fn partial_cleanup_retries_child_ref_deletion() {
+    for legacy in [false, true] {
+        let repo = Repo::new();
+        let first = recorded_child(&repo, 1, legacy);
+        let second = recorded_child(&repo, 2, !legacy);
+        repo.merge();
+        let lock = repo.main.join(".git/refs/heads/feat/t--1.lock");
+        fs::write(&lock, "locked").unwrap();
+        assert!(cleanup::run(repo.preflight(false).unwrap(), false).is_err());
+        assert!(!first.exists());
+        assert!(repo.ticket.exists());
+        fs::remove_file(lock).unwrap();
+        let store = herdr_shepherd::store::Store::open(&repo.state, &repo.main).unwrap();
+        let before = store.read().unwrap();
+        assert_eq!(before.tickets[0].child_cleanup.len(), 1);
+        assert_eq!(before.tickets[0].child_cleanup[0].child.unit, 1);
+        assert_eq!(before.tickets[0].child_cleanup[0].path, first);
+        let preview = cleanup::run(repo.preflight(true).unwrap(), true).unwrap();
+        assert!(preview.children_removed.contains(&first));
+        assert_eq!(store.read().unwrap().tickets, before.tickets);
+        assert!(second.exists());
+        if legacy {
+            // Simulate interruption after ref deletion but before store reconciliation.
+            ok(&repo.main, &["update-ref", "-d", "refs/heads/feat/t--1"]);
+        }
+        cleanup::run(repo.preflight(false).unwrap(), false).unwrap();
+        assert!(!second.exists());
+        assert_cleanup_finished(&repo);
+    }
+}
+
+#[test]
+fn partial_cleanup_retries_before_ticket_workspace_removal() {
+    let repo = Repo::new();
+    let first = recorded_child(&repo, 1, false);
+    let second = recorded_child(&repo, 2, true);
+    repo.merge();
+    ok(
+        &repo.main,
+        &["worktree", "lock", repo.ticket.to_str().unwrap()],
+    );
+    assert!(cleanup::run(repo.preflight(false).unwrap(), false).is_err());
+    assert!(!first.exists());
+    assert!(!second.exists());
+    ok(
+        &repo.main,
+        &["worktree", "unlock", repo.ticket.to_str().unwrap()],
+    );
+    cleanup::run(repo.preflight(false).unwrap(), false).unwrap();
+    assert_cleanup_finished(&repo);
+}
+
+#[test]
+fn partial_cleanup_retries_legacy_workspace_close() {
+    let repo = Repo::new();
+    let first = recorded_child(&repo, 1, true);
+    let second = recorded_child(&repo, 2, false);
+    repo.merge();
+    *repo.h.fail_after_checkout_removal.borrow_mut() = true;
+    assert!(cleanup::run(repo.preflight(false).unwrap(), false).is_err());
+    assert!(!first.exists());
+    assert!(
+        repo.h
+            .workspaces
+            .borrow()
+            .iter()
+            .any(|ws| ws.workspace_id == "child-1")
+    );
+    cleanup::run(repo.preflight(false).unwrap(), false).unwrap();
+    assert!(!second.exists());
+    assert_cleanup_finished(&repo);
+}
+
+#[test]
+fn missing_child_without_cleanup_evidence_is_refused() {
+    let repo = Repo::new();
+    let first = recorded_child(&repo, 1, false);
+    recorded_child(&repo, 2, true);
+    repo.merge();
+    ok(&repo.main, &["worktree", "remove", first.to_str().unwrap()]);
+    assert!(repo.preflight(false).is_err());
+    assert!(repo.ticket.exists());
+    assert!(repo.h.removals.borrow().is_empty());
+}
+
+#[test]
+fn partial_cleanup_refuses_changed_resources() {
+    for change in [
+        "moved-ref",
+        "reassigned-checkout",
+        "unrelated-directory",
+        "symlink",
+        "record-path",
+        "record-base",
+        "record-workspace",
+        "record-unit",
+        "legacy-workspace",
+    ] {
+        let repo = Repo::new();
+        let first = recorded_child(&repo, 1, true);
+        let second = recorded_child(&repo, 2, false);
+        repo.merge();
+        let lock = repo.main.join(".git/refs/heads/feat/t--1.lock");
+        fs::write(&lock, "locked").unwrap();
+        assert!(cleanup::run(repo.preflight(false).unwrap(), false).is_err());
+        assert!(!first.exists());
+        fs::remove_file(lock).unwrap();
+        let store = herdr_shepherd::store::Store::open(&repo.state, &repo.main).unwrap();
+        match change {
+            "moved-ref" => {
+                ok(&repo.main, &["update-ref", "refs/heads/feat/t--1", "HEAD^"]);
+            }
+            "reassigned-checkout" => {
+                ok(
+                    &repo.main,
+                    &[
+                        "worktree",
+                        "add",
+                        "-b",
+                        "unrelated",
+                        first.to_str().unwrap(),
+                    ],
+                );
+            }
+            "unrelated-directory" => {
+                fs::create_dir(&first).unwrap();
+            }
+            "symlink" => {
+                std::os::unix::fs::symlink(&second, &first).unwrap();
+            }
+            "legacy-workspace" => {
+                repo.h.workspaces.borrow_mut().push(Workspace {
+                    workspace_id: "child-1".into(),
+                    label: "reassigned".into(),
+                    worktree: Some(WorktreeInfo {
+                        repo_key: "fixture".into(),
+                        repo_root: Some(repo.main.clone()),
+                        checkout_path: Some(second.clone()),
+                        is_linked_worktree: true,
+                    }),
+                });
+            }
+            _ => {
+                store
+                    .update(|data| {
+                        let child = &mut data.tickets[0].children[0];
+                        match change {
+                            "record-path" => child.path = repo._dir.path().join("tampered"),
+                            "record-base" => child.base_sha = "tampered".into(),
+                            "record-workspace" => child.workspace_id = None,
+                            "record-unit" => child.unit = 99,
+                            _ => unreachable!(),
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+        assert!(repo.preflight(false).is_err(), "accepted {change}");
+        assert!(repo.ticket.exists());
+        assert!(second.exists(), "removed remaining child after {change}");
+    }
+}
+
+#[test]
+fn tickets_without_child_cleanup_intent_still_load() {
+    for legacy in [false, true] {
+        let repo = Repo::new();
+        recorded_child(&repo, 1, legacy);
+        let store = herdr_shepherd::store::Store::open(&repo.state, &repo.main).unwrap();
+        let ticket = store.read().unwrap().tickets.remove(0);
+        let mut json = serde_json::to_value(&ticket).unwrap();
+        json.as_object_mut().unwrap().remove("child_cleanup");
+        let loaded: herdr_shepherd::store::Ticket = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded, ticket);
+        assert!(loaded.child_cleanup.is_empty());
+    }
 }

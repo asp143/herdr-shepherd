@@ -135,6 +135,7 @@ pub struct Preflight<'a> {
     main: PathBuf,
     target: Target,
     children: Vec<Target>,
+    removed_children: Vec<Target>,
     ticket: crate::store::Ticket,
     proof: MergeProof,
     policy: BranchPolicy,
@@ -152,12 +153,148 @@ fn check_recorded_resources(
             && ticket.worktree == expected.worktree
             && ticket.workspace_id == expected.workspace_id
             && ticket.children == expected.children
+            && ticket.child_cleanup == expected.child_cleanup
     }) {
         return Err(ShepherdError::PolicyDenied(
             "stored cleanup resources changed after preflight".into(),
         ));
     }
     Ok(())
+}
+
+// Missing checkouts are recoverable only with an exact, previously validated
+// cleanup intent. Never infer completion merely from an absent directory.
+fn removed_child(
+    receipt: &crate::store::ChildCleanup,
+    trees: &[(PathBuf, String)],
+    workspaces: &[Workspace],
+    transport: &crate::gate::transport::PushTransport,
+) -> Result<Target, ShepherdError> {
+    let denied = || ShepherdError::PolicyDenied("removed cleanup child ownership changed".into());
+    let path = &receipt.path;
+    let recorded = &receipt.child.path;
+    let parent = recorded
+        .parent()
+        .ok_or_else(denied)?
+        .canonicalize()
+        .map_err(anyhow::Error::from)?;
+    if parent.join(recorded.file_name().ok_or_else(denied)?) != *path {
+        return Err(denied());
+    }
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        _ => return Err(denied()),
+    }
+    if trees
+        .iter()
+        .any(|(checkout, branch)| checkout == path || *branch == receipt.child.branch)
+        || transport
+            .read_ref(&branch_ref(&receipt.child.branch))?
+            .is_some_and(|tip| tip != receipt.tip)
+    {
+        return Err(denied());
+    }
+    for workspace in workspaces {
+        let same_id = receipt.child.workspace_id.as_ref() == Some(&workspace.workspace_id);
+        let same_path = workspace
+            .worktree
+            .as_ref()
+            .is_some_and(|wt| wt.checkout_path.as_ref() == Some(path));
+        if !same_id && !same_path {
+            continue;
+        }
+        // A legacy removal can succeed before Herdr closes its workspace.
+        // Only the original, still repository-matching handle may be closed.
+        let Some(wt) = workspace.worktree.as_ref() else {
+            return Err(denied());
+        };
+        if !same_id
+            || !same_path
+            || !wt.is_linked_worktree
+            || !wt
+                .repo_root
+                .as_ref()
+                .is_some_and(|root| transport.matches_repository(root).unwrap_or(false))
+        {
+            return Err(denied());
+        }
+        check_caller(
+            &workspace.workspace_id,
+            std::env::var("HERDR_WORKSPACE_ID").ok().as_deref(),
+        )?;
+    }
+    Ok(Target {
+        path: path.clone(),
+        branch: receipt.child.branch.clone(),
+        workspace: receipt.child.workspace_id.clone(),
+        tip: receipt.tip.clone(),
+    })
+}
+
+fn save_child_cleanup(
+    proof: &MergeProof,
+    expected: &mut crate::store::Ticket,
+    next: crate::store::Ticket,
+) -> Result<(), ShepherdError> {
+    crate::store::Store::open(&proof.state_dir, &proof.project_root)?.update(|data| {
+        check_recorded_resources(expected, data)?;
+        let ticket = data
+            .tickets
+            .iter_mut()
+            .find(|ticket| ticket.id == expected.id)
+            .unwrap();
+        ticket.children.clone_from(&next.children);
+        ticket.child_cleanup.clone_from(&next.child_cleanup);
+        Ok(())
+    })?;
+    expected.children = next.children;
+    expected.child_cleanup = next.child_cleanup;
+    Ok(())
+}
+
+fn finish_child_cleanup(
+    proof: &MergeProof,
+    herdr: &dyn Herdr,
+    main: &Path,
+    ticket: &mut crate::store::Ticket,
+    target: &Target,
+) -> Result<(), ShepherdError> {
+    let receipt = ticket
+        .child_cleanup
+        .iter()
+        .find(|receipt| {
+            receipt.path == target.path
+                && receipt.child.branch == target.branch
+                && receipt.tip == target.tip
+        })
+        .ok_or_else(|| ShepherdError::PolicyDenied("child cleanup intent missing".into()))?
+        .clone();
+    let data = crate::store::Store::open(&proof.state_dir, &proof.project_root)?.read()?;
+    check_recorded_resources(ticket, &data)?;
+    let workspaces = herdr.workspaces()?;
+    removed_child(
+        &receipt,
+        &worktrees(main)?,
+        &workspaces,
+        &proof.transport()?,
+    )?;
+    check_agents(herdr, &[target], &data.agents)?;
+    if let Some(workspace) = &target.workspace
+        && workspaces.iter().any(|ws| ws.workspace_id == *workspace)
+    {
+        herdr.close_workspace(workspace)?;
+    }
+    if proof
+        .transport()?
+        .read_ref(&branch_ref(&target.branch))?
+        .is_some()
+    {
+        let _ = delete_local(main, &target.branch, &target.tip, &proof.base_tip)?;
+    }
+    let mut next = ticket.clone();
+    next.children.retain(|child| child != &receipt.child);
+    next.child_cleanup.retain(|current| current != &receipt);
+    save_child_cleanup(proof, ticket, next)
 }
 
 fn capture(path: &Path, args: &[&str]) -> Result<proc::Captured, ShepherdError> {
@@ -380,8 +517,8 @@ fn check_agents(
                         && record
                             .worktree
                             .canonicalize()
-                            .ok()
-                            .is_some_and(|path| path.starts_with(&target.path))
+                            .unwrap_or_else(|_| record.worktree.clone())
+                            .starts_with(&target.path)
                 })
         }) {
             return Err(ShepherdError::Usage(
@@ -593,7 +730,50 @@ pub fn preflight_with_transport<'a>(
             }
             children.push(child);
         }
-        if children.len() != ticket.children.len() {
+        let mut removed_children = Vec::new();
+        for receipt in &ticket.child_cleanup {
+            if ticket
+                .children
+                .iter()
+                .filter(|child| **child == receipt.child)
+                .count()
+                != 1
+                || ticket
+                    .child_cleanup
+                    .iter()
+                    .filter(|other| other.child.unit == receipt.child.unit)
+                    .count()
+                    != 1
+                || receipt.child.branch != format!("{branch}--{}", receipt.child.unit)
+                || policy.is_protected(&receipt.child.branch)
+            {
+                return Err(ShepherdError::PolicyDenied(
+                    "child cleanup intent does not match stored ownership".into(),
+                ));
+            }
+            if let Some(child) = children
+                .iter()
+                .find(|child| child.path == receipt.path && child.branch == receipt.child.branch)
+            {
+                if child.tip != receipt.tip || child.workspace != receipt.child.workspace_id {
+                    return Err(ShepherdError::PolicyDenied(
+                        "child cleanup intent tip changed".into(),
+                    ));
+                }
+            } else {
+                let child = removed_child(receipt, &trees, &workspaces, &transport)?;
+                if !transport.is_ancestor(&child.tip, &target.tip)?
+                    && !transport.is_ancestor(&child.tip, &base_tip)?
+                    && !transport.patch_equivalent(&child.tip, &base_tip)?
+                {
+                    return Err(ShepherdError::PolicyDenied(
+                        "removed child commits are not contained".into(),
+                    ));
+                }
+                removed_children.push(child);
+            }
+        }
+        if children.len() + removed_children.len() != ticket.children.len() {
             return Err(ShepherdError::PolicyDenied(
                 "stored child worktree set does not match the repository".into(),
             ));
@@ -601,7 +781,7 @@ pub fn preflight_with_transport<'a>(
         children.sort_by_key(|child| std::cmp::Reverse(child.path.components().count()));
         check_tree_set(&trees, &target, &children)?;
         let mut targets = vec![&target];
-        targets.extend(children.iter());
+        targets.extend(children.iter().chain(removed_children.iter()));
         check_agents(h, &targets, &data.agents)?;
         // A squash merge is sufficient to remove a clean workspace, but local
         // and remote branches are retained unless ancestry proves containment.
@@ -612,6 +792,7 @@ pub fn preflight_with_transport<'a>(
             main,
             target,
             children,
+            removed_children,
             ticket,
             proof: MergeProof {
                 pr: status.number,
@@ -702,7 +883,7 @@ fn delete_local(main: &Path, branch: &str, tip: &str, base: &str) -> Result<bool
     Ok(true)
 }
 
-pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdError> {
+pub fn run(mut p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdError> {
     if dry_run != p.dry_run {
         return Err(ShepherdError::Usage(
             "cleanup preflight and execution modes differ".into(),
@@ -724,7 +905,12 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
             local_branch_kept_reason: (!contained).then(|| "branch_not_contained".into()),
             remote_branch: remote_state(&p.proof, &p.target.branch, &p.proof.tip, contained)?,
             base_synced: base_sync_status(&p.main, &p.proof.base, &p.proof),
-            children_removed: p.children.iter().map(|child| child.path.clone()).collect(),
+            children_removed: p
+                .children
+                .iter()
+                .chain(p.removed_children.iter())
+                .map(|child| child.path.clone())
+                .collect(),
             ignored_files: p
                 .children
                 .iter()
@@ -777,8 +963,11 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
             }
         }
         let mut targets = vec![&p.target];
-        targets.extend(p.children.iter());
+        targets.extend(p.children.iter().chain(p.removed_children.iter()));
         check_agents(p.herdr, &targets, &data.agents)?;
+        for target in &p.removed_children {
+            finish_child_cleanup(&p.proof, p.herdr, &p.main, &mut p.ticket, target)?;
+        }
         for (index, target) in p
             .children
             .iter()
@@ -806,6 +995,34 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
             check_recorded_resources(&p.ticket, &data)?;
             check_tree_set(&worktrees(&p.main)?, &p.target, &p.children[index..])?;
             check_agents(p.herdr, &[target], &data.agents)?;
+            if index < p.children.len() {
+                let child = p
+                    .ticket
+                    .children
+                    .iter()
+                    .find(|child| {
+                        child.branch == target.branch
+                            && child.path.canonicalize().ok().as_deref()
+                                == Some(target.path.as_path())
+                    })
+                    .ok_or_else(|| {
+                        ShepherdError::PolicyDenied("cleanup child record missing".into())
+                    })?;
+                if !p
+                    .ticket
+                    .child_cleanup
+                    .iter()
+                    .any(|receipt| receipt.child == *child)
+                {
+                    let mut next = p.ticket.clone();
+                    next.child_cleanup.push(crate::store::ChildCleanup {
+                        child: child.clone(),
+                        path: target.path.clone(),
+                        tip: target.tip.clone(),
+                    });
+                    save_child_cleanup(&p.proof, &mut p.ticket, next)?;
+                }
+            }
             if let Some(workspace) = &target.workspace {
                 p.herdr.remove_worktree(workspace, p.force_discard)?;
                 if p.herdr
@@ -835,29 +1052,12 @@ pub fn run(p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdErr
                     "herdr did not remove the worktree"
                 )));
             }
+            drop(transport);
+            if index < p.children.len() {
+                finish_child_cleanup(&p.proof, p.herdr, &p.main, &mut p.ticket, target)?;
+            }
         }
         git(&p.main, &["worktree", "prune"])?;
-        for child in &p.children {
-            let _ = delete_local(&p.main, &child.branch, &child.tip, &p.proof.base_tip)?;
-        }
-        crate::store::Store::open(&p.proof.state_dir, &p.proof.project_root)?.update(|data| {
-            if let Some(ticket) = data
-                .tickets
-                .iter_mut()
-                .find(|ticket| ticket.id == p.ticket.id)
-            {
-                ticket.children.retain(|current| {
-                    !p.ticket.children.iter().any(|removed| {
-                        current.unit == removed.unit
-                            && current.path == removed.path
-                            && current.branch == removed.branch
-                            && current.base_sha == removed.base_sha
-                            && current.workspace_id == removed.workspace_id
-                    })
-                });
-            }
-            Ok(())
-        })?;
         report.local_branch_deleted =
             delete_local(&p.main, &p.target.branch, &p.proof.tip, &p.proof.base_tip)?;
         report.local_branch_kept_reason =
