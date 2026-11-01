@@ -195,13 +195,15 @@ fn poll_ticket(
                         &serde_json::json!({"ticket":ticket.id,"reason":"loop_cap"}),
                     );
                 } else {
-                    crate::lead::ping_lead(
+                    crate::flock::ping_notice(
                         h,
                         store,
                         &format!(
                             "{}: CI failed; run ticket dispatch to start the fix and complete reviewer and QA",
                             ticket.id
                         ),
+                        Some(&ticket.id),
+                        None,
                     );
                 }
                 crate::hooks::emit(
@@ -336,9 +338,11 @@ fn notify_comments(
             }
         }
         if count > 0 {
-            data.enqueue_lead_ping(&format!(
-                "{id}: {count} new PR comment(s), run ticket comments {id} --new"
-            ));
+            data.enqueue_lead_notice(
+                &format!("{id}: {count} new PR comment(s), run ticket comments {id} --new"),
+                Some(id),
+                None,
+            );
         }
         Ok(count)
     })?;

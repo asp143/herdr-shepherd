@@ -330,6 +330,23 @@ nonblocking operation ownership and fresh pane/session/worktree/project checks;
 deferred retirement keeps resources and stops CI handoff or cleanup. Explicit
 `agent cancel` remains available to the operator after inspecting uncertainty.
 
+Automatic lead notices carry their ticket, agent and creation time. The queue
+heals during supervision, before delivery and when launching a lead: it removes
+self-notices, notices for finished or missing tickets, notices for inactive
+agents without an active ticket, and notices older than 24 hours. Capacity
+recovery removes the oldest automatic notices first. `status` reports the
+remaining pending count; routine healing logs counts without message text or
+notifications. A relaunched lead retains notices for active tickets.
+
+Messages from `ask` never expire or get trimmed, including intentional duplicates.
+State files migrate from schema 1 to schema 2 automatically when saved. Legacy
+queue strings are classified as automatic only when they match a known generated
+notice; unrecognized strings remain user requests. A full queue still
+refuses new `ask` requests until capacity is available. Supervision sends blocked
+lead conditions to the user's notification channel once per episode while safe
+rules can still handle trust dialogs; flock notices and escalation are also
+limited per episode, even when screen text changes.
+
 An opt-in PTY regression uses the installed OMP with empty fixture HOME/XDG and
 agent directories, no tools/extensions/context files, and a loopback fake
 provider inside a separate network namespace. It requires Python 3 and bwrap:

@@ -54,6 +54,7 @@ fn launch_lead(
             "invoking workspace is required".into(),
         ));
     }
+    store.heal_pending_pings()?;
     let data = store.read()?;
     if crate::trusted::main_checkout(&data.project_root).is_ok() {
         crate::trusted::ensure_snapshot(ctx.state_dir, &data.project_root)?;
@@ -135,6 +136,8 @@ pub fn ping_lead(h: &dyn Herdr, store: &Store, text: &str) {
 
 /// Deliver one queued notification per sweep without losing concurrent reports.
 pub fn flush_pings(h: &dyn Herdr, store: &Store) -> Result<usize, ShepherdError> {
+    // Healing never requires a live or idle lead and causes no transport input.
+    store.heal_pending_pings()?;
     let data = store.read()?;
     let Some(lead) = data.lead else {
         return Ok(0);
@@ -167,6 +170,7 @@ pub fn flush_pings(h: &dyn Herdr, store: &Store) -> Result<usize, ShepherdError>
         Err(std::fs::TryLockError::WouldBlock) => return Ok(0),
         Err(error) => return Err(anyhow::Error::from(error).into()),
     }
+    store.heal_pending_pings()?;
     let Some(message) = store.read()?.pending_pings.first().cloned() else {
         return Ok(0);
     };
@@ -175,7 +179,7 @@ pub fn flush_pings(h: &dyn Herdr, store: &Store) -> Result<usize, ShepherdError>
         store,
         rec,
         crate::flock::automatic::Prompt::Followup {
-            text: &message,
+            text: &message.text,
             kind: "notification",
             nudge_at: None,
             queued: true,
@@ -441,6 +445,231 @@ mod tests {
     }
 
     #[test]
+    fn legacy_noise_heals_without_a_lead_and_preserves_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state"), dir.path()).unwrap();
+        let h = crate::herdr::fake::FakeHerdr::new(vec![]);
+        store
+            .update(|data| {
+                for index in 0..32 {
+                    data.tickets.push(crate::store::Ticket {
+                        id: format!("T-{index}"),
+                        state: crate::store::TicketState::Closed,
+                        ..Default::default()
+                    });
+                }
+                Ok(())
+            })
+            .unwrap();
+        // This models a legacy file on disk, independently of the new serializer.
+        let path = store.root().join("state.json");
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        legacy["schema_version"] = 1.into();
+        legacy["pending_pings"] = serde_json::json!(
+            (0..369)
+                .map(|index| format!(": sh-69c8fe-lead blocked: screen {index}"))
+                .chain((0..32).map(|index| format!(
+                    "T-{index}: coder sh-69c8fe-coder-1 reported: old report"
+                )))
+                .chain(std::iter::once("legacy text from the user".into()))
+                .collect::<Vec<_>>()
+        );
+        legacy["pending_pings"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "text": "structured request from the user",
+                "kind": "request",
+                "ticket": "T-0",
+                "agent": "sh-69c8fe-lead",
+                "created_at": 0
+            }));
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(store.read().unwrap().pending_pings.len(), 403);
+        let cfg = crate::config::load(&dir.path().join("config"), None).unwrap();
+        let report = crate::supervise::sweep_projects(&h, &dir.path().join("state"), &cfg, 100);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(store.read().unwrap().pending_pings.len(), 2);
+        assert_eq!(flush_pings(&h, &store).unwrap(), 0);
+        let healed = store.read().unwrap();
+        assert_eq!(
+            healed.pending_pings,
+            [
+                "legacy text from the user",
+                "structured request from the user"
+            ]
+        );
+        assert!(h.calls.borrow().is_empty());
+        assert_eq!(healed.schema_version, 2);
+        let reloaded = Store::open(&dir.path().join("state"), dir.path())
+            .unwrap()
+            .read()
+            .unwrap();
+        assert_eq!(reloaded, healed);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            saved["pending_pings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.is_object())
+        );
+    }
+
+    fn enqueue_live_notice(store: &Store) {
+        store
+            .update(|data| {
+                data.tickets.push(crate::store::Ticket {
+                    id: "T-live".into(),
+                    state: crate::store::TicketState::Building,
+                    ..Default::default()
+                });
+                data.enqueue_lead_notice(
+                    "T-live: coder reported useful progress",
+                    Some("T-live"),
+                    Some("worker"),
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn lead_relaunch_retains_live_ticket_notices_and_delivers_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, h) = notification_fixture(dir.path());
+        store
+            .update(|data| {
+                data.agents[0].status = AgentStatus::Retired;
+                Ok(())
+            })
+            .unwrap();
+        h.agent_records.borrow_mut().clear();
+        enqueue_live_notice(&store);
+        let before = store.read().unwrap().pending_pings;
+        let cfg = crate::config::load(&dir.path().join("config"), None).unwrap();
+        resume(
+            &h,
+            &store,
+            &cfg,
+            &LeadContext {
+                bin: Path::new("fixture"),
+                state_dir: &dir.path().join("state"),
+                workspace_id: "w1",
+            },
+        )
+        .unwrap();
+        assert_eq!(store.read().unwrap().pending_pings, before);
+        assert_eq!(flush_pings(&h, &store).unwrap(), 1);
+        assert!(store.read().unwrap().pending_pings.is_empty());
+        assert!(
+            h.calls
+                .borrow()
+                .iter()
+                .any(|call| call.contains("T-live: coder reported useful progress false"))
+        );
+    }
+
+    #[test]
+    fn notification_closing_during_recipient_check_is_dropped_before_input() {
+        for close_on_read in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, h) = notification_fixture(dir.path());
+            enqueue_live_notice(&store);
+            let callback_store = store.clone();
+            let reads = std::sync::atomic::AtomicUsize::new(0);
+            *h.on_get.borrow_mut() = Some(Box::new(move |_| {
+                if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == close_on_read {
+                    callback_store
+                        .update(|data| {
+                            data.tickets[0].state = crate::store::TicketState::Closed;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            }));
+            assert_eq!(flush_pings(&h, &store).unwrap(), 0);
+            assert!(store.read().unwrap().pending_pings.is_empty());
+            assert!(h.accepted_prompts.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn notification_rejection_preserves_request_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, h) = notification_fixture(dir.path());
+        let self_notice_text = ": sh-69c8fe-lead blocked: explicitly quoted by user";
+        store
+            .update(|data| data.enqueue_lead_request(self_notice_text))
+            .unwrap();
+        let before = store.read().unwrap().pending_pings;
+        h.prompt_results.borrow_mut().push_back((
+            false,
+            Err(ShepherdError::HerdrCommand {
+                code: "agent_blocked".into(),
+                message: "before input".into(),
+            }),
+        ));
+        assert!(flush_pings(&h, &store).is_err());
+        assert_eq!(store.read().unwrap().pending_pings, before);
+        assert_eq!(flush_pings(&h, &store).unwrap(), 1);
+        assert_eq!(h.accepted_prompts.borrow().len(), 1);
+    }
+
+    #[test]
+    fn healing_and_concurrent_enqueue_preserve_every_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state"), dir.path()).unwrap();
+        store
+            .update(|data| {
+                for index in 0..369 {
+                    data.pending_pings
+                        .push(format!(": sh-69c8fe-lead blocked: screen {index}").into());
+                }
+                Ok(())
+            })
+            .unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let healer = scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..40 {
+                    store.heal_pending_pings().unwrap();
+                }
+            });
+            let writer = scope.spawn(|| {
+                barrier.wait();
+                for index in 0..40 {
+                    store
+                        .update(|data| {
+                            // An explicit concurrent writer may persist while healing
+                            // is waiting for the same state lock.
+                            data.pending_pings.push(crate::store::PendingPing {
+                                text: format!("request {index}"),
+                                kind: crate::store::PingKind::Request,
+                                ticket: None,
+                                agent: None,
+                                created_at: 0,
+                            });
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            });
+            healer.join().unwrap();
+            writer.join().unwrap();
+        });
+        store.heal_pending_pings().unwrap();
+        let data = store.read().unwrap();
+        assert_eq!(data.pending_pings.len(), 40);
+        for (index, ping) in data.pending_pings.iter().enumerate() {
+            assert_eq!(ping.text, format!("request {index}"));
+        }
+    }
+
+    #[test]
     fn ping_queued_when_lead_blocked() {
         let dir = tempfile::tempdir().unwrap();
         let (store, h) = notification_fixture(dir.path());
@@ -526,7 +755,7 @@ mod tests {
                 *h.on_prompt.borrow_mut() = Some(Box::new(move |_| {
                     let data = callback_store.read().unwrap();
                     assert!(data.agents[0].prompt_delivery_uncertain());
-                    assert!(!data.pending_pings.contains(&"first".to_string()));
+                    assert!(!data.pending_pings.iter().any(|ping| ping.text == "first"));
                     callback_store
                         .update(|data| {
                             data.pending_pings.push("concurrent".into());

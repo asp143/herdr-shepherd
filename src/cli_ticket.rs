@@ -390,10 +390,12 @@ pub fn integrate(
                 "ticket.blocked",
                 &serde_json::json!({"ticket":id,"reason":"conflict"}),
             );
-            herdr_shepherd::flock::ping(
+            herdr_shepherd::flock::ping_notice(
                 h,
                 store,
                 &format!("{id}: child integration conflict; both ranges retained"),
+                Some(id),
+                None,
             );
             herdr_shepherd::notify::Notifier::new(h, cfg.upkeep.notifications)
                 .send(&format!("{id}: integration blocked"), &error.to_string());

@@ -172,7 +172,7 @@ pub fn reconcile(
                         "{}: {} launch_failed; role re-queued for agent spawn",
                         current.ticket, current.role
                     );
-                    data.enqueue_lead_ping(&message);
+                    data.enqueue_lead_notice(&message, Some(&rec.ticket), Some(&rec.name));
                     result.failed += 1;
                 }
                 None => {
@@ -219,16 +219,33 @@ pub fn reconcile(
 
 /// Queue a short lead notification when interactive delivery is unavailable.
 pub fn ping(h: &dyn crate::herdr::Herdr, store: &crate::store::Store, text: &str) {
-    let text: String = text
-        .split_whitespace()
+    ping_notice(h, store, text, None, None);
+}
+
+pub(crate) fn compact_ping(text: &str) -> String {
+    text.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
         .take(160)
-        .collect();
+        .collect()
+}
+
+pub fn ping_notice(
+    h: &dyn crate::herdr::Herdr,
+    store: &crate::store::Store,
+    text: &str,
+    ticket: Option<&str>,
+    agent: Option<&str>,
+) {
+    let text = compact_ping(text);
     if let Err(error) = store
         .update(|data| {
-            data.enqueue_lead_ping(&text);
+            if ticket.is_some() || agent.is_some() {
+                data.enqueue_lead_notice(&text, ticket, agent);
+            } else {
+                data.enqueue_lead_ping(&text);
+            }
             Ok(())
         })
         .and_then(|_| crate::lead::flush_pings(h, store).map(|_| ()))
@@ -245,7 +262,7 @@ pub fn report(
     text: &str,
 ) -> Result<crate::store::AgentRecord, ShepherdError> {
     let rec = store_report(store, name, text)?;
-    ping(
+    ping_notice(
         h,
         store,
         &format!(
@@ -255,6 +272,8 @@ pub fn report(
             rec.name,
             rec.report.as_ref().map_or("", |r| r.summary.as_str())
         ),
+        Some(&rec.ticket),
+        Some(&rec.name),
     );
     crate::hooks::emit(
         cfg,

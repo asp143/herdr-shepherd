@@ -80,11 +80,12 @@ pub(crate) fn dispatch(
     expected: &AgentRecord,
     prompt: Prompt<'_>,
 ) -> Result<bool, ShepherdError> {
-    let (claim, nudge_at, queued, initial, recipient_info) = match prompt {
+    let (mut claim, nudge_at, queued, initial, recipient_info) = match prompt {
         Prompt::Initial => (
             PromptClaim {
                 kind: "initial".into(),
                 text: expected.task.clone(),
+                queued_ping: None,
             },
             None,
             false,
@@ -107,6 +108,7 @@ pub(crate) fn dispatch(
                 PromptClaim {
                     kind: kind.into(),
                     text: text.into(),
+                    queued_ping: None,
                 },
                 nudge_at,
                 queued,
@@ -122,18 +124,30 @@ pub(crate) fn dispatch(
         {
             return Ok(false);
         }
-        let Some(rec) = data.agents.iter_mut().find(|rec| *rec == expected) else {
+        if queued {
+            // Recipient reads may run callbacks or take time. Revalidate under
+            // the state lock immediately before claiming the queued intent.
+            let healed = data.heal_pending_pings(crate::launch::now().parse().unwrap_or(0));
+            if healed > 0 {
+                eprintln!("shepherd: healed {healed} pending notices");
+            }
+            if data.pending_pings.first().map(|ping| ping.text.as_str())
+                != Some(claim.text.as_str())
+            {
+                return Ok(false);
+            }
+        }
+        let Some(index) = data.agents.iter().position(|rec| rec == expected) else {
             return Ok(false);
         };
+        let rec = &data.agents[index];
         if !active(rec) || rec.prompt_delivery_uncertain() || initial != rec.prompt_pending {
             return Ok(false);
         }
         if queued {
-            if data.pending_pings.first() != Some(&claim.text) {
-                return Ok(false);
-            }
-            data.pending_pings.remove(0);
+            claim.queued_ping = Some(data.pending_pings.remove(0));
         }
+        let rec = &mut data.agents[index];
         rec.prompt_pending = false;
         rec.status = AgentStatus::Blocked;
         rec.set_prompt_delivery_uncertain(true);
@@ -163,7 +177,13 @@ pub(crate) fn dispatch(
             // retain this older request even then. The project-wide ping lock
             // allows at most one restoration overflow, and future enqueue
             // refuses the full queue until it drains.
-            data.pending_pings.insert(0, claim.text.clone());
+            data.pending_pings.insert(
+                0,
+                claim
+                    .queued_ping
+                    .clone()
+                    .expect("queued claim retains its entry"),
+            );
         }
         // A real report or retirement wins, even when it arrives during input.
         let Some(rec) = data.agents.iter_mut().find(|rec| {

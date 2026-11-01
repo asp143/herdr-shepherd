@@ -522,7 +522,7 @@ fn ask_reports_full_queue_without_losing_requests() {
     fixture
         .store()
         .update(|data| {
-            data.pending_pings = pending.clone();
+            data.pending_pings = pending.iter().cloned().map(Into::into).collect();
             Ok(())
         })
         .unwrap();
