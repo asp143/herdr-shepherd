@@ -106,6 +106,19 @@ impl Fixture {
         .unwrap();
         name
     }
+
+    fn herdr(&self, status: &str) -> FakeHerdr {
+        let h = FakeHerdr::new(vec![]);
+        h.agent_records.borrow_mut().push(AgentInfo {
+            name: Some(self.store().read().unwrap().lead.unwrap().agent_name),
+            agent: "codex".into(),
+            agent_status: status.into(),
+            cwd: Some(self.root.clone()),
+            pane_id: "w1:p1".into(),
+            workspace_id: Some("w1".into()),
+        });
+        h
+    }
 }
 
 fn git(root: &Path, args: &[&str]) {
@@ -373,6 +386,155 @@ struct PromptFailure {
     code: &'static str,
 }
 
+#[test]
+fn ask_keeps_proven_pre_input_rejections_queued() {
+    for code in ["agent_blocked", "agent_not_ready"] {
+        let fixture = Fixture::new();
+        fixture.seed_lead("idle");
+        let h = PromptFailure {
+            inner: fixture.herdr("idle"),
+            code,
+        };
+        let report = herdr_shepherd::ask::send(&h, &fixture.store(), "Fix typo").unwrap();
+        assert!(report.queued);
+        let data = fixture.store().read().unwrap();
+        assert_eq!(data.pending_pings, ["Fix typo"]);
+        assert!(!data.agents[0].prompt_delivery_uncertain());
+    }
+}
+
+#[test]
+fn ask_retains_uncertain_verbatim_request_without_replay() {
+    let fixture = Fixture::new();
+    fixture.seed_lead("idle");
+    let h = fixture.herdr("idle");
+    h.prompt_results.borrow_mut().push_back((
+        true,
+        Err(ShepherdError::HerdrCommand {
+            code: "timeout".into(),
+            message: "accepted without acknowledgement".into(),
+        }),
+    ));
+    let text = format!(
+        "Fix the banner.\n\n{}\n",
+        "Preserve every detail. ".repeat(30)
+    );
+    assert!(
+        herdr_shepherd::ask::send(&h, &fixture.store(), &text)
+            .unwrap_err()
+            .prompt_submission_uncertain()
+    );
+    let data = fixture.store().read().unwrap();
+    assert!(data.pending_pings.is_empty());
+    assert_eq!(data.agents[0].prompt_claim().unwrap().text, text);
+    assert!(data.agents[0].prompt_delivery_uncertain());
+    assert!(herdr_shepherd::ask::lead_running(&h, &fixture.store()).unwrap());
+    for _ in 0..2 {
+        assert!(
+            herdr_shepherd::ask::send(&h, &fixture.store(), &text)
+                .unwrap()
+                .queued
+        );
+        assert_eq!(
+            herdr_shepherd::lead::flush_pings(&h, &fixture.store()).unwrap(),
+            0
+        );
+    }
+    assert_eq!(
+        fixture.store().read().unwrap().pending_pings,
+        [text.clone(), text]
+    );
+    assert_eq!(h.accepted_prompts.borrow().len(), 1);
+}
+
+#[test]
+fn ask_does_not_treat_retired_live_lead_as_running() {
+    let fixture = Fixture::new();
+    fixture.seed_lead("idle");
+    fixture
+        .store()
+        .update(|data| {
+            data.agents[0].status = AgentStatus::Retired;
+            Ok(())
+        })
+        .unwrap();
+    let h = fixture.herdr("idle");
+    assert!(!herdr_shepherd::ask::lead_running(&h, &fixture.store()).unwrap());
+    assert_eq!(
+        herdr_shepherd::ask::send(&h, &fixture.store(), "Fix typo")
+            .unwrap_err()
+            .code(),
+        "usage"
+    );
+    assert!(fixture.store().read().unwrap().pending_pings.is_empty());
+}
+
+#[test]
+fn ask_rejects_replaced_lead_terminal_without_queueing() {
+    for mismatch in ["pane", "workspace", "worktree", "session"] {
+        let fixture = Fixture::new();
+        fixture.seed_lead("idle");
+        let h = fixture.herdr("idle");
+        match mismatch {
+            "pane" => h.agent_records.borrow_mut()[0].pane_id = "w1:replacement".into(),
+            "workspace" => h.agent_records.borrow_mut()[0].workspace_id = Some("other".into()),
+            "worktree" => h.agent_records.borrow_mut()[0].cwd = Some(fixture._dir.path().into()),
+            "session" => {
+                fixture
+                    .store()
+                    .update(|data| {
+                        data.agents[0].observed = Some(r#"{"session_ref":"saved"}"#.into());
+                        Ok(())
+                    })
+                    .unwrap();
+                h.pane_sessions
+                    .borrow_mut()
+                    .insert("w1:p1".into(), "replacement".into());
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            herdr_shepherd::ask::lead_running(&h, &fixture.store())
+                .unwrap_err()
+                .code(),
+            "policy_denied",
+            "{mismatch}"
+        );
+        assert_eq!(
+            herdr_shepherd::ask::send(&h, &fixture.store(), "Fix typo")
+                .unwrap_err()
+                .code(),
+            "policy_denied",
+            "{mismatch}"
+        );
+        assert!(fixture.store().read().unwrap().pending_pings.is_empty());
+        assert!(h.accepted_prompts.borrow().is_empty());
+    }
+}
+
+#[test]
+fn ask_reports_full_queue_without_losing_requests() {
+    let fixture = Fixture::new();
+    fixture.seed_lead("working");
+    let pending: Vec<_> = (0..herdr_shepherd::store::StoreData::MAX_PENDING_PINGS)
+        .map(|index| format!("queued request {index}"))
+        .collect();
+    fixture
+        .store()
+        .update(|data| {
+            data.pending_pings = pending.clone();
+            Ok(())
+        })
+        .unwrap();
+    let h = fixture.herdr("working");
+    let error = herdr_shepherd::ask::send(&h, &fixture.store(), "Keep this new request intact")
+        .unwrap_err();
+    assert_eq!(error.code(), "usage");
+    assert!(error.to_string().contains("queue is full"));
+    assert_eq!(fixture.store().read().unwrap().pending_pings, pending);
+    assert!(h.accepted_prompts.borrow().is_empty());
+}
+
 impl Herdr for PromptFailure {
     fn prompt_agent(&self, _: &str, _: &str, _: bool) -> Result<(), ShepherdError> {
         match self.code {
@@ -457,9 +619,16 @@ fn shared_delivery_retains_failed_requests_without_repeating_accepted_prompts() 
         });
         let result = herdr_shepherd::ask::send(&h, &fixture.store(), "Fix typo");
         match code {
-            "timeout" | "agent_prompt_stalled" => {
-                assert!(!result.unwrap().queued);
-                assert!(fixture.store().read().unwrap().pending_pings.is_empty());
+            "timeout" | "agent_prompt_stalled" | "runtime" => {
+                assert!(result.unwrap_err().prompt_submission_uncertain());
+                let data = fixture.store().read().unwrap();
+                assert!(data.pending_pings.is_empty());
+                assert_eq!(data.agents[0].prompt_claim().unwrap().text, "Fix typo");
+                assert!(data.agents[0].prompt_delivery_uncertain());
+                assert_eq!(
+                    herdr_shepherd::lead::flush_pings(&h, &fixture.store()).unwrap(),
+                    0
+                );
             }
             "agent_blocked" => {
                 assert!(result.unwrap().queued);
