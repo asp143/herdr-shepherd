@@ -536,7 +536,6 @@ mod tests {
     }
     #[test]
     fn prompt_cli_preserves_argv_and_quarantines_unacknowledged_delivery() {
-        use std::os::unix::fs::PermissionsExt;
         for (response, exit, code, uncertain) in [
             (
                 r#"{"result":{"agent":{"agent_status":"working"}}}"#,
@@ -571,25 +570,13 @@ mod tests {
             ("truncated acknowledgement", 0, None, true),
             ("connection lost after dispatch", 1, None, true),
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            let socket = dir.path().join("herdr.sock");
-            let _listener = UnixListener::bind(&socket).unwrap();
-            let h = CliHerdr {
-                bin: dir.path().join("herdr-fake"),
-                socket,
-            };
+            let (dir, h, _listener) = output_fixture(response);
             let log = dir.path().join("argv");
-            std::fs::write(
-                &h.bin,
-                format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{}'\nexit {exit}\n",
-                    log.display(),
-                    response.replace('\'', "'\\''")
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&h.bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(&log, "").unwrap();
+            std::fs::write(dir.path().join("exit-code"), format!("{exit}\n")).unwrap();
+            let writers = retain_fixture_writers(dir.path());
             let result = h.prompt_agent("sh-fixture-researcher-1", "task with spaces", true);
+            drop(writers);
             let diagnostic = format!("{result:?}");
             if exit == 0 && !uncertain {
                 result.unwrap();
@@ -680,16 +667,9 @@ mod tests {
     }
     #[test]
     fn pane_helpers_use_foreground_and_session_value_schema() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("herdr.sock");
-        let _listener = UnixListener::bind(&socket).unwrap();
-        let bin = dir.path().join("herdr-fake");
-        std::fs::write(&bin,r#"#!/bin/sh
-printf '%s\n' '{"result":{"pane":{"cwd":"/tmp/shell","foreground_cwd":"/tmp/foreground","agent_session":{"source":"integration","agent":"codex","kind":"thread","value":"fixture-session"}}}}'
-"#).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let h = CliHerdr { bin, socket };
+        let (_dir, h, _listener) = output_fixture(
+            r#"{"result":{"pane":{"cwd":"/tmp/shell","foreground_cwd":"/tmp/foreground","agent_session":{"source":"integration","agent":"codex","kind":"thread","value":"fixture-session"}}}}"#,
+        );
         assert_eq!(
             h.pane_cwd("owned:p1").unwrap().as_deref(),
             Some(std::path::Path::new("/tmp/foreground"))
@@ -701,25 +681,7 @@ printf '%s\n' '{"result":{"pane":{"cwd":"/tmp/shell","foreground_cwd":"/tmp/fore
     }
     #[test]
     fn start_agent_accepts_silent_run_and_text_wait() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("herdr.sock");
-        let _listener = UnixListener::bind(&socket).unwrap();
-        let bin = dir.path().join("herdr-fake");
-        std::fs::write(
-            &bin,
-            r#"#!/bin/sh
-case "$1 $2" in
-  'pane run') exit 0 ;;
-  'pane wait-output') printf '%s\n' 'matched readiness marker'; exit 0 ;;
-  'agent start') printf '%s\n' '{"result":{"agent":{"agent_status":"idle"}}}'; exit 0 ;;
-  *) exit 9 ;;
-esac
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let h = CliHerdr { bin, socket };
+        let (dir, h, _listener) = start_fixture(r#"{"result":{"agent":{"agent_status":"idle"}}}"#);
         let values = HashMap::from([(
             "GIT_CONFIG_GLOBAL".into(),
             dir.path()
@@ -727,6 +689,7 @@ esac
                 .to_string_lossy()
                 .into_owned(),
         )]);
+        let writers = retain_fixture_writers(dir.path());
         let result = h.start_agent(
             "sh-fixture-coder-1",
             "codex",
@@ -734,36 +697,16 @@ esac
             &["--yolo".into(), "-m".into(), "gpt-6.1-sol".into()],
             &values,
         );
+        drop(writers);
         assert!(matches!(result, Ok(AgentStart::Ready)), "{result:?}");
     }
 
     #[test]
     fn start_agent_surfaces_unsupported_omp_overlay_without_retry() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("herdr.sock");
-        let _listener = UnixListener::bind(&socket).unwrap();
-        let bin = dir.path().join("herdr-fake");
-        let starts = dir.path().join("starts");
-        std::fs::write(
-            &bin,
-            format!(
-                r#"#!/bin/sh
-case "$1 $2" in
-  'pane run'|'pane wait-output') exit 0 ;;
-  'agent start')
-    printf '%s\n' "$@" >> {}
-    printf '%s\n' '{{"error":{{"code":"unsupported_config"}}}}'
-    exit 1 ;;
-  *) exit 9 ;;
-esac
-"#,
-                crate::gate::shim::shell_quote(&starts)
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let h = CliHerdr { bin, socket };
+        let (dir, h, _listener) = start_fixture(r#"{"error":{"code":"unsupported_config"}}"#);
+        let starts = dir.path().join("argv");
+        std::fs::write(&starts, "").unwrap();
+        std::fs::write(dir.path().join("exit-code"), "1\n").unwrap();
         let values = HashMap::from([(
             "GIT_CONFIG_GLOBAL".into(),
             dir.path()
@@ -775,9 +718,11 @@ esac
         let args = harness
             .managed_args(vec!["--model".into(), "fixture/probe".into()], dir.path())
             .unwrap();
+        let writers = retain_fixture_writers(dir.path());
         let error = h
             .start_agent("sh-fixture-coder-1", "omp", "owned:p1", &args, &values)
             .unwrap_err();
+        drop(writers);
         assert_eq!(error.herdr_code(), Some("unsupported_config"));
         let sent = std::fs::read_to_string(starts).unwrap();
         assert_eq!(sent.lines().filter(|line| *line == "start").count(), 1);
@@ -786,15 +731,48 @@ esac
     }
 
     fn output_fixture(text: &str) -> (tempfile::TempDir, CliHerdr, UnixListener) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("herdr.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let bin = dir.path().join("herdr-fake");
-        let quoted = text.replace('\'', "'\\''");
-        std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s' '{quoted}'\n")).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Never write executable inodes while parallel tests can fork. A child
+        // can inherit a writer before CLOEXEC takes effect and cause ETXTBSY.
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/herdr-output.sh");
+        std::fs::write(dir.path().join("response"), text).unwrap();
         (dir, CliHerdr { bin, socket }, listener)
+    }
+
+    fn start_fixture(text: &str) -> (tempfile::TempDir, CliHerdr, UnixListener) {
+        let (dir, mut h, listener) = output_fixture(text);
+        h.bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/herdr-start.sh");
+        (dir, h, listener)
+    }
+
+    fn retain_fixture_writers(dir: &Path) -> Vec<std::fs::File> {
+        // Model the writable inode a concurrent fork can retain until exec,
+        // even after the creating thread has closed its CLOEXEC descriptor.
+        let writers: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(entry.path())
+                    .unwrap()
+            })
+            .collect();
+        assert!(!writers.is_empty());
+        writers
+    }
+
+    #[test]
+    fn output_fixture_runs_with_retained_writers() {
+        let screen = "Trust 'this folder'?\nTrust and continue\n";
+        let (dir, h, _listener) = output_fixture(screen);
+        let writers = retain_fixture_writers(dir.path());
+        let result = h.read_visible("sh-fixture-coder-1");
+        drop(writers);
+        assert_eq!(result.unwrap(), screen);
     }
 
     #[test]
