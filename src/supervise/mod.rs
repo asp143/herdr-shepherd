@@ -20,6 +20,10 @@ use std::{collections::HashMap, fs, path::Path, process::Command, time::Duration
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 struct Observation {
+    // Stable tab placement survives session replacement. Missing on records
+    // created before child tabs moved into the ticket workspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tab_workspace_id: Option<String>,
     hash: String,
     head: Option<String>,
     condition: String,
@@ -307,6 +311,13 @@ pub(crate) fn owned(data: &StoreData, rec: &AgentRecord, info: &AgentInfo) -> bo
         .iter()
         .find(|t| t.id == rec.ticket)
         .is_some_and(|ticket| {
+            let placement = prior(rec).tab_workspace_id;
+            if placement
+                .as_ref()
+                .is_some_and(|id| ticket.workspace_id.as_ref() != Some(id))
+            {
+                return false;
+            }
             let workspace = if ticket
                 .worktree
                 .as_ref()
@@ -318,7 +329,10 @@ pub(crate) fn owned(data: &StoreData, rec: &AgentRecord, info: &AgentInfo) -> bo
                 .iter()
                 .find(|child| child.path.canonicalize().is_ok_and(|p| p == root))
             {
-                child.workspace_id.as_deref()
+                placement
+                    .as_deref()
+                    .or(child.workspace_id.as_deref())
+                    .or(ticket.workspace_id.as_deref())
             } else {
                 return false;
             };
@@ -832,9 +846,7 @@ fn respawn(
             .iter()
             .find(|child| child.path.canonicalize().ok() == rec.worktree.canonicalize().ok())
     });
-    let workspace = child
-        .and_then(|child| child.workspace_id.as_deref())
-        .or_else(|| ticket.and_then(|ticket| ticket.workspace_id.as_deref()));
+    let workspace = ticket.and_then(|ticket| ticket.workspace_id.as_deref());
     let Some(workspace) = workspace else {
         return block(
             ctx,
@@ -853,7 +865,7 @@ fn respawn(
         return Ok(());
     }
     let label = child
-        .filter(|child| child.unit > 1 && rec.role == "coder")
+        .filter(|_| rec.role == "coder")
         .map(|child| format!("coder-{}", child.unit))
         .unwrap_or_else(|| rec.role.clone());
     let (tab, pane) = ctx.h.create_tab(workspace, &label, &rec.worktree)?;
@@ -870,6 +882,7 @@ fn respawn(
         // This pane starts a new task/session. Keep action history, but none
         // of the predecessor terminal's session, screen or nudge evidence.
         let observation = Observation {
+            tab_workspace_id: Some(workspace.into()),
             actions: prior(a).actions,
             ..Default::default()
         };
@@ -3552,48 +3565,218 @@ mod tests {
     }
 
     #[test]
-    fn provider_fallback_stays_in_owned_child_workspace() {
-        let dir = tempfile::tempdir().unwrap();
-        let (store, mut cfg, h) = fixture(dir.path());
-        cfg.raw = "[roles.coder]\nrunners=['codex-sol-high','omp-astra']\n"
-            .parse()
+    fn native_and_legacy_provider_fallback_use_ticket_tabs() {
+        for legacy_workspace in [None, Some("w-child")] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, mut cfg, h) = fixture(dir.path());
+            cfg.raw = "[roles.coder]\nrunners=['codex-sol-high','omp-astra']\n"
+                .parse()
+                .unwrap();
+            let child = dir.path().join("child");
+            std::fs::create_dir(&child).unwrap();
+            store
+                .update(|d| {
+                    d.agents[0].worktree = child.clone();
+                    d.tickets[0].children.push(crate::store::ChildWorktree {
+                        unit: 2,
+                        branch: "feat/t--2".into(),
+                        path: child.clone(),
+                        workspace_id: legacy_workspace.map(str::to_owned),
+                        base_sha: "fixture".into(),
+                        integrated: false,
+                    });
+                    Ok(())
+                })
+                .unwrap();
+            h.agent_records.borrow_mut()[0].cwd = Some(child.clone());
+            h.agent_records.borrow_mut()[0].workspace_id =
+                Some(legacy_workspace.unwrap_or("w1").into());
+            let rec = store.read().unwrap().agents[0].clone();
+            apply(
+                &ApplyContext {
+                    h: &h,
+                    store: &store,
+                    cfg: &cfg,
+                    state_dir: &dir.path().join("state"),
+                    now_s: 1,
+                },
+                &rec,
+                &Decision::Respawn,
+            )
             .unwrap();
-        let child = dir.path().join("child");
+            assert!(
+                h.calls
+                    .borrow()
+                    .contains(&format!("create_tab w1 coder-2 {}", child.display()))
+            );
+            let current = store.read().unwrap().agents[0].clone();
+            assert_eq!(current.worktree, child);
+            assert_eq!(current.runner, "omp-astra");
+            assert_eq!(prior(&current).tab_workspace_id.as_deref(), Some("w1"));
+            h.agent_records.borrow_mut()[0].workspace_id = Some("w1".into());
+            assert!(crate::flock::retire_automatically(&h, &store, &current).unwrap());
+            assert!(child.exists());
+            assert!(
+                !h.calls
+                    .borrow()
+                    .iter()
+                    .any(|c| c.starts_with("close_workspace") || c.starts_with("remove_worktree"))
+            );
+        }
+    }
+
+    #[test]
+    fn native_child_retirement_and_cancel_close_only_own_tab() {
+        for automatic in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, _, h) = fixture(dir.path());
+            let sibling = add_sibling(&store, &h);
+            let child = dir.path().join("child");
+            std::fs::create_dir(&child).unwrap();
+            store
+                .update(|d| {
+                    d.agents[0].worktree = child.clone();
+                    d.tickets[0].children.push(crate::store::ChildWorktree {
+                        unit: 1,
+                        branch: "feat/t--1".into(),
+                        path: child.clone(),
+                        workspace_id: None,
+                        base_sha: "fixture".into(),
+                        integrated: false,
+                    });
+                    Ok(())
+                })
+                .unwrap();
+            h.agent_records.borrow_mut()[0].cwd = Some(child.clone());
+            let rec = store.read().unwrap().agents[0].clone();
+            if automatic {
+                assert!(crate::flock::retire_automatically(&h, &store, &rec).unwrap());
+            } else {
+                crate::flock::cancel(&h, &store, &rec.name, false).unwrap();
+            }
+            assert_eq!(store.read().unwrap().agents[0].status, AgentStatus::Retired);
+            assert!(store.read().unwrap().agents.contains(&sibling));
+            assert!(child.exists());
+            let closed: Vec<_> = h
+                .calls
+                .borrow()
+                .iter()
+                .filter(|c| c.starts_with("close_tab"))
+                .cloned()
+                .collect();
+            assert_eq!(closed, vec![format!("close_tab {}", rec.tab_id.unwrap())]);
+            assert!(
+                !h.calls
+                    .borrow()
+                    .iter()
+                    .any(|c| c.starts_with("close_workspace") || c.starts_with("remove_worktree"))
+            );
+        }
+    }
+
+    #[test]
+    fn new_tab_on_legacy_child_uses_recorded_ticket_placement() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg, h) = fixture(dir.path());
+        let child = dir.path().join("legacy-child");
         std::fs::create_dir(&child).unwrap();
         store
             .update(|d| {
-                d.agents[0].worktree = child.clone();
                 d.tickets[0].children.push(crate::store::ChildWorktree {
-                    unit: 2,
-                    branch: "feat/t--2".into(),
+                    unit: 1,
+                    branch: "feat/t--1".into(),
                     path: child.clone(),
-                    workspace_id: Some("w-child".into()),
+                    workspace_id: Some("w-legacy".into()),
                     base_sha: "fixture".into(),
                     integrated: false,
                 });
                 Ok(())
             })
             .unwrap();
-        h.agent_records.borrow_mut()[0].cwd = Some(child);
-        h.agent_records.borrow_mut()[0].workspace_id = Some("w-child".into());
-        let rec = store.read().unwrap().agents[0].clone();
-        apply(
-            &ApplyContext {
-                h: &h,
-                store: &store,
-                cfg: &cfg,
-                state_dir: &dir.path().join("state"),
-                now_s: 1,
+        // Account for the existing fixture tab before allocating another one.
+        h.create_tab("w1", "existing", &store.read().unwrap().agents[0].worktree)
+            .unwrap();
+        let roles = roles::resolve(&cfg).unwrap();
+        let role = roles
+            .roles
+            .iter()
+            .find(|r| r.name == "coder")
+            .unwrap()
+            .clone();
+        let rec = crate::launch::launch_configured(
+            &h,
+            &store,
+            crate::launch::LaunchRequest {
+                ticket: "T-1".into(),
+                runners: role
+                    .runners
+                    .iter()
+                    .map(|name| roles.runners[name].clone())
+                    .collect(),
+                role,
+                worktree: child,
+                workspace_id: "w1".into(),
+                tab_label: "coder-1".into(),
+                prompt: "implement unit 1".into(),
+                state_dir: dir.path().join("state"),
             },
-            &rec,
-            &Decision::Respawn,
+            &cfg,
         )
         .unwrap();
         assert!(
             h.calls
                 .borrow()
                 .iter()
-                .any(|c| c.starts_with("create_tab w-child coder-2"))
+                .any(|c| c.starts_with("create_tab w1 coder-1"))
         );
+        h.calls.borrow_mut().clear();
+        // Real Herdr reports the workspace separately from the tab cwd.
+        let original = h.agent_records.borrow().last().unwrap().clone();
+        for mismatch in ["workspace", "pane", "cwd", "session"] {
+            let mut live = original.clone();
+            live.workspace_id = Some("w1".into());
+            match mismatch {
+                "workspace" => live.workspace_id = Some("w-legacy".into()),
+                "pane" => live.pane_id = "w1:other-pane".into(),
+                "cwd" => live.cwd = Some(dir.path().join("ticket")),
+                "session" => {
+                    let mut observation = prior(&rec);
+                    observation.session_ref = Some("expected-session".into());
+                    store
+                        .update(|d| {
+                            remember(&mut d.agents[1], &observation);
+                            Ok(())
+                        })
+                        .unwrap();
+                    h.pane_sessions
+                        .borrow_mut()
+                        .insert(live.pane_id.clone(), "replacement-session".into());
+                }
+                _ => unreachable!(),
+            }
+            *h.agent_records.borrow_mut().last_mut().unwrap() = live;
+            let current = store.read().unwrap().agents[1].clone();
+            assert!(
+                !crate::flock::retire_automatically(&h, &store, &current).unwrap(),
+                "{mismatch}"
+            );
+            assert_no_terminal_mutation(&h, &current);
+        }
+        *h.agent_records.borrow_mut().last_mut().unwrap() = original;
+        h.agent_records
+            .borrow_mut()
+            .last_mut()
+            .unwrap()
+            .workspace_id = Some("w1".into());
+        h.pane_sessions
+            .borrow_mut()
+            .insert(rec.pane_id.clone().unwrap(), "expected-session".into());
+        // Observation updates and a store reload must retain explicit placement.
+        sweep_ok(&h, &store, &cfg, &dir.path().join("state"), 1);
+        let current = store.read().unwrap().agents[1].clone();
+        assert_eq!(prior(&current).tab_workspace_id.as_deref(), Some("w1"));
+        assert!(crate::flock::retire_automatically(&h, &store, &current).unwrap());
+        assert_eq!(store.read().unwrap().agents[1].status, AgentStatus::Retired);
+        assert!(!h.calls.borrow().iter().any(|c| c.contains("w-legacy")));
     }
 }

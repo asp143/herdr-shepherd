@@ -135,7 +135,7 @@ pub fn run(
             }
             let task = crate::cli_pr::read_text(task_file)?;
             let mut label = None;
-            if child_mode && parallel {
+            if child_mode && unit.is_some() {
                 let unit = unit.expect("checked unit");
                 if data
                     .agents
@@ -186,7 +186,6 @@ pub fn run(
                     child
                 };
                 ticket.worktree = Some(child.path);
-                ticket.workspace_id = child.workspace_id.or(ticket.workspace_id);
                 ticket.branch = child.branch;
                 label = Some(format!("{}-{unit}", role.name));
             }
