@@ -301,7 +301,13 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 ));
             }
             let report = herdr_shepherd::trusted::refresh_snapshot(&state, &root)?;
-            output::emit(cli.json, &report, || report.diff.clone());
+            output::emit(cli.json, &report, || {
+                let mut text = report.diff.clone();
+                for warning in &report.warnings {
+                    text.push_str(&format!("warning: {warning}\n"));
+                }
+                text
+            });
         }
 
         Commands::Init { project_root } => {
@@ -737,10 +743,15 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
         }
         Commands::ValidateConfig { project_root } => {
             let current = resolve_project_root(project_root.as_deref())?;
-            let cfg = config::load(
+            let mut cfg = config::load(
                 &config::resolve_config_dir(cli.config_dir.as_deref()),
                 Some(&current),
             )?;
+            if let Some(warning) =
+                herdr_shepherd::trusted::config_drift_warning(&state_dir(cli), &current)?
+            {
+                cfg.warnings.push(warning);
+            }
             let validated = ValidatedConfig {
                 resolved: herdr_shepherd::roles::resolve(&cfg)?,
                 config: cfg,

@@ -9,6 +9,8 @@ use crate::{
 use serde::Serialize;
 use std::{
     fs,
+    io::Read,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -114,7 +116,7 @@ fn matches_snapshot(
 }
 fn find_snapshot(state: &Path, project: &Path) -> Result<Option<ProjectTrust>, ShepherdError> {
     let path = safe_path(project)?;
-    let direct = Store::open(state, &path)?.read()?;
+    let direct = Store::open(state, &path)?.read_only()?;
     if let Some(trust) = direct.trust
         && trust.project_root == path
     {
@@ -142,7 +144,7 @@ fn find_snapshot(state: &Path, project: &Path) -> Result<Option<ProjectTrust>, S
         if let Some(trust) = &header.trust
             && matches_snapshot(&header, trust, &path, None)
         {
-            let data = Store::open(state, &header.project_root)?.read()?;
+            let data = Store::open(state, &header.project_root)?.read_only()?;
             if let Some(trust) = &data.trust
                 && matches_snapshot(&data, trust, &path, None)
             {
@@ -156,7 +158,7 @@ fn find_snapshot(state: &Path, project: &Path) -> Result<Option<ProjectTrust>, S
     let Some(repo) = repository(&path)? else {
         return Ok(None);
     };
-    let own = Store::open(state, &repo.main)?.read()?;
+    let own = Store::open(state, &repo.main)?.read_only()?;
     if let Some(trust) = own.trust
         && trust.common_git_dir == repo.common
     {
@@ -169,7 +171,7 @@ fn find_snapshot(state: &Path, project: &Path) -> Result<Option<ProjectTrust>, S
         if trust.common_git_dir != repo.common || header.project_root != trust.project_root {
             continue;
         }
-        let data = Store::open(state, &header.project_root)?.read()?;
+        let data = Store::open(state, &header.project_root)?.read_only()?;
         if let Some(trust) = data.trust
             && trust.common_git_dir == repo.common
         {
@@ -182,6 +184,77 @@ fn find_snapshot(state: &Path, project: &Path) -> Result<Option<ProjectTrust>, S
 pub fn load_snapshot(state: &Path, project: &Path) -> Result<ProjectTrust, ShepherdError> {
     find_snapshot(state, project)?
         .ok_or_else(|| denied("project has no trust snapshot; run start or config trust"))
+}
+
+enum LocalConfig {
+    Missing,
+    Bytes(Vec<u8>),
+    Unavailable,
+}
+
+impl LocalConfig {
+    fn matches(&self, text: Option<&str>) -> bool {
+        match (self, text) {
+            (Self::Missing, None) => true,
+            (Self::Bytes(bytes), Some(text)) => bytes == text.as_bytes(),
+            _ => false,
+        }
+    }
+}
+
+/// Local bytes are used only for comparison, never as a source of trust.
+fn local_config(project: &Path) -> LocalConfig {
+    let path = project.join(".shepherd.toml");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return LocalConfig::Unavailable,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return LocalConfig::Missing;
+        }
+        Err(_) => return LocalConfig::Unavailable,
+    }
+    // Prevent a replacement symlink from being followed between metadata and
+    // open, and avoid blocking if the file is replaced by a FIFO.
+    let Ok(mut file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+    else {
+        return LocalConfig::Unavailable;
+    };
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return LocalConfig::Unavailable;
+    }
+    let mut bytes = Vec::new();
+    match file.read_to_end(&mut bytes) {
+        Ok(_) => LocalConfig::Bytes(bytes),
+        Err(_) => LocalConfig::Unavailable,
+    }
+}
+
+/// Compare the selected checkout to existing runtime trust without creating state.
+pub fn config_drift_warning(state: &Path, project: &Path) -> Result<Option<String>, ShepherdError> {
+    let Some(snapshot) = find_snapshot(state, project)? else {
+        return Ok(None);
+    };
+    let local = local_config(&safe_path(project)?);
+    if local.matches(snapshot.config_text.as_deref()) {
+        return Ok(None);
+    }
+    let reason = match local {
+        LocalConfig::Missing => "On-disk .shepherd.toml is missing",
+        LocalConfig::Bytes(_) if snapshot.config_text.is_none() => {
+            "On-disk .shepherd.toml exists, but the trust snapshot has no project config"
+        }
+        LocalConfig::Bytes(_) => "On-disk .shepherd.toml differs from the trust snapshot",
+        LocalConfig::Unavailable => {
+            "On-disk .shepherd.toml is symlinked, unreadable, or not a regular file"
+        }
+    };
+    Ok(Some(format!(
+        "{reason}. Runtime commands use the stored trust snapshot; commit the desired configuration (or its removal) on default branch `{}`, then run `config trust`.",
+        snapshot.default_branch
+    )))
 }
 
 fn isolated_git(cwd: &Path) -> Command {
@@ -568,6 +641,7 @@ pub struct TrustDiff {
     pub old: Option<ProjectTrust>,
     pub new: ProjectTrust,
     pub diff: String,
+    pub warnings: Vec<String>,
 }
 pub fn refresh_snapshot(state: &Path, project: &Path) -> Result<TrustDiff, ShepherdError> {
     let old = find_snapshot(state, project)?;
@@ -578,6 +652,32 @@ pub fn refresh_snapshot(state: &Path, project: &Path) -> Result<TrustDiff, Sheph
     let store = Store::open(state, &main)?;
     let _lock = trust_lock(&store)?;
     let new = capture(state, &main, None, None)?;
+    let selected = safe_path(project)?;
+    let mut locals = vec![local_config(&selected)];
+    if selected != main {
+        locals.push(local_config(&main));
+    }
+    if new.config_text.is_none()
+        && locals
+            .iter()
+            .any(|local| !matches!(local, LocalConfig::Missing))
+    {
+        return Err(denied(&format!(
+            ".shepherd.toml exists on disk but is not committed on default branch `{}`; commit it on that branch, then run `config trust`. The stored trust snapshot was not changed.",
+            new.default_branch
+        )));
+    }
+    let warnings = if locals
+        .iter()
+        .any(|local| !local.matches(new.config_text.as_deref()))
+    {
+        vec![format!(
+            "Local .shepherd.toml edits were not captured; config trust uses only committed bytes from default branch `{}`. Commit the desired configuration (or its removal) on that branch, then run `config trust`.",
+            new.default_branch
+        )]
+    } else {
+        Vec::new()
+    };
     let mut diff = String::from("--- stored/.shepherd.toml\n+++ main/.shepherd.toml\n");
     for line in old
         .as_ref()
@@ -619,7 +719,12 @@ pub fn refresh_snapshot(state: &Path, project: &Path) -> Result<TrustDiff, Sheph
         data.trust = Some(new.clone());
         Ok(())
     })?;
-    Ok(TrustDiff { old, new, diff })
+    Ok(TrustDiff {
+        old,
+        new,
+        diff,
+        warnings,
+    })
 }
 
 pub fn default_branch(worktree: &Path, state: &Path) -> Result<Option<String>, ShepherdError> {

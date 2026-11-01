@@ -284,3 +284,204 @@ fn poisoned_remote_tracking_config_cannot_inject_hooks() {
     );
     assert_eq!(repo.git(&["rev-parse", "refs/heads/main"]), trusted_main);
 }
+
+fn stored_state(repo: &Repo) -> Vec<u8> {
+    let root = repo.root.canonicalize().unwrap();
+    fs::read(
+        repo.state
+            .join("projects")
+            .join(herdr_shepherd::store::project_hash(&root))
+            .join("state.json"),
+    )
+    .unwrap()
+}
+
+fn trust_warnings(report: &trusted::TrustDiff) -> Vec<String> {
+    serde_json::to_value(report).unwrap()["warnings"]
+        .as_array()
+        .expect("trust output includes warnings")
+        .iter()
+        .map(|warning| warning.as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn trust_rejects_untracked_config_without_initializing_snapshot() {
+    let repo = Repo::new("");
+    fs::write(repo.root.join(".shepherd.toml"), "enabled=false\n").unwrap();
+    let error = trusted::refresh_snapshot(&repo.state, &repo.root).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("not committed"), "{message}");
+    assert!(message.contains("default branch"), "{message}");
+    assert!(message.contains("main"), "{message}");
+    assert!(trusted::load_snapshot(&repo.state, &repo.root).is_err());
+}
+
+#[test]
+fn failed_trust_preserves_snapshot_bytes() {
+    let repo = Repo::new("enabled=true\n");
+    trusted::ensure_snapshot(&repo.state, &repo.root).unwrap();
+    let before = stored_state(&repo);
+    repo.git(&["rm", "--cached", ".shepherd.toml"]);
+    repo.git(&["commit", "-m", "remove tracked config"]);
+    assert!(trusted::refresh_snapshot(&repo.state, &repo.root).is_err());
+    assert_eq!(stored_state(&repo), before);
+    assert_eq!(
+        trusted::load_snapshot(&repo.state, &repo.root)
+            .unwrap()
+            .config_text
+            .as_deref(),
+        Some("enabled=true\n")
+    );
+}
+
+#[test]
+fn trust_warns_about_local_edits_and_retains_committed_bytes() {
+    let committed = "[shepherd]\nrunner='claude-opus'\n";
+    let repo = Repo::new(committed);
+    let blob = repo.git(&["rev-parse", "HEAD:.shepherd.toml"]);
+    fs::write(
+        repo.root.join(".shepherd.toml"),
+        "[shepherd]\nrunner='local-edit-marker'\n",
+    )
+    .unwrap();
+    let report = trusted::refresh_snapshot(&repo.state, &repo.root).unwrap();
+    assert_eq!(report.new.config_text.as_deref(), Some(committed));
+    assert_eq!(report.new.config_blob.as_deref(), Some(blob.as_str()));
+    let warnings = trust_warnings(&report);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("not captured"));
+    assert!(!warnings[0].contains("local-edit-marker"));
+    let cfg = trusted::committed_config(&repo.config, &repo.root, None, &repo.state).unwrap();
+    assert_eq!(cfg.raw["shepherd"]["runner"].as_str(), Some("claude-opus"));
+}
+
+#[test]
+fn trust_matching_config_has_no_warnings() {
+    let repo = Repo::new("enabled=true\n");
+    let report = trusted::refresh_snapshot(&repo.state, &repo.root).unwrap();
+    assert!(trust_warnings(&report).is_empty());
+}
+
+#[test]
+fn trust_without_local_or_committed_config_succeeds() {
+    let repo = Repo::new("");
+    let report = trusted::refresh_snapshot(&repo.state, &repo.root).unwrap();
+    assert!(report.new.config_text.is_none());
+    assert!(report.new.config_blob.is_none());
+    assert!(trust_warnings(&report).is_empty());
+}
+
+#[test]
+fn trust_can_remove_config_after_committed_deletion() {
+    let repo = Repo::new("enabled=true\n");
+    trusted::ensure_snapshot(&repo.state, &repo.root).unwrap();
+    repo.git(&["rm", ".shepherd.toml"]);
+    repo.git(&["commit", "-m", "remove project config"]);
+    let report = trusted::refresh_snapshot(&repo.state, &repo.root).unwrap();
+    assert!(report.new.config_text.is_none());
+    assert!(report.new.config_blob.is_none());
+    assert!(trust_warnings(&report).is_empty());
+}
+
+#[test]
+fn trust_does_not_follow_local_config_symlink() {
+    let committed = "enabled=true\n";
+    let repo = Repo::new(committed);
+    fs::remove_file(repo.root.join(".shepherd.toml")).unwrap();
+    // Even a symlink to matching bytes cannot establish a local match.
+    let target = repo._dir.path().join("local-config-target");
+    fs::write(&target, committed).unwrap();
+    std::os::unix::fs::symlink(&target, repo.root.join(".shepherd.toml")).unwrap();
+    let report = trusted::refresh_snapshot(&repo.state, &repo.root).unwrap();
+    assert_eq!(report.new.config_text.as_deref(), Some(committed));
+    assert_eq!(trust_warnings(&report).len(), 1);
+}
+
+#[test]
+fn trust_rejects_dangling_local_symlink_when_no_committed_config() {
+    let repo = Repo::new("");
+    std::os::unix::fs::symlink(
+        repo._dir.path().join("missing-config-target"),
+        repo.root.join(".shepherd.toml"),
+    )
+    .unwrap();
+    assert!(trusted::refresh_snapshot(&repo.state, &repo.root).is_err());
+    assert!(trusted::load_snapshot(&repo.state, &repo.root).is_err());
+}
+
+#[test]
+fn trust_uses_committed_bytes_when_local_config_is_not_readable_as_a_file() {
+    let repo = Repo::new("enabled=true\n");
+    fs::remove_file(repo.root.join(".shepherd.toml")).unwrap();
+    fs::create_dir(repo.root.join(".shepherd.toml")).unwrap();
+    let report = trusted::refresh_snapshot(&repo.state, &repo.root).unwrap();
+    assert_eq!(report.new.config_text.as_deref(), Some("enabled=true\n"));
+    assert_eq!(trust_warnings(&report).len(), 1);
+}
+
+#[test]
+fn init_snapshot_still_accepts_its_explicit_config() {
+    let repo = Repo::new("");
+    let text = "enabled=false\n";
+    fs::write(repo.root.join(".shepherd.toml"), text).unwrap();
+    let trust = trusted::snapshot_initialized_config(&repo.state, &repo.root, text).unwrap();
+    assert_eq!(trust.config_text.as_deref(), Some(text));
+    assert!(trust.config_blob.is_some());
+}
+
+#[test]
+fn trust_warns_about_edits_in_selected_linked_worktree() {
+    let repo = Repo::new("enabled=true\n");
+    fs::write(repo.wt.join(".shepherd.toml"), "enabled=false\n").unwrap();
+    let report = trusted::refresh_snapshot(&repo.state, &repo.wt).unwrap();
+    assert_eq!(report.new.config_text.as_deref(), Some("enabled=true\n"));
+    assert_eq!(trust_warnings(&report).len(), 1);
+}
+
+#[test]
+fn trust_rejects_untracked_config_in_selected_linked_worktree() {
+    let repo = Repo::new("");
+    trusted::ensure_snapshot(&repo.state, &repo.root).unwrap();
+    let before = stored_state(&repo);
+    fs::write(repo.wt.join(".shepherd.toml"), "enabled=false\n").unwrap();
+    let error = trusted::refresh_snapshot(&repo.state, &repo.wt).unwrap_err();
+    assert!(error.to_string().contains("not committed"));
+    assert_eq!(stored_state(&repo), before);
+}
+
+#[test]
+fn drift_comparison_does_not_follow_local_symlink() {
+    let repo = Repo::new("enabled=true\n");
+    trusted::ensure_snapshot(&repo.state, &repo.root).unwrap();
+    let target = repo._dir.path().join("matching-local-config");
+    fs::write(&target, "enabled=true\n").unwrap();
+    fs::remove_file(repo.root.join(".shepherd.toml")).unwrap();
+    std::os::unix::fs::symlink(&target, repo.root.join(".shepherd.toml")).unwrap();
+    let warning = trusted::config_drift_warning(&repo.state, &repo.root)
+        .unwrap()
+        .unwrap();
+    assert!(warning.contains("symlinked"));
+    assert!(warning.contains("snapshot"));
+}
+
+#[test]
+fn drift_comparison_does_not_block_on_fifo() {
+    let repo = Repo::new("enabled=true\n");
+    trusted::ensure_snapshot(&repo.state, &repo.root).unwrap();
+    fs::remove_file(repo.root.join(".shepherd.toml")).unwrap();
+    assert!(
+        repo.command(Path::new("mkfifo"))
+            .arg(repo.root.join(".shepherd.toml"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let warning = trusted::config_drift_warning(&repo.state, &repo.root)
+        .unwrap()
+        .unwrap();
+    assert!(warning.contains("not a regular file"));
+    let report = trusted::refresh_snapshot(&repo.state, &repo.root).unwrap();
+    assert_eq!(report.new.config_text.as_deref(), Some("enabled=true\n"));
+    assert_eq!(trust_warnings(&report).len(), 1);
+}
