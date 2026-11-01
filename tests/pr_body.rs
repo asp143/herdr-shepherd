@@ -204,6 +204,75 @@ fn disposition_metadata_rejects_entry_sequences() {
 }
 
 #[test]
+fn disposition_metadata_rejects_object_statuses() {
+    use herdr_shepherd::ticket::pr_body::FindingDispositions;
+    let accepted: Vec<_> = ["open", "resolved", "deferred"]
+        .into_iter()
+        .filter(|status| {
+            FindingDispositions::parse(&format!(
+                r#"{{"ticket_id":"T-1","findings":[{{"index":0,"status":{{"{status}":null}}}}]}}"#
+            ))
+            .is_ok()
+        })
+        .collect();
+    assert!(
+        accepted.is_empty(),
+        "accepted object statuses: {accepted:?}"
+    );
+}
+
+#[test]
+fn disposition_metadata_enforces_documented_field_types() {
+    use herdr_shepherd::ticket::pr_body::FindingDispositions;
+    use serde_json::{Value, json};
+
+    let mut invalid = Vec::new();
+    for value in [Value::Null, json!(true), json!(0), json!([]), json!({})] {
+        invalid.push(json!({"ticket_id":value,"findings":[]}));
+    }
+    for value in [Value::Null, json!(true), json!(0), json!(""), json!({})] {
+        invalid.push(json!({"ticket_id":"T-1","findings":value}));
+    }
+    for value in [Value::Null, json!(true), json!(0), json!("open")] {
+        invalid.push(json!({"ticket_id":"T-1","findings":[value]}));
+    }
+    for value in [
+        Value::Null,
+        json!(true),
+        json!(-1),
+        json!(0.0),
+        json!("0"),
+        json!([]),
+        json!({}),
+    ] {
+        invalid.push(json!({"ticket_id":"T-1","findings":[{"index":value,"status":"open"}]}));
+    }
+    for value in [Value::Null, json!(true), json!(0), json!(["open"])] {
+        invalid.push(json!({"ticket_id":"T-1","findings":[{"index":0,"status":value}]}));
+    }
+    for value in [json!(true), json!(0), json!([]), json!({})] {
+        invalid.push(
+            json!({"ticket_id":"T-1","findings":[{"index":0,"status":"open","reason":value}]}),
+        );
+    }
+    let accepted: Vec<_> = invalid
+        .into_iter()
+        .filter(|value| FindingDispositions::parse(&value.to_string()).is_ok())
+        .collect();
+    assert!(
+        accepted.is_empty(),
+        "accepted invalid field types: {accepted:?}"
+    );
+    for reason in [Value::Null, json!(""), json!("Boundary test covers it")] {
+        FindingDispositions::parse(
+            &json!({"ticket_id":"T-1","findings":[{"index":0,"status":"open","reason":reason}]})
+                .to_string(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
 fn disposition_metadata_is_strict_and_bound_to_ticket_history() {
     use herdr_shepherd::ticket::pr_body::{FindingDispositions, build_body_with_dispositions};
     let ticket = Ticket {

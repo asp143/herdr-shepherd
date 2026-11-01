@@ -87,12 +87,25 @@ fn deserialize_object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     deserializer.deserialize_map(ObjectVisitor(PhantomData))
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug)]
 enum FindingStatus {
     Open,
     Deferred,
     Resolved,
+}
+
+impl<'de> Deserialize<'de> for FindingStatus {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "open" => Ok(Self::Open),
+            "deferred" => Ok(Self::Deferred),
+            "resolved" => Ok(Self::Resolved),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["open", "deferred", "resolved"],
+            )),
+        }
+    }
 }
 
 impl FindingDispositions {

@@ -312,6 +312,41 @@ fn public_metadata_rejects_entry_sequences_without_effects() {
     assert_shape_rejected_without_effects(json!({"ticket_id":"T-1","findings":[[0,"open",null]]}));
 }
 
+#[test]
+fn public_metadata_rejects_object_open_status_without_effects() {
+    assert_shape_rejected_without_effects(
+        json!({"ticket_id":"T-1","findings":[{"index":0,"status":{"open":null}}]}),
+    );
+}
+
+#[test]
+fn public_metadata_rejects_object_resolved_status_without_effects() {
+    assert_shape_rejected_without_effects(
+        json!({"ticket_id":"T-1","findings":[{"index":0,"status":{"resolved":null}}]}),
+    );
+}
+
+#[test]
+fn public_metadata_rejects_object_deferred_status_without_effects() {
+    assert_shape_rejected_without_effects(
+        json!({"ticket_id":"T-1","findings":[{"index":0,"status":{"deferred":null}}]}),
+    );
+}
+
+#[test]
+fn public_metadata_rejects_invalid_field_types_without_effects() {
+    for metadata in [
+        json!({"ticket_id":["T-1"],"findings":[]}),
+        json!({"ticket_id":"T-1","findings":{}}),
+        json!({"ticket_id":"T-1","findings":["open"]}),
+        json!({"ticket_id":"T-1","findings":[{"index":0.0,"status":"open"}]}),
+        json!({"ticket_id":"T-1","findings":[{"index":0,"status":["open"]}]}),
+        json!({"ticket_id":"T-1","findings":[{"index":0,"status":"open","reason":{}}]}),
+    ] {
+        assert_shape_rejected_without_effects(metadata);
+    }
+}
+
 fn assert_shape_rejected_without_effects(metadata: Value) {
     let f = Fixture::new();
     let before = f.store.read().unwrap();
