@@ -268,6 +268,7 @@ fn handle_with_context(
     // Wait for any revision launch to persist its pane before reserving a
     // terminal state. Otherwise retirement can miss an agent still starting.
     let _dispatch = super::revise::dispatch_lock(store, id)?;
+    let _operation = super::operation::exclusive(store, id)?;
     let data = store.read()?;
     let Some(ticket) = data.tickets.iter().find(|ticket| ticket.id == id) else {
         return Ok(MergeOutcome::Unchanged);
@@ -1300,6 +1301,44 @@ mod tests {
         assert_eq!(fixture.run().unwrap(), MergeOutcome::CleanedUp);
         assert_eq!(fixture.ticket().state, TicketState::CleanedUp);
     }
+    #[test]
+    fn terminal_pr_handling_drains_nonrevision_admission() {
+        let fixture = Fixture::new(TicketState::Building);
+        fixture.agent();
+        let store = fixture.store.clone();
+        let agent = store.update(|data| Ok(data.agents.remove(0))).unwrap();
+        let admission = crate::ticket::operation::shared(&store, "T1").unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let outcome = fixture.run();
+            finished_tx.send(()).unwrap();
+            (fixture, outcome)
+        });
+        started_rx.recv().unwrap();
+        let early = finished_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+        store
+            .update(|data| {
+                data.agents.push(agent);
+                Ok(())
+            })
+            .unwrap();
+        drop(admission);
+        let (fixture, outcome) = worker.join().unwrap();
+        assert!(
+            !early,
+            "terminal handling skipped an admitted nonrevision launch"
+        );
+        assert_eq!(outcome.unwrap(), MergeOutcome::CleanedUp);
+        assert_eq!(
+            fixture.store.read().unwrap().agents[0].status,
+            AgentStatus::Retired
+        );
+        assert!(fixture.h.fake.agent_records.borrow().is_empty());
+        assert!(!fixture.path.exists());
+    }
+
     #[test]
     fn merged_waits_for_inflight_revision_launch_before_retiring() {
         let fixture = Fixture::new(TicketState::Revising);

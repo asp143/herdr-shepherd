@@ -287,6 +287,7 @@ pub fn apply(
     rec: &AgentRecord,
     decision: &Decision,
 ) -> Result<(), ShepherdError> {
+    let _ticket_operation = crate::ticket::operation::shared(ctx.store, &rec.ticket)?;
     let data = ctx.store.read()?;
     let Some(current) = data
         .agents
@@ -715,6 +716,7 @@ pub fn supervise_project(
     let data = store.read()?;
     let default = crate::trusted::default_branch(&data.project_root, state_dir)?;
     for mut rec in data.agents.iter().filter(|a| active(a.status)).cloned() {
+        let _ticket_operation = crate::ticket::operation::shared(store, &rec.ticket)?;
         let Some(_operation) = crate::flock::try_agent_operation(store, &rec.name)? else {
             continue;
         };
@@ -1252,6 +1254,78 @@ mod tests {
                 .any(|c| c.starts_with("start_agent"))
         );
         assert_eq!(store.read().unwrap().agents[0].restarts, 0);
+    }
+
+    #[test]
+    fn cancellation_drains_native_resume_before_retiring() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg, h) = fixture(dir.path());
+        let rec = store.read().unwrap().agents[0].clone();
+        h.agent_records.borrow_mut().clear();
+        h.pane_cwds
+            .borrow_mut()
+            .insert("w1:p1".into(), rec.worktree.clone());
+        let observed = store.clone();
+        let (early_tx, early_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        *h.on_start.borrow_mut() = Some(Box::new(move |_| {
+            let observed = observed.clone();
+            let done = done_tx.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = crate::ticket::intake::cancel_agents(
+                    &FakeHerdr::new(vec![]),
+                    &observed,
+                    "T-1",
+                    "cancel",
+                    3,
+                );
+                let _ = tx.send(());
+                done.send(result).unwrap();
+            });
+            early_tx
+                .send(rx.recv_timeout(Duration::from_millis(200)).is_ok())
+                .unwrap();
+        }));
+        let result = apply(
+            &ApplyContext {
+                h: &h,
+                store: &store,
+                cfg: &cfg,
+                state_dir: &dir.path().join("state"),
+                now_s: 1,
+            },
+            &rec,
+            &Decision::Resume,
+        );
+        let cancelled = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            !early_rx.recv().unwrap(),
+            "cancellation returned while native resume could still start work"
+        );
+        result.unwrap();
+        cancelled.unwrap();
+        let data = store.read().unwrap();
+        assert_eq!(data.tickets[0].state, TicketState::Closed);
+        assert_eq!(data.agents[0].status, AgentStatus::Retired);
+        let calls = h.calls.borrow().len();
+        apply(
+            &ApplyContext {
+                h: &h,
+                store: &store,
+                cfg: &cfg,
+                state_dir: &dir.path().join("state"),
+                now_s: 2,
+            },
+            &rec,
+            &Decision::Resume,
+        )
+        .unwrap();
+        assert_eq!(
+            h.calls.borrow().len(),
+            calls,
+            "retired work must never resume"
+        );
     }
 
     #[test]

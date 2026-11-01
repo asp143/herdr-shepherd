@@ -1,6 +1,7 @@
 pub mod children;
 pub mod intake;
 pub mod merge;
+pub mod operation;
 pub mod pr;
 pub mod pr_body;
 pub mod revise;

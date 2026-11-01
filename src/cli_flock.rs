@@ -93,6 +93,7 @@ pub fn run(
             task_file,
             unit,
         } => {
+            let _ticket_operation = herdr_shepherd::ticket::operation::shared(&store, ticket)?;
             let _placement = spawn_placement_lock(&store)?;
             let resolved = roles::resolve(&cfg)?;
             let role = resolved

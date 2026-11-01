@@ -256,13 +256,9 @@ pub fn cancel(
     cfg: &Config,
     id: &str,
 ) -> Result<herdr_shepherd::store::Ticket, ShepherdError> {
-    for rec in store.read()?.agents.into_iter().filter(|a| {
-        a.ticket == id && !matches!(a.status, AgentStatus::Retired | AgentStatus::LaunchFailed)
-    }) {
-        herdr_shepherd::flock::cancel(h, store, &rec.name, false)?;
-    }
     let resolved = roles::resolve(cfg)?;
-    let ticket = intake::cancel(
+    let ticket = intake::cancel_agents(
+        h,
         store,
         id,
         &launch::now(),
@@ -279,6 +275,8 @@ pub fn transition(
     to: TicketState,
     reason: Option<BlockedReason>,
 ) -> Result<herdr_shepherd::store::Ticket, ShepherdError> {
+    let _dispatch = herdr_shepherd::ticket::revise::dispatch_lock(store, id)?;
+    let _operation = herdr_shepherd::ticket::operation::exclusive(store, id)?;
     let cap = roles::resolve(cfg)?.shepherd.max_revision_rounds;
     let ticket = store.update(|data| {
         if data.agents.iter().any(|a| {
@@ -320,6 +318,8 @@ pub fn integrate(
     id: &str,
 ) -> Result<herdr_shepherd::ticket::children::IntegrateReport, ShepherdError> {
     use herdr_shepherd::ticket::children;
+    let _dispatch = herdr_shepherd::ticket::revise::dispatch_lock(store, id)?;
+    let _operation = herdr_shepherd::ticket::operation::exclusive(store, id)?;
     let data = store.read()?;
     if data.agents.iter().any(|a| {
         a.ticket == id
@@ -388,7 +388,19 @@ pub fn integrate(
                     .iter_mut()
                     .find(|t| t.id == id)
                     .ok_or_else(|| ShepherdError::Usage("ticket disappeared".into()))?;
-                t.children = ticket.children.clone();
+                // Update only the identities whose Git integration completed.
+                // Retain any independently registered or recovered children.
+                for integrated in &ticket.children {
+                    if let Some(current) = t.children.iter_mut().find(|current| {
+                        current.unit == integrated.unit
+                            && current.path == integrated.path
+                            && current.branch == integrated.branch
+                            && current.base_sha == integrated.base_sha
+                            && current.workspace_id == integrated.workspace_id
+                    }) {
+                        current.integrated = integrated.integrated;
+                    }
+                }
                 t.integration_ranges = report.ranges.clone();
                 Ok(())
             })?;
@@ -401,7 +413,13 @@ pub fn integrate(
                 children::cleanup_integrated(h, &path, std::slice::from_ref(child))?;
                 store.update(|data| {
                     if let Some(t) = data.tickets.iter_mut().find(|t| t.id == id) {
-                        t.children.retain(|c| c.unit != child.unit);
+                        t.children.retain(|c| {
+                            c.unit != child.unit
+                                || c.path != child.path
+                                || c.branch != child.branch
+                                || c.base_sha != child.base_sha
+                                || c.workspace_id != child.workspace_id
+                        });
                     }
                     Ok(())
                 })?;
