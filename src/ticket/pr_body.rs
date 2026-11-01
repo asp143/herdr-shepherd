@@ -1,7 +1,10 @@
-use std::sync::LazyLock;
+use std::{fmt, marker::PhantomData, sync::LazyLock};
 
 use regex::Regex;
-use serde::Deserialize;
+use serde::{
+    Deserialize, Deserializer,
+    de::{MapAccess, Visitor, value::MapAccessDeserializer},
+};
 
 use crate::{
     error::ShepherdError,
@@ -17,19 +20,71 @@ pub fn build_title(t: &Ticket) -> String {
 }
 
 /// Optional publication metadata. Stored findings and reports remain unchanged.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub struct FindingDispositions {
     ticket_id: String,
     findings: Vec<FindingDisposition>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct FindingDisposition {
     index: usize,
     status: FindingStatus,
     reason: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for FindingDispositions {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            ticket_id: String,
+            findings: Vec<FindingDisposition>,
+        }
+        let fields: Fields = deserialize_object(deserializer)?;
+        Ok(Self {
+            ticket_id: fields.ticket_id,
+            findings: fields.findings,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for FindingDisposition {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            index: usize,
+            status: FindingStatus,
+            reason: Option<String>,
+        }
+        let fields: Fields = deserialize_object(deserializer)?;
+        Ok(Self {
+            index: fields.index,
+            status: fields.status,
+            reason: fields.reason,
+        })
+    }
+}
+
+// Derived structs also accept positional sequences. Require a map before
+// delegating to their field validation, preserving duplicate-key rejection.
+fn deserialize_object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<T, D::Error> {
+    struct ObjectVisitor<T>(PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
+        type Value = T;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an object")
+        }
+
+        fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<T, M::Error> {
+            T::deserialize(MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_map(ObjectVisitor(PhantomData))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

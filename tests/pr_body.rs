@@ -190,6 +190,20 @@ fn explicit_dispositions_classify_indices_without_guessing() {
 }
 
 #[test]
+fn disposition_metadata_rejects_top_level_sequences() {
+    use herdr_shepherd::ticket::pr_body::FindingDispositions;
+    assert!(FindingDispositions::parse(r#"["T-1",[]]"#).is_err());
+}
+
+#[test]
+fn disposition_metadata_rejects_entry_sequences() {
+    use herdr_shepherd::ticket::pr_body::FindingDispositions;
+    assert!(
+        FindingDispositions::parse(r#"{"ticket_id":"T-1","findings":[[0,"open",null]]}"#).is_err()
+    );
+}
+
+#[test]
 fn disposition_metadata_is_strict_and_bound_to_ticket_history() {
     use herdr_shepherd::ticket::pr_body::{FindingDispositions, build_body_with_dispositions};
     let ticket = Ticket {
@@ -204,6 +218,11 @@ fn disposition_metadata_is_strict_and_bound_to_ticket_history() {
     for text in [
         "{",
         "null",
+        r#"{"ticket_id":"T-1","ticket_id":"T-1","findings":[]}"#,
+        r#"{"ticket_id":"T-1","findings":[],"findings":[]}"#,
+        r#"{"ticket_id":"T-1","findings":[{"index":0,"index":0,"status":"open"}]}"#,
+        r#"{"ticket_id":"T-1","findings":[{"index":0,"status":"open","status":"resolved"}]}"#,
+        r#"{"ticket_id":"T-1","findings":[{"index":0,"status":"open","reason":null,"reason":"Later"}]}"#,
         r#"{"ticket_id":"T-1"}"#,
         r#"{"ticket_id":"T-1","findings":[],"extra":true}"#,
         r#"{"ticket_id":"T-1","findings":[{"index":0,"status":"done"}]}"#,

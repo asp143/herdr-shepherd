@@ -303,6 +303,43 @@ fn legacy_and_empty_metadata_keep_every_finding_unclassified() {
 }
 
 #[test]
+fn public_metadata_rejects_top_level_sequences_without_effects() {
+    assert_shape_rejected_without_effects(json!(["T-1", []]));
+}
+
+#[test]
+fn public_metadata_rejects_entry_sequences_without_effects() {
+    assert_shape_rejected_without_effects(json!({"ticket_id":"T-1","findings":[[0,"open",null]]}));
+}
+
+fn assert_shape_rejected_without_effects(metadata: Value) {
+    let f = Fixture::new();
+    let before = f.store.read().unwrap();
+    let ticket_before = success(f.run("ticket", &["show", "T-1"]));
+    let agent_before = success(f.run("agent", &["status", "fixture-coder"]));
+    rejected(
+        f.publish(Some(metadata)),
+        "usage",
+        "invalid finding dispositions",
+    );
+    assert_eq!(f.store.read().unwrap(), before);
+    assert_eq!(success(f.run("ticket", &["show", "T-1"])), ticket_before);
+    assert_eq!(
+        success(f.run("agent", &["status", "fixture-coder"])),
+        agent_before
+    );
+    assert!(f.backend()["calls"].as_array().unwrap().is_empty());
+    assert!(!f.path("fake/github.lock").exists());
+    assert!(
+        git(
+            &f.path("remote.git"),
+            &["for-each-ref", "refs/heads/fix/t-1"]
+        )
+        .is_empty()
+    );
+}
+
+#[test]
 fn invalid_metadata_and_reasons_never_reach_backend() {
     let f = Fixture::new();
     let before = f.store.read().unwrap();
