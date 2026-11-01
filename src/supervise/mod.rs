@@ -287,6 +287,7 @@ pub fn apply(
     rec: &AgentRecord,
     decision: &Decision,
 ) -> Result<(), ShepherdError> {
+    let _hooks = hooks::defer();
     let _ticket_operation = crate::ticket::operation::shared(ctx.store, &rec.ticket)?;
     let data = ctx.store.read()?;
     let Some(current) = data
@@ -707,6 +708,9 @@ pub fn supervise_project(
     state_dir: &Path,
     now: u64,
 ) -> Result<SweepReport, ShepherdError> {
+    // Pane events and periodic sweeps share this outer ownership scope. Hooks
+    // must wait for its project, ticket and agent locks, including nested apply.
+    let _hooks = hooks::defer();
     let _guard = project_lock(store)?;
     let resolved = roles::resolve(cfg)?;
     let mut report = SweepReport {
