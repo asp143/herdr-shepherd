@@ -49,6 +49,16 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
+    /// Send a request to this project's lead, starting it when needed.
+    Ask {
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        #[arg(long, conflicts_with = "text")]
+        file: Option<PathBuf>,
+        /// Message words, or - to read the complete message from stdin.
+        #[arg(num_args = 1.., required_unless_present = "file")]
+        text: Vec<String>,
+    },
     Resume {
         #[arg(long)]
         project_root: Option<PathBuf>,
@@ -324,6 +334,68 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
             };
             herdr_shepherd::watch::detach(&state, Some(&dir), None)?;
             output::emit(cli.json, &report, || format!("Shepherd {}", report.name));
+        }
+        Commands::Ask {
+            project_root,
+            file,
+            text,
+        } => {
+            let root = resolve_project_root(project_root.as_deref())?;
+            let state = state_dir(cli);
+            let main = herdr_shepherd::trusted::main_checkout(&root)?;
+            if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
+                for project in [&main, &root] {
+                    let data = herdr_shepherd::store::Store::open(&state, project)?.read()?;
+                    if data
+                        .agents
+                        .iter()
+                        .any(|a| a.pane_id.as_deref() == Some(pane.as_str()))
+                    {
+                        return Err(ShepherdError::PolicyDenied(
+                            "ask requires a user outside managed agent panes".into(),
+                        ));
+                    }
+                }
+            }
+            let text = if let Some(path) = file {
+                cli_pr::read_text(path)?
+            } else if text.as_slice() == ["-"] {
+                use std::io::Read;
+                let mut input = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut input)
+                    .map_err(anyhow::Error::from)?;
+                input
+            } else {
+                text.join(" ")
+            };
+            herdr_shepherd::ask::validate_text(&text)?;
+            let store = herdr_shepherd::store::Store::open(&state, &root)?;
+            let h = herdr_client()?;
+            let started = !herdr_shepherd::ask::lead_running(h.as_ref(), &store)?;
+            if started {
+                let dir = config::resolve_config_dir(cli.config_dir.as_deref());
+                herdr_shepherd::trusted::ensure_snapshot(&state, &root)?;
+                let cfg = herdr_shepherd::trusted::committed_config(&dir, &root, None, &state)?;
+                let bin = std::env::current_exe().map_err(anyhow::Error::from)?;
+                let workspace = invoking_workspace()?;
+                let ctx = herdr_shepherd::lead::LeadContext {
+                    bin: &bin,
+                    state_dir: &state,
+                    workspace_id: &workspace,
+                };
+                herdr_shepherd::lead::start(h.as_ref(), &store, &cfg, &ctx)?;
+                herdr_shepherd::watch::detach(&state, Some(&dir), None)?;
+            }
+            let mut report = herdr_shepherd::ask::send(h.as_ref(), &store, &text)?;
+            report.started = started;
+            output::emit(cli.json, &report, || {
+                format!(
+                    "{} for shepherd {}",
+                    if report.queued { "Queued" } else { "Delivered" },
+                    report.agent_name
+                )
+            });
         }
         Commands::Status { project_root } => {
             let root = resolve_project_root(project_root.as_deref())?;

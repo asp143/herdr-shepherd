@@ -68,6 +68,8 @@ Use only the public CLI to orchestrate state. Available commands:
 Inspect command --help for exact arguments. Never edit state files directly. Agent report commands carry the inherited project and state-directory identity.
 
 Honor explicit role stage mappings (review maps to reviewing). At each stage run every configured role mapped to that stage, along with its required built-in role.
+For an ad-hoc request with no ticket ID or source, treat the request as a ticket. Derive a short imperative title and choose --type feat|fix|refactor|docs from the request. Write the user's full request verbatim into the --body-file, draft concrete, testable acceptance criteria from that request, and pass the criteria with --acceptance-file. Run ticket add with --title, --body-file, --acceptance-file, and --type; omit --id so the title slug becomes the generated ID. Use the actual ID returned by ticket add, including any collision suffix. Tell the user the generated ID and acceptance criteria in one short message, then run ticket dispatch immediately without waiting for confirmation. The run goes straight through. Only ask the user first if the request is too ambiguous to write any acceptance criteria. Several distinct tasks in one message become separate tickets, each retaining the full request verbatim in its body file and criteria scoped to that task.
+For a request that names a ticket ID, use ticket fetch <id> when a ticket source is configured, then add the fetched ticket with --id. Otherwise use the named ID with --id and the supplied request text; do not ask for an ID or acceptance criteria that you can derive from that request. If only an ID is supplied and no source is configured, ask for the ticket text because no acceptance criteria can be derived.
 For a new ticket: add it with title, body, and acceptance criteria, then dispatch the queue. Dispatch creates a ticket worktree and launches planner. Read the planner's report using agent status; its summary is the plan. Use researching and a researcher only when the ticket needs investigation, otherwise transition planning to building. Write a task file with the complete ticket context and plan, then spawn coder. Once all coders report, integrate child worktrees before transitioning to reviewing and spawning reviewer. Read every report before advancing. Address High (Blocker) findings and failed checks by transitioning reviewing or qa back to building, then delegate a coder fix; the configured revision cap is {cap}. Once review has no blockers, transition to qa and spawn qa. After QA reports all acceptance checks passed, transition to ready_for_pr, prepare the summary, changes, and testing files, then run ticket pr to push and open the PR. CI and comment pickup are driven by the watcher. When red CI returns the ticket to building, inspect the stored ci_failure_task and its check names and URLs, then dispatch the coder, review, and QA again. Never skip review or QA. Reported agents no longer consume agent capacity. Use ticket dispatch whenever a ticket frees a slot; revising tickets have priority over queued tickets. Use agent cancel for a stuck owned agent; keep its worktree and commits.
 For a blocked ticket, inspect history and return only to its recorded prior state using ticket transition before assigning a resolver. For child conflicts, give the resolver both recorded ranges and have it merge the child branches locally into the ticket branch with any conflicts resolved; then rerun ticket integrate to recognize contained commits and clean up.
 When supervision sends a dialog, answer from the ticket context or deny it. Never approve a gate-forbidden action. Do not prompt a blocked agent; safe dialog keys go through supervision. Unresolved blocks should be escalated to the user.
@@ -228,6 +230,67 @@ mod tests {
         assert!(prompt.contains("stage: review"));
         assert!(prompt.contains("every configured role"));
     }
+
+    #[test]
+    fn lead_prompt_handles_adhoc_requests_without_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::load(&dir.path().join("cfg"), None).unwrap();
+        let resolved = crate::roles::resolve(&cfg).unwrap();
+        let data = crate::store::Store::open(&dir.path().join("state"), dir.path())
+            .unwrap()
+            .read()
+            .unwrap();
+        let prompt = lead_prompt(Path::new("shepherd"), dir.path(), &resolved, &data);
+        for required in [
+            "ad-hoc request with no ticket ID or source",
+            "treat the request as a ticket",
+            "short imperative title",
+            "--type feat|fix|refactor|docs",
+            "user's full request verbatim into the --body-file",
+            "concrete, testable acceptance criteria",
+            "pass the criteria with --acceptance-file",
+            "omit --id so the title slug becomes the generated ID",
+            "actual ID returned by ticket add, including any collision suffix",
+            "generated ID and acceptance criteria in one short message",
+            "run ticket dispatch immediately without waiting for confirmation",
+            "Only ask the user first if the request is too ambiguous to write any acceptance criteria",
+            "Several distinct tasks in one message become separate tickets",
+            "each retaining the full request verbatim in its body file",
+            "ticket fetch <id> when a ticket source is configured",
+            "Otherwise use the named ID with --id and the supplied request text",
+        ] {
+            assert!(prompt.contains(required), "missing {required}");
+        }
+    }
+
+    #[test]
+    fn lead_prompt_preserves_safety_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::load(&dir.path().join("cfg"), None).unwrap();
+        let resolved = crate::roles::resolve(&cfg).unwrap();
+        let data = crate::store::Store::open(&dir.path().join("state"), dir.path())
+            .unwrap()
+            .read()
+            .unwrap();
+        let prompt = lead_prompt(Path::new("shepherd"), dir.path(), &resolved, &data);
+        let command = crate::gate::shim::shell_quote(Path::new("shepherd"));
+        let protected = resolved.shepherd.protected_branches.join(", ");
+        for line in [
+            format!("You must never edit repository code yourself. Delegate all code changes through {command} agent spawn. You may write task-description and ticket-intake metadata files for these CLI commands."),
+            format!("You must never merge PRs, approve PRs, force-push, or push protected branches ({protected}). Flock agents never push, open PRs, or call GitHub. Use the gated ticket PR commands after QA passes."),
+            "Never read .env*, Credentials/, *.pem, *.key, or other secret files. Findings use High (Blocker) | Mid | Low | Wish.".into(),
+            "Inspect command --help for exact arguments. Never edit state files directly. Agent report commands carry the inherited project and state-directory identity.".into(),
+            "When supervision sends a dialog, answer from the ticket context or deny it. Never approve a gate-forbidden action. Do not prompt a blocked agent; safe dialog keys go through supervision. Unresolved blocks should be escalated to the user.".into(),
+        ] {
+            assert!(prompt.lines().any(|actual| actual == line), "missing safety line: {line}");
+        }
+        assert!(prompt.contains("Never skip review or QA."));
+        assert!(prompt.contains("Never bypass these stages."));
+        assert!(
+            prompt.contains("never resolve threads. Never request changes, approve, or merge.")
+        );
+    }
+
     #[test]
     fn role_prompt_contains_report_command_and_secrets_rule() {
         let ticket = crate::store::Ticket {
