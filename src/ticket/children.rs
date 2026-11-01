@@ -251,29 +251,54 @@ pub fn create_child_configured(
         .and_then(|field| field.strip_prefix("worktree "))
         .ok_or_else(|| ShepherdError::Usage("repository has no primary worktree".into()))?;
     let source = Path::new(source);
-    let workspace = h.create_worktree(
-        source,
-        &branch,
-        &format!("{}-{unit}", ticket.slug),
-        &base_sha,
-        &path,
-    )?;
-    let path = path.canonicalize().map_err(anyhow::Error::from)?;
+    if branch_exists(ticket_wt, &branch)? {
+        return Err(ShepherdError::Usage("child branch already exists".into()));
+    }
+    let path = path
+        .parent()
+        .expect("child has parent")
+        .canonicalize()
+        .map_err(anyhow::Error::from)?
+        .join(unit.to_string());
+    let path_arg = path
+        .to_str()
+        .ok_or_else(|| ShepherdError::Usage("child path is not UTF-8".into()))?
+        .to_owned();
+    // Reserve an empty destination before Git can create its branch. In
+    // particular, an occupied path must never leave a newly created ref.
+    std::fs::create_dir(&path).map_err(anyhow::Error::from)?;
     let child = ChildWorktree {
         unit,
         branch,
         path,
-        workspace_id: workspace.workspace_id,
+        workspace_id: None,
         base_sha,
         integrated: false,
     };
-    if let Err(error) =
-        hook::install_configured(&child.path, &child.branch, state_dir, bin, config_dir)
-    {
+    let setup = git(
+        source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &child.branch,
+            &path_arg,
+            &child.base_sha,
+        ],
+    )
+    .and_then(|_| hook::install_configured(&child.path, &child.branch, state_dir, bin, config_dir));
+    if let Err(error) = setup {
+        // A failure before Git allocated anything owns only our empty
+        // reservation. Never delete a preexisting or concurrently moved ref.
+        if matches!(branch_exists(ticket_wt, &child.branch), Ok(false))
+            && std::fs::remove_dir(&child.path).is_ok()
+        {
+            return Err(error);
+        }
         if let Err(cleanup) = rollback_created_child(h, ticket_wt, &child) {
             let recovery = record_failed_child(&child)?;
             return Err(ShepherdError::Runtime(anyhow::anyhow!(
-                "child hook installation failed: {error}; cleanup failed: {cleanup}; ownership recovery saved at {}",
+                "child setup failed: {error}; cleanup failed: {cleanup}; ownership recovery saved at {}",
                 recovery.display()
             )));
         }
@@ -328,28 +353,13 @@ pub fn cleanup_integrated(
             ));
         }
         let child_path = child.path.canonicalize().map_err(anyhow::Error::from)?;
-        let matching: Vec<_> = workspaces
-            .iter()
-            .filter(|workspace| {
-                workspace.worktree.as_ref().is_some_and(|tree| {
-                    tree.is_linked_worktree
-                        && tree
-                            .checkout_path
-                            .as_ref()
-                            .and_then(|path| path.canonicalize().ok())
-                            .as_deref()
-                            == Some(&child_path)
-                })
-            })
-            .collect();
-        if matching.len() != 1 || matching[0].workspace_id != child.workspace_id {
-            return Err(ShepherdError::PolicyDenied(
-                "child workspace ownership changed".into(),
-            ));
-        }
+        verify_workspace_owner(&workspaces, child, &child_path)?;
         if agents.iter().any(|agent| {
             !matches!(agent.agent_status.as_str(), "exited" | "stopped")
-                && (agent.workspace_id.as_deref() == Some(&child.workspace_id)
+                && (child
+                    .workspace_id
+                    .as_ref()
+                    .is_some_and(|id| agent.workspace_id.as_ref() == Some(id))
                     || agent
                         .cwd
                         .as_ref()
@@ -384,18 +394,10 @@ pub fn cleanup_integrated(
                 "child changed after cleanup preflight".into(),
             ));
         }
-        h.remove_worktree(&child.workspace_id, false)?;
-        if h.workspaces()?
-            .iter()
-            .any(|workspace| workspace.workspace_id == child.workspace_id)
-        {
-            h.close_workspace(&child.workspace_id)?;
-        }
-        if child.path.exists() {
-            return Err(ShepherdError::Runtime(anyhow::anyhow!(
-                "herdr did not remove child worktree"
-            )));
-        }
+        verify_workspace_owner(&h.workspaces()?, child, &child.path)?;
+        ensure_no_live_agents(h, child)?;
+        verify_child_tip(ticket_wt, child, &tip, true)?;
+        remove_child_checkout(h, ticket_wt, child)?;
         git(ticket_wt, &["update-ref", "-d", &reference, &tip])?;
         removed.push(child.unit);
     }
@@ -420,49 +422,10 @@ fn rollback_created_child(
         ));
     }
     let path = child.path.canonicalize().map_err(anyhow::Error::from)?;
-    let workspaces = h.workspaces()?;
-    let owners: Vec<_> = workspaces
-        .iter()
-        .filter(|workspace| {
-            workspace.worktree.as_ref().is_some_and(|tree| {
-                tree.is_linked_worktree
-                    && tree
-                        .checkout_path
-                        .as_ref()
-                        .and_then(|path| path.canonicalize().ok())
-                        .as_deref()
-                        == Some(&path)
-            })
-        })
-        .collect();
-    if owners.len() != 1 || owners[0].workspace_id != child.workspace_id {
-        return Err(ShepherdError::PolicyDenied(
-            "new child workspace ownership changed".into(),
-        ));
-    }
-    if h.agents()?.iter().any(|agent| {
-        !matches!(agent.agent_status.as_str(), "exited" | "stopped")
-            && (agent.workspace_id.as_deref() == Some(&child.workspace_id)
-                || agent
-                    .cwd
-                    .as_ref()
-                    .and_then(|path| path.canonicalize().ok())
-                    .is_some_and(|cwd| cwd.starts_with(&path)))
-    }) {
-        return Err(ShepherdError::Usage("new child has a live agent".into()));
-    }
-    h.remove_worktree(&child.workspace_id, false)?;
-    if h.workspaces()?
-        .iter()
-        .any(|workspace| workspace.workspace_id == child.workspace_id)
-    {
-        h.close_workspace(&child.workspace_id)?;
-    }
-    if child.path.exists() {
-        return Err(ShepherdError::Runtime(anyhow::anyhow!(
-            "herdr did not remove new child worktree"
-        )));
-    }
+    verify_workspace_owner(&h.workspaces()?, child, &path)?;
+    ensure_no_live_agents(h, child)?;
+    verify_child_tip(ticket_wt, child, &child.base_sha, false)?;
+    remove_child_checkout(h, ticket_wt, child)?;
     git(
         ticket_wt,
         &[
@@ -494,4 +457,137 @@ fn record_failed_child(child: &ChildWorktree) -> Result<PathBuf, ShepherdError> 
             .map_err(anyhow::Error::from)?;
     }
     Ok(recovery)
+}
+
+fn verify_workspace_owner(
+    workspaces: &[crate::herdr::Workspace],
+    child: &ChildWorktree,
+    path: &Path,
+) -> Result<(), ShepherdError> {
+    let matching: Vec<_> = workspaces
+        .iter()
+        .filter(|workspace| {
+            workspace.worktree.as_ref().is_some_and(|tree| {
+                tree.is_linked_worktree
+                    && tree
+                        .checkout_path
+                        .as_ref()
+                        .and_then(|path| path.canonicalize().ok())
+                        .as_deref()
+                        == Some(path)
+            })
+        })
+        .collect();
+    let owned = match &child.workspace_id {
+        Some(id) => matching.len() == 1 && matching[0].workspace_id == *id,
+        None => matching.is_empty(),
+    };
+    if !owned {
+        return Err(ShepherdError::PolicyDenied(
+            "child workspace ownership changed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_no_live_agents(h: &dyn Herdr, child: &ChildWorktree) -> Result<(), ShepherdError> {
+    let path = child.path.canonicalize().map_err(anyhow::Error::from)?;
+    if h.agents()?.iter().any(|agent| {
+        !matches!(agent.agent_status.as_str(), "exited" | "stopped")
+            && (child
+                .workspace_id
+                .as_ref()
+                .is_some_and(|id| agent.workspace_id.as_ref() == Some(id))
+                || agent
+                    .cwd
+                    .as_ref()
+                    .and_then(|cwd| cwd.canonicalize().ok())
+                    .is_some_and(|cwd| cwd.starts_with(&path)))
+    }) {
+        return Err(ShepherdError::Usage("child still has a live agent".into()));
+    }
+    Ok(())
+}
+
+// Revalidate after observing Herdr state and immediately before removing a
+// checkout. In particular, an advanced ref must retain both tree and branch.
+fn verify_child_tip(
+    ticket_wt: &Path,
+    child: &ChildWorktree,
+    tip: &str,
+    guarded: bool,
+) -> Result<(), ShepherdError> {
+    let common_args = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+    let common = git(ticket_wt, &common_args)?;
+    if git(&child.path, &["branch", "--show-current"])? != child.branch
+        || git(&child.path, &["rev-parse", "HEAD"])? != tip
+        || git(
+            ticket_wt,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{}", child.branch),
+            ],
+        )? != tip
+        || git(&child.path, &common_args)? != common
+        || git(&child.path, &["rev-parse", "--absolute-git-dir"])? == common
+        || !git(&child.path, &["status", "--porcelain"])?.is_empty()
+        || (guarded
+            && git(
+                &child.path,
+                &["config", "--worktree", "--get", "shepherd.ticketBranch"],
+            )? != child.branch)
+    {
+        return Err(ShepherdError::PolicyDenied(
+            "child changed before removal".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn remove_child_checkout(
+    h: &dyn Herdr,
+    ticket_wt: &Path,
+    child: &ChildWorktree,
+) -> Result<(), ShepherdError> {
+    if let Some(id) = &child.workspace_id {
+        h.remove_worktree(id, false)?;
+        if h.workspaces()?
+            .iter()
+            .any(|workspace| workspace.workspace_id == *id)
+        {
+            h.close_workspace(id)?;
+        }
+    } else {
+        git(
+            ticket_wt,
+            &[
+                "worktree",
+                "remove",
+                "--",
+                child
+                    .path
+                    .to_str()
+                    .ok_or_else(|| ShepherdError::Usage("child path is not UTF-8".into()))?,
+            ],
+        )?;
+    }
+    if child.path.exists() {
+        return Err(ShepherdError::Runtime(anyhow::anyhow!(
+            "child worktree was not removed"
+        )));
+    }
+    Ok(())
+}
+
+fn branch_exists(worktree: &Path, branch: &str) -> Result<bool, ShepherdError> {
+    Ok(!git(
+        worktree,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?
+    .is_empty())
 }

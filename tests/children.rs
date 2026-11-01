@@ -72,7 +72,7 @@ impl Repo {
             unit,
             branch,
             path,
-            workspace_id: format!("w{unit}"),
+            workspace_id: Some(format!("w{unit}")),
             base_sha,
             integrated: false,
         }
@@ -164,7 +164,9 @@ fn refuses_dirty_ticket_worktree() {
 #[derive(Default)]
 struct LocalHerdr {
     workspaces: std::cell::RefCell<Vec<herdr_shepherd::herdr::Workspace>>,
-    remove_error: std::cell::Cell<bool>,
+    on_workspaces: std::cell::RefCell<Option<Box<dyn FnOnce()>>>,
+    agents: std::cell::RefCell<Vec<herdr_shepherd::herdr::AgentInfo>>,
+    removals: std::cell::RefCell<Vec<String>>,
 }
 impl herdr_shepherd::herdr::Herdr for LocalHerdr {
     fn create_worktree(
@@ -211,10 +213,13 @@ impl herdr_shepherd::herdr::Herdr for LocalHerdr {
         Ok(workspace)
     }
     fn workspaces(&self) -> Result<Vec<herdr_shepherd::herdr::Workspace>, ShepherdError> {
+        if let Some(callback) = self.on_workspaces.borrow_mut().take() {
+            callback();
+        }
         Ok(self.workspaces.borrow().clone())
     }
     fn agents(&self) -> Result<Vec<herdr_shepherd::herdr::AgentInfo>, ShepherdError> {
-        Ok(Vec::new())
+        Ok(self.agents.borrow().clone())
     }
     fn rename_workspace(&self, _: &str, _: &str) -> Result<(), ShepherdError> {
         Ok(())
@@ -243,11 +248,7 @@ impl herdr_shepherd::herdr::Herdr for LocalHerdr {
     }
     fn remove_worktree(&self, id: &str, force: bool) -> Result<(), ShepherdError> {
         assert!(!force);
-        if self.remove_error.get() {
-            return Err(ShepherdError::Runtime(anyhow::anyhow!(
-                "temporary removal failure"
-            )));
-        }
+        self.removals.borrow_mut().push(id.into());
         let workspace = self
             .workspaces
             .borrow()
@@ -437,7 +438,19 @@ fn hook_failure_retains_recovery_when_cleanup_fails() {
     let repo = Repo::new();
     let state = repo.dir.path().join("state");
     let h = LocalHerdr::default();
-    h.remove_error.set(true);
+    let primary = repo.main.clone();
+    *h.on_workspaces.borrow_mut() = Some(Box::new(move || {
+        let trees = ok(&primary, &["worktree", "list", "--porcelain"]);
+        let block = trees
+            .split("\n\n")
+            .find(|block| block.contains("branch refs/heads/feat/tiny--1"))
+            .unwrap();
+        let path = block
+            .lines()
+            .find_map(|line| line.strip_prefix("worktree "))
+            .unwrap();
+        ok(Path::new(path), &["worktree", "lock", path]);
+    }));
     let ticket = herdr_shepherd::store::Ticket {
         id: "TINY".into(),
         slug: "tiny".into(),
@@ -458,12 +471,17 @@ fn hook_failure_retains_recovery_when_cleanup_fails() {
         .join(herdr_shepherd::store::project_hash(&repo.ticket))
         .join("1.pending.json");
     let child: ChildWorktree = serde_json::from_slice(&fs::read(&recovery_path).unwrap()).unwrap();
-    assert_eq!(child.workspace_id, "owned-child");
+    assert!(
+        serde_json::to_value(&child)
+            .unwrap()
+            .get("workspace_id")
+            .is_none()
+    );
     assert_eq!(child.branch, "feat/tiny--1");
     assert!(child.path.exists());
     assert!(!child.integrated);
     assert!(error.to_string().contains(recovery_path.to_str().unwrap()));
-    assert_eq!(h.workspaces.borrow().len(), 1);
+    assert!(h.workspaces.borrow().is_empty());
 }
 
 #[test]
@@ -669,7 +687,7 @@ fn child_uses_primary_source_and_ticket_tip() {
     assert_ne!(tip, ok(&repo.main, &["rev-parse", "HEAD"]));
     let state = repo.dir.path().join("state");
     let config = repo.dir.path().join("selected-config");
-    let h = LocalHerdr::default();
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(Vec::new());
     let ticket = herdr_shepherd::store::Ticket {
         id: "TINY".into(),
         slug: "tiny".into(),
@@ -689,15 +707,39 @@ fn child_uses_primary_source_and_ticket_tip() {
     assert_eq!(child.base_sha, tip);
     assert_eq!(ok(&child.path, &["rev-parse", "HEAD"]), tip);
     assert_eq!(child.branch, "feat/tiny--2");
-    assert_eq!(
-        h.workspaces.borrow()[0]
-            .worktree
-            .as_ref()
-            .unwrap()
-            .repo_root
-            .as_ref(),
-        Some(&repo.main)
+    assert!(
+        h.workspaces.borrow().is_empty(),
+        "units must not create workspaces"
     );
+    let sibling = herdr_shepherd::ticket::children::create_child_configured(
+        &h,
+        &ticket,
+        3,
+        &state,
+        Path::new(env!("CARGO_BIN_EXE_herdr-shepherd")),
+        &config,
+    )
+    .unwrap();
+    assert_ne!(child.path, sibling.path);
+    assert_ne!(child.branch, sibling.branch);
+    assert_eq!(sibling.base_sha, tip);
+    for unit in [&child, &sibling] {
+        assert_eq!(ok(&unit.path, &["rev-parse", "HEAD"]), tip);
+        assert_eq!(
+            ok(
+                &unit.path,
+                &["config", "--worktree", "--get", "shepherd.ticketBranch"]
+            ),
+            unit.branch
+        );
+    }
+    assert!(h.workspaces.borrow().is_empty());
+    assert!(
+        h.calls.borrow().is_empty(),
+        "native allocation must not call Herdr"
+    );
+    assert!(child.workspace_id.is_none());
+    assert!(sibling.workspace_id.is_none());
     assert!(
         child.path.starts_with(
             state
@@ -712,4 +754,347 @@ fn child_uses_primary_source_and_ticket_tip() {
     let hook = fs::read_to_string(Path::new(&hooks).join("pre-push")).unwrap();
     assert!(hook.contains(config.to_str().unwrap()));
     assert!(hook.contains(state.to_str().unwrap()));
+}
+
+#[test]
+fn child_json_preserves_legacy_workspace_and_allows_no_workspace() {
+    let legacy = serde_json::json!({
+        "unit": 1, "branch": "feat/tiny--1", "path": "/fixture/child",
+        "workspace_id": "legacy-child", "base_sha": "a".repeat(40),
+        "integrated": false
+    });
+    let child: ChildWorktree = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(serde_json::to_value(child).unwrap(), legacy);
+    let mut native = legacy;
+    native.as_object_mut().unwrap().remove("workspace_id");
+    let child: ChildWorktree = serde_json::from_value(native.clone()).unwrap();
+    assert_eq!(serde_json::to_value(child).unwrap(), native);
+}
+
+fn guarded_child(repo: &Repo, unit: u32, native: bool) -> ChildWorktree {
+    let child = repo.child(unit);
+    herdr_shepherd::gate::hook::install_configured(
+        &child.path,
+        &child.branch,
+        &repo.dir.path().join("state"),
+        Path::new(env!("CARGO_BIN_EXE_herdr-shepherd")),
+        &repo.dir.path().join("config"),
+    )
+    .unwrap();
+    if native {
+        let mut value = serde_json::to_value(child).unwrap();
+        value.as_object_mut().unwrap().remove("workspace_id");
+        serde_json::from_value(value).unwrap()
+    } else {
+        child
+    }
+}
+
+fn legacy_workspace(repo: &Repo, child: &ChildWorktree) -> herdr_shepherd::herdr::Workspace {
+    herdr_shepherd::herdr::Workspace {
+        workspace_id: format!("w{}", child.unit),
+        label: "legacy child".into(),
+        worktree: Some(herdr_shepherd::herdr::WorktreeInfo {
+            repo_key: "fixture".into(),
+            repo_root: Some(repo.main.clone()),
+            checkout_path: Some(child.path.clone()),
+            is_linked_worktree: true,
+        }),
+    }
+}
+
+#[test]
+fn integrated_cleanup_supports_native_and_legacy_resources() {
+    for native in [true, false] {
+        let repo = Repo::new();
+        let h = LocalHerdr::default();
+        let mut children = [
+            guarded_child(&repo, 1, native),
+            guarded_child(&repo, 2, false),
+        ];
+        for child in &children {
+            if !native || child.unit == 2 {
+                h.workspaces
+                    .borrow_mut()
+                    .push(legacy_workspace(&repo, child));
+            }
+            Repo::commit(child, &format!("unit-{}.txt", child.unit), "done\n", "unit");
+        }
+        integrate(&repo.ticket, &mut children).unwrap();
+        assert_eq!(
+            herdr_shepherd::ticket::children::cleanup_integrated(&h, &repo.ticket, &children)
+                .unwrap(),
+            [1, 2]
+        );
+        assert!(children.iter().all(|child| !child.path.exists()));
+        assert!(h.workspaces.borrow().is_empty());
+        assert_eq!(h.removals.borrow().len(), if native { 1 } else { 2 });
+        for child in children {
+            assert!(
+                !git(
+                    &repo.ticket,
+                    &[
+                        "show-ref",
+                        "--verify",
+                        &format!("refs/heads/{}", child.branch)
+                    ]
+                )
+                .status
+                .success()
+            );
+        }
+    }
+}
+
+#[test]
+fn native_cleanup_preflights_entire_set_and_preserves_unsafe_children() {
+    for change in ["dirty", "unowned", "live", "unintegrated"] {
+        let repo = Repo::new();
+        let h = LocalHerdr::default();
+        let mut children = [guarded_child(&repo, 1, true), guarded_child(&repo, 2, true)];
+        integrate(&repo.ticket, &mut children).unwrap();
+        let child = &children[1];
+        match change {
+            "dirty" => {
+                fs::write(child.path.join("untracked"), "keep").unwrap();
+            }
+            "unowned" => {
+                ok(
+                    &child.path,
+                    &["config", "--worktree", "shepherd.ticketBranch", "other"],
+                );
+            }
+            "live" => h
+                .agents
+                .borrow_mut()
+                .push(herdr_shepherd::herdr::AgentInfo {
+                    name: Some("coder".into()),
+                    agent: "codex".into(),
+                    agent_status: "working".into(),
+                    cwd: Some(child.path.clone()),
+                    pane_id: "pane".into(),
+                    workspace_id: Some("ticket".into()),
+                }),
+            "unintegrated" => {
+                Repo::commit(child, "later", "keep", "new work");
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            herdr_shepherd::ticket::children::cleanup_integrated(&h, &repo.ticket, &children)
+                .is_err(),
+            "{change}"
+        );
+        for child in children {
+            assert!(child.path.exists(), "{change}");
+            assert!(
+                git(
+                    &repo.ticket,
+                    &[
+                        "show-ref",
+                        "--verify",
+                        &format!("refs/heads/{}", child.branch)
+                    ]
+                )
+                .status
+                .success()
+            );
+        }
+        assert!(h.removals.borrow().is_empty());
+    }
+}
+
+#[test]
+fn native_cleanup_keeps_live_sibling_in_ticket_workspace() {
+    let repo = Repo::new();
+    let h = LocalHerdr::default();
+    let mut children = [guarded_child(&repo, 1, true)];
+    integrate(&repo.ticket, &mut children).unwrap();
+    h.agents
+        .borrow_mut()
+        .push(herdr_shepherd::herdr::AgentInfo {
+            name: Some("planner".into()),
+            agent: "codex".into(),
+            agent_status: "working".into(),
+            cwd: Some(repo.ticket.clone()),
+            pane_id: "sibling".into(),
+            workspace_id: Some("ticket".into()),
+        });
+    herdr_shepherd::ticket::children::cleanup_integrated(&h, &repo.ticket, &children).unwrap();
+    assert_eq!(h.agents.borrow().len(), 1);
+    assert!(repo.ticket.exists());
+    assert!(h.removals.borrow().is_empty());
+}
+
+#[test]
+fn hook_failure_preserves_changed_native_child_and_recovery() {
+    for change in ["dirty", "moved-ref", "live", "workspace"] {
+        let repo = Repo::new();
+        let state = repo.dir.path().join("state");
+        let path = state
+            .join("children")
+            .join(herdr_shepherd::store::project_hash(&repo.ticket))
+            .join("1");
+        let h = LocalHerdr::default();
+        let expected = ok(&repo.ticket, &["rev-parse", "HEAD"]);
+        let advanced = ok(
+            &repo.main,
+            &[
+                "commit-tree",
+                &format!("{expected}^{{tree}}"),
+                "-p",
+                &expected,
+                "-m",
+                "advanced",
+            ],
+        );
+        if change == "live" {
+            h.agents
+                .borrow_mut()
+                .push(herdr_shepherd::herdr::AgentInfo {
+                    name: Some("coder".into()),
+                    agent: "codex".into(),
+                    agent_status: "working".into(),
+                    cwd: Some(path.clone()),
+                    pane_id: "pane".into(),
+                    workspace_id: Some("ticket".into()),
+                });
+        } else if change == "workspace" {
+            h.workspaces
+                .borrow_mut()
+                .push(herdr_shepherd::herdr::Workspace {
+                    workspace_id: "unowned".into(),
+                    label: "unowned".into(),
+                    worktree: Some(herdr_shepherd::herdr::WorktreeInfo {
+                        repo_key: "fixture".into(),
+                        repo_root: Some(repo.main.clone()),
+                        checkout_path: Some(path.clone()),
+                        is_linked_worktree: true,
+                    }),
+                });
+        } else {
+            let path = path.clone();
+            let primary = repo.main.clone();
+            let advanced = advanced.clone();
+            *h.on_workspaces.borrow_mut() = Some(Box::new(move || {
+                if change == "dirty" {
+                    fs::write(path.join("untracked"), "keep").unwrap();
+                } else {
+                    ok(
+                        &primary,
+                        &["update-ref", "refs/heads/feat/tiny--1", &advanced],
+                    );
+                }
+            }));
+        }
+        let ticket = herdr_shepherd::store::Ticket {
+            branch: "feat/tiny".into(),
+            worktree: Some(repo.ticket.clone()),
+            ..Default::default()
+        };
+        let error = herdr_shepherd::ticket::children::create_child_configured(
+            &h,
+            &ticket,
+            1,
+            &state,
+            &repo.dir.path().join("missing"),
+            &repo.dir.path().join("config"),
+        )
+        .unwrap_err();
+        assert!(path.exists(), "{change}: {error}");
+        let recovery = path.with_extension("pending.json");
+        let child: ChildWorktree = serde_json::from_slice(&fs::read(&recovery).unwrap()).unwrap();
+        assert_eq!(child.base_sha, expected);
+        assert!(error.to_string().contains(recovery.to_str().unwrap()));
+        assert!(h.removals.borrow().is_empty());
+        assert_eq!(
+            ok(&repo.main, &["rev-parse", "refs/heads/feat/tiny--1"]),
+            if change == "moved-ref" {
+                advanced
+            } else {
+                expected
+            }
+        );
+    }
+}
+
+#[test]
+fn native_creation_refusal_preserves_existing_path_without_new_ref() {
+    let repo = Repo::new();
+    let state = repo.dir.path().join("state");
+    let path = state
+        .join("children")
+        .join(herdr_shepherd::store::project_hash(&repo.ticket))
+        .join("1");
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("keep"), "existing contents").unwrap();
+    let ticket = herdr_shepherd::store::Ticket {
+        branch: "feat/tiny".into(),
+        worktree: Some(repo.ticket.clone()),
+        ..Default::default()
+    };
+    assert!(
+        herdr_shepherd::ticket::children::create_child_configured(
+            &LocalHerdr::default(),
+            &ticket,
+            1,
+            &state,
+            Path::new(env!("CARGO_BIN_EXE_herdr-shepherd")),
+            &repo.dir.path().join("config"),
+        )
+        .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(path.join("keep")).unwrap(),
+        "existing contents"
+    );
+    assert!(
+        !git(
+            &repo.main,
+            &["show-ref", "--verify", "refs/heads/feat/tiny--1"]
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
+fn native_post_checkout_failure_rolls_back_only_new_resources() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = Repo::new();
+    let state = repo.dir.path().join("state");
+    let path = state
+        .join("children")
+        .join(herdr_shepherd::store::project_hash(&repo.ticket))
+        .join("1");
+    let hook = repo.main.join(".git/hooks/post-checkout");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    let ticket = herdr_shepherd::store::Ticket {
+        branch: "feat/tiny".into(),
+        worktree: Some(repo.ticket.clone()),
+        ..Default::default()
+    };
+    assert!(
+        herdr_shepherd::ticket::children::create_child_configured(
+            &LocalHerdr::default(),
+            &ticket,
+            1,
+            &state,
+            Path::new(env!("CARGO_BIN_EXE_herdr-shepherd")),
+            &repo.dir.path().join("config"),
+        )
+        .is_err()
+    );
+    assert!(!path.exists());
+    assert!(
+        !git(
+            &repo.main,
+            &["show-ref", "--verify", "refs/heads/feat/tiny--1"]
+        )
+        .status
+        .success()
+    );
+    assert!(repo.ticket.exists());
+    assert!(repo.main.exists());
 }

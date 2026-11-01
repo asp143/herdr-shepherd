@@ -104,7 +104,9 @@ pub struct ChildWorktree {
     pub unit: u32,
     pub branch: String,
     pub path: PathBuf,
-    pub workspace_id: String,
+    /// Legacy Herdr resource ownership; native children have no workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     pub base_sha: String,
     #[serde(default)]
     pub integrated: bool,

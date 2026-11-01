@@ -71,7 +71,7 @@ fn concurrent_initial_coders_use_distinct_worktrees() {
             unit,
             branch,
             path,
-            workspace_id: format!("child-{unit}"),
+            workspace_id: Some(format!("child-{unit}")),
             base_sha: base.clone(),
             integrated: false,
         });

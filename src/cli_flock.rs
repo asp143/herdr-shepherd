@@ -186,7 +186,7 @@ pub fn run(
                     child
                 };
                 ticket.worktree = Some(child.path);
-                ticket.workspace_id = Some(child.workspace_id);
+                ticket.workspace_id = child.workspace_id.or(ticket.workspace_id);
                 ticket.branch = child.branch;
                 label = Some(format!("{}-{unit}", role.name));
             }

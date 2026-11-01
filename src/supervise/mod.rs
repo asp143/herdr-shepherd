@@ -318,7 +318,7 @@ pub(crate) fn owned(data: &StoreData, rec: &AgentRecord, info: &AgentInfo) -> bo
                 .iter()
                 .find(|child| child.path.canonicalize().is_ok_and(|p| p == root))
             {
-                Some(child.workspace_id.as_str())
+                child.workspace_id.as_deref()
             } else {
                 return false;
             };
@@ -833,7 +833,7 @@ fn respawn(
             .find(|child| child.path.canonicalize().ok() == rec.worktree.canonicalize().ok())
     });
     let workspace = child
-        .map(|child| child.workspace_id.as_str())
+        .and_then(|child| child.workspace_id.as_deref())
         .or_else(|| ticket.and_then(|ticket| ticket.workspace_id.as_deref()));
     let Some(workspace) = workspace else {
         return block(
@@ -3567,7 +3567,7 @@ mod tests {
                     unit: 2,
                     branch: "feat/t--2".into(),
                     path: child.clone(),
-                    workspace_id: "w-child".into(),
+                    workspace_id: Some("w-child".into()),
                     base_sha: "fixture".into(),
                     integrated: false,
                 });

@@ -202,7 +202,7 @@ fn verify_children(ticket: &Ticket, h: &dyn Herdr) -> Result<(), ShepherdError> 
                 child.branch == branch
                     && tree_path.is_some_and(|path| same_path(path, &child.path))
                     && workspaces.iter().any(|workspace| {
-                        workspace.workspace_id == child.workspace_id
+                        Some(&workspace.workspace_id) == child.workspace_id.as_ref()
                             && workspace.worktree.as_ref().is_some_and(|tree| {
                                 tree.checkout_path
                                     .as_ref()
@@ -1481,7 +1481,7 @@ mod tests {
                     unit: 1,
                     branch: "feat/t--1".into(),
                     path: child.clone(),
-                    workspace_id: "child".into(),
+                    workspace_id: Some("child".into()),
                     base_sha: fixture.status.head_oid.clone().unwrap(),
                     integrated: true,
                 });

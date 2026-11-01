@@ -216,7 +216,7 @@ fn integration_registration_case(existing_child: bool) {
                     unit: 1,
                     branch: "fix/ticket--1".into(),
                     path: existing_path.clone(),
-                    workspace_id: "child1".into(),
+                    workspace_id: Some("child1".into()),
                     base_sha: base,
                     integrated: false,
                 });
@@ -240,7 +240,7 @@ fn integration_registration_case(existing_child: bool) {
         unit: 2,
         branch: "fix/ticket--2".into(),
         path: child_path.clone(),
-        workspace_id: "child2".into(),
+        workspace_id: Some("child2".into()),
         base_sha: git(&f.root, &["rev-parse", "HEAD"]),
         integrated: false,
     };
