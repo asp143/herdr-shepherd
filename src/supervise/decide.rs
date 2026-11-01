@@ -219,6 +219,164 @@ mod tests {
             }
         );
     }
+    #[test]
+    fn claude_startup_dialogs_require_owned_cwd_and_claude_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = roles::resolve(&config::load(dir.path(), None).unwrap())
+            .unwrap()
+            .supervision;
+        let policy = BranchPolicy::new(&[], None, None).unwrap();
+        for (name, screen) in [
+            (
+                "claude-trust",
+                include_str!("../../tests/fixtures/claude-trust.txt"),
+            ),
+            (
+                "claude-bypass-permissions",
+                include_str!("../../tests/fixtures/claude-bypass-permissions.txt"),
+            ),
+        ] {
+            for screen in [
+                screen.to_owned(),
+                screen.replace('\n', "\r\n"),
+                screen.replace(
+                    "you created or one you trust?",
+                    "you created or\n one you trust?",
+                ),
+            ] {
+                assert_eq!(
+                    decide(
+                        &record(),
+                        &Condition::Blocked { screen },
+                        &settings,
+                        &*harness_for("claude").unwrap(),
+                        &policy,
+                        true,
+                        0
+                    ),
+                    Decision::SendKeys {
+                        rule: name.into(),
+                        keys: vec!["down".into(), "enter".into()]
+                    }
+                );
+            }
+            let condition = Condition::Blocked {
+                screen: screen.into(),
+            };
+            for (harness, inside) in [
+                ("claude", true),
+                ("claude", false),
+                ("codex", true),
+                ("omp", true),
+            ] {
+                let result = decide(
+                    &record(),
+                    &condition,
+                    &settings,
+                    &*harness_for(harness).unwrap(),
+                    &policy,
+                    inside,
+                    0,
+                );
+                if harness == "claude" && inside {
+                    assert_eq!(
+                        result,
+                        Decision::SendKeys {
+                            rule: name.into(),
+                            keys: vec!["down".into(), "enter".into()]
+                        }
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Decision::AskLead { .. }),
+                        "{name}: {harness}, {inside}"
+                    );
+                }
+            }
+            // A policy violation takes precedence even on a recognized startup screen.
+            let result = decide(
+                &record(),
+                &Condition::Blocked {
+                    screen: format!("{screen}\nAllow git push origin main?"),
+                },
+                &settings,
+                &*harness_for("claude").unwrap(),
+                &BranchPolicy::new(&["main".into()], None, None).unwrap(),
+                true,
+                0,
+            );
+            assert!(matches!(result, Decision::Deny { .. }));
+        }
+    }
+
+    #[test]
+    fn claude_startup_rules_reject_ordinary_output_and_changed_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = roles::resolve(&config::load(dir.path(), None).unwrap())
+            .unwrap()
+            .supervision;
+        let harness = harness_for("claude").unwrap();
+        let policy = BranchPolicy::new(&[], None, None).unwrap();
+        for screen in [
+            "Do you trust the files in this folder?\nYes, I trust this folder",
+            "WARNING: Claude Code running in Bypass Permissions mode\nYes, I accept",
+            "The startup dialog says Yes, I accept. Select it to proceed.",
+            "Output: Accessing workspace: /tmp/ticket\nQuick safety check: Is this a project you created or one you trust?\nClaude Code'll be able to read, edit, and execute files here.\n❯ No, exit\n  Yes, I trust this folder",
+        ] {
+            assert!(
+                matches!(
+                    decide(
+                        &record(),
+                        &Condition::Blocked {
+                            screen: screen.into()
+                        },
+                        &settings,
+                        &*harness,
+                        &policy,
+                        true,
+                        0
+                    ),
+                    Decision::AskLead { .. }
+                ),
+                "{screen}"
+            );
+        }
+        for screen in [
+            include_str!("../../tests/fixtures/claude-trust.txt"),
+            include_str!("../../tests/fixtures/claude-bypass-permissions.txt"),
+        ] {
+            for ordinary in [
+                screen.replace(" ❯ No, exit", "   No, exit"),
+                screen
+                    .replace(" ❯ No, exit", "   No, exit")
+                    .replace("   Yes,", " ❯ Yes,"),
+                screen
+                    .lines()
+                    .map(|line| format!("> {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ] {
+                assert!(
+                    matches!(
+                        decide(
+                            &record(),
+                            &Condition::Blocked {
+                                screen: ordinary.clone()
+                            },
+                            &settings,
+                            &*harness,
+                            &policy,
+                            true,
+                            0
+                        ),
+                        Decision::AskLead { .. }
+                    ),
+                    "{ordinary}"
+                );
+            }
+        }
+    }
+
     fn decision(rec: &AgentRecord, cond: Condition, inside: bool, now: u64) -> Decision {
         let dir = tempfile::tempdir().unwrap();
         let settings = roles::resolve(&config::load(dir.path(), None).unwrap())

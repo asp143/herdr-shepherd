@@ -26,7 +26,7 @@ pub struct ShepherdSettings {
 impl Default for ShepherdSettings {
     fn default() -> Self {
         Self {
-            runner: "codex-sol-high".into(),
+            runner: "claude-opus".into(),
             max_concurrent_tickets: 2,
             max_parallel_agents: 6,
             max_revision_rounds: 3,
@@ -162,6 +162,15 @@ fn defaults() -> Resolved {
         name: name.into(), description: description.into(), runners: vec![runner.into()], worktree, stage: None, prompt: None,
     }).collect();
     let runners = [
+        (
+            "claude-opus",
+            "claude",
+            vec![
+                "--model",
+                "claude-opus-5-5",
+                "--dangerously-skip-permissions",
+            ],
+        ),
         (
             "codex-sol-high",
             "codex",
@@ -304,10 +313,16 @@ pub fn resolve(cfg: &Config) -> Result<Resolved, ShepherdError> {
         let settings: SupervisionConfig =
             value.clone().try_into().map_err(|err| invalid(cfg, err))?;
         let mut rules = Vec::new();
-        let mut rule_names: HashSet<String> = ["codex-trust", "press-enter", "codex-update-notice"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+        let mut rule_names: HashSet<String> = [
+            "codex-trust",
+            "press-enter",
+            "codex-update-notice",
+            "claude-trust",
+            "claude-bypass-permissions",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
         for rule in settings.rules {
             if !rule_names.insert(rule.name.clone()) {
                 return Err(invalid(
@@ -426,22 +441,48 @@ pub fn resolve(cfg: &Config) -> Result<Resolved, ShepherdError> {
                 "codex-trust",
                 Some("codex"),
                 r"(?s)Trust this folder\?.*Trust and continue",
-                "enter",
+                &["enter"][..],
             ),
-            ("press-enter", None, r"(?i)press enter to continue", "enter"),
+            ("press-enter", None, r"(?i)press enter to continue", &["enter"][..]),
             (
                 "codex-update-notice",
                 Some("codex"),
                 r"(?i)update available.*(skip|later)",
-                "esc",
+                &["esc"][..],
+            ),
+            // Claude Code 2.1.316 presents the cancel option first and focused.
+            // Require that selection explicitly before moving to confirmation.
+            // Unrecognized layouts remain blocked for manual handling.
+            (
+                "claude-trust",
+                Some("claude"),
+                concat!(
+                    r"(?m)^[ \t]*Accessing workspace:[ \t]*\r?$",
+                    r"[\s\S]{0,1500}?^[ \t]*Quick\s+safety\s+check:\s+Is\s+this\s+a\s+project\s+you\s+created\s+or\s+one\s+you\s+trust\?",
+                    r"[\s\S]{0,1500}?^[ \t]*Claude Code'll be able to read, edit, and execute files here\.[ \t]*\r?$",
+                    r"[\s\S]{0,1500}?^[ \t]*❯[ \t]+No, exit[ \t]*\r?\n",
+                    r"[ \t]+Yes, I trust this folder[ \t]*\r?$",
+                ),
+                &["down", "enter"][..],
+            ),
+            (
+                "claude-bypass-permissions",
+                Some("claude"),
+                concat!(
+                    r"(?m)^[ \t]*WARNING: Claude Code running in Bypass Permissions mode[ \t]*\r?$",
+                    r"[\s\S]{0,1500}?^[ \t]*By\s+proceeding,\s+you\s+accept\s+all\s+responsibility\s+for\s+actions\s+taken\s+while\s+running\s+in\s+Bypass\s+Permissions\s+mode\.[ \t]*\r?$",
+                    r"[\s\S]{0,1500}?^[ \t]*❯[ \t]+No, exit[ \t]*\r?\n",
+                    r"[ \t]+Yes, I accept[ \t]*\r?$",
+                ),
+                &["down", "enter"][..],
             ),
         ]
         .into_iter()
-        .map(|(name, harness, pattern, key)| Rule {
+        .map(|(name, harness, pattern, keys)| Rule {
             name: name.into(),
             harness: harness.map(str::to_owned),
             pattern: Regex::new(pattern).expect("built-in pattern is valid"),
-            keys: vec![key.into()],
+            keys: keys.iter().map(|key| (*key).into()).collect(),
         }),
     );
     Ok(resolved)
@@ -465,7 +506,7 @@ mod tests {
     #[test]
     fn defaults_match_spec() {
         let resolved = resolve(&config("")).unwrap();
-        assert_eq!(resolved.shepherd.runner, "codex-sol-high");
+        assert_eq!(resolved.shepherd.runner, "claude-opus");
         assert_eq!(resolved.shepherd.max_concurrent_tickets, 2);
         assert_eq!(resolved.shepherd.max_parallel_agents, 6);
         assert_eq!(resolved.shepherd.max_revision_rounds, 3);
@@ -524,7 +565,29 @@ mod tests {
             assert_eq!(role.stage, None);
             assert_eq!(role.prompt, None);
         }
-        assert_eq!(resolved.runners.len(), 3);
+        assert_eq!(
+            resolved
+                .runners
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "claude-opus",
+                "codex-sol-high",
+                "omp-astra",
+                "omp-glm-infra"
+            ]
+        );
+        let claude = &resolved.runners["claude-opus"];
+        assert_eq!(claude.harness, "claude");
+        assert_eq!(
+            claude.args,
+            [
+                "--model",
+                "claude-opus-5-5",
+                "--dangerously-skip-permissions"
+            ]
+        );
         let codex = &resolved.runners["codex-sol-high"];
         assert_eq!(codex.harness, "codex");
         assert_eq!(
@@ -559,6 +622,20 @@ mod tests {
         assert_eq!(resolved.supervision.report_grace_seconds, 120);
         assert_eq!(resolved.supervision.stall_minutes, 20);
         assert_eq!(resolved.supervision.escalate_minutes, 15);
+    }
+
+    #[test]
+    fn init_template_matches_resolved_defaults() {
+        let defaults = resolve(&config("")).unwrap();
+        let template = resolve(&config(crate::lead::DEFAULT_CONFIG)).unwrap();
+        assert_eq!(
+            serde_json::to_value(&template).unwrap(),
+            serde_json::to_value(&defaults).unwrap()
+        );
+        assert_eq!(
+            template.runners.keys().collect::<Vec<_>>(),
+            defaults.runners.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -615,7 +692,9 @@ mod tests {
                 "custom",
                 "codex-trust",
                 "press-enter",
-                "codex-update-notice"
+                "codex-update-notice",
+                "claude-trust",
+                "claude-bypass-permissions"
             ]
         );
         assert_eq!(rules[1].harness.as_deref(), Some("codex"));
@@ -630,7 +709,7 @@ mod tests {
         assert_eq!(rules[3].harness.as_deref(), Some("codex"));
         assert_eq!(rules[3].keys, ["esc"]);
         assert!(rules[3].pattern.is_match("Update available, try later"));
-        assert_eq!(resolve(&config("")).unwrap().supervision.rules.len(), 3);
+        assert_eq!(resolve(&config("")).unwrap().supervision.rules.len(), 5);
     }
 
     #[test]
@@ -705,6 +784,6 @@ escalate_minutes = 2
         assert_eq!(resolved.supervision.report_grace_seconds, 40);
         assert_eq!(resolved.supervision.stall_minutes, 5);
         assert_eq!(resolved.supervision.escalate_minutes, 2);
-        assert_eq!(resolved.supervision.rules.len(), 3);
+        assert_eq!(resolved.supervision.rules.len(), 5);
     }
 }

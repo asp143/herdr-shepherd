@@ -218,6 +218,10 @@ mod tests {
         assert_eq!(cfg.source, ConfigSource::Default);
         assert!(cfg.upkeep.regroup);
         assert_eq!(cfg.upkeep.token_prefix, "shepherd_");
+        assert_eq!(
+            crate::roles::resolve(&cfg).unwrap().shepherd.runner,
+            "claude-opus"
+        );
     }
 
     #[test]

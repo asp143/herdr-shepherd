@@ -659,6 +659,65 @@ esac
         assert!(matches!(result, Ok(AgentStart::Ready)), "{result:?}");
     }
 
+    #[test]
+    fn claude_start_and_prompt_use_generic_readiness_contract() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("herdr.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let bin = dir.path().join("herdr-fake");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+case "$1 $2" in
+  'pane run' | 'pane wait-output') exit 0 ;;
+  'agent start')
+    printf '%s\n' "$@" > "${0%/*}/start-args"
+    printf '%s\n' '{"result":{"agent":{"agent_status":"idle"}}}' ;;
+  'agent prompt')
+    printf '%s\n' "$@" > "${0%/*}/prompt-args"
+    printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
+  *) exit 9 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let h = CliHerdr { bin, socket };
+        let values = HashMap::from([(
+            "GIT_CONFIG_GLOBAL".into(),
+            dir.path()
+                .join("agent.gitconfig")
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+        assert_eq!(
+            h.start_agent(
+                "sh-fixture-lead",
+                "claude",
+                "owned:p1",
+                &[
+                    "--model".into(),
+                    "claude-opus-5-5".into(),
+                    "--dangerously-skip-permissions".into(),
+                ],
+                &values,
+            )
+            .unwrap(),
+            AgentStart::Ready
+        );
+        h.prompt_agent("sh-fixture-lead", "Coordinate the flock", true)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("start-args")).unwrap(),
+            "agent\nstart\nsh-fixture-lead\n--kind\nclaude\n--pane\nowned:p1\n--timeout\n30000\n--\n--model\nclaude-opus-5-5\n--dangerously-skip-permissions\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("prompt-args")).unwrap(),
+            "agent\nprompt\nsh-fixture-lead\nCoordinate the flock\n--wait\n--until\nworking\n--timeout\n30000\n"
+        );
+    }
+
     fn output_fixture(text: &str) -> (tempfile::TempDir, CliHerdr, UnixListener) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();

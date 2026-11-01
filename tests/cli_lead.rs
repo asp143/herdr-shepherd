@@ -24,6 +24,27 @@ fn init_cli_writes_only_project_defaults() {
             .unwrap()
             .contains("system")
     );
-    assert!(project.join(".shepherd.toml").exists());
+    let config: toml::Table = fs::read_to_string(project.join(".shepherd.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(config["shepherd"]["runner"].as_str(), Some("claude-opus"));
+    assert_eq!(
+        config["runners"]["claude-opus"]["harness"].as_str(),
+        Some("claude")
+    );
+    assert_eq!(
+        config["runners"]["claude-opus"]["args"],
+        toml::Value::Array(
+            [
+                "--model",
+                "claude-opus-5-5",
+                "--dangerously-skip-permissions"
+            ]
+            .into_iter()
+            .map(|arg| toml::Value::String(arg.into()))
+            .collect()
+        )
+    );
     assert!(!home.join(".config").exists());
 }

@@ -216,7 +216,7 @@ pub const DEFAULT_CONFIG: &str = r#"schema_version = 1
 enabled = true
 
 [shepherd]
-runner = "codex-sol-high"
+runner = "claude-opus"
 max_concurrent_tickets = 2
 max_parallel_agents = 6
 max_revision_rounds = 3
@@ -251,6 +251,10 @@ worktree = "ticket"
 description = "Runs tests and checks every acceptance criterion against the final code"
 runners = ["codex-sol-high"]
 worktree = "ticket"
+
+[runners.claude-opus]
+harness = "claude"
+args = ["--model", "claude-opus-5-5", "--dangerously-skip-permissions"]
 
 [runners.codex-sol-high]
 harness = "codex"
@@ -310,6 +314,118 @@ pub fn init_with_state(project_root: &Path, state_dir: &Path) -> Result<InitRepo
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn default_claude_lead_delivers_prompt_and_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let cfg = crate::config::load(&dir.path().join("config"), None).unwrap();
+        let store = Store::open(&state, dir.path()).unwrap();
+        let h = crate::herdr::fake::FakeHerdr::new(vec![]);
+        let ctx = LeadContext {
+            bin: Path::new("/tmp/bin/herdr-shepherd"),
+            state_dir: &state,
+            workspace_id: "w1",
+        };
+        let expected_prompt = crate::prompts::lead_prompt(
+            ctx.bin,
+            dir.path(),
+            &roles::resolve(&cfg).unwrap(),
+            &store.read().unwrap(),
+        );
+        let record = start(&h, &store, &cfg, &ctx).unwrap();
+        assert_eq!(record.runner, "claude-opus");
+        assert_eq!(record.status, AgentStatus::Working);
+        assert!(!record.prompt_pending);
+        assert_eq!(record.task, expected_prompt);
+        assert!(h.calls.borrow().contains(&format!(
+            "start_agent {} claude {} -- {:?}",
+            record.name,
+            record.pane_id.as_ref().unwrap(),
+            [
+                "--model",
+                "claude-opus-5-5",
+                "--dangerously-skip-permissions"
+            ]
+        )));
+        assert!(h.calls.borrow().contains(&format!(
+            "prompt_agent {} {expected_prompt} true",
+            record.name
+        )));
+
+        let resumed = resume(&h, &store, &cfg, &ctx).unwrap();
+        assert_eq!(resumed.name, record.name);
+        let report = status(&h, &store, &cfg).unwrap();
+        assert_eq!(report.lead.unwrap().agent_name, record.name);
+        assert_eq!(report.agents.len(), 1);
+        assert_eq!(report.agents[0].runner, "claude-opus");
+        for operation in ["start_agent", "prompt_agent"] {
+            assert_eq!(
+                h.calls
+                    .borrow()
+                    .iter()
+                    .filter(|call| call.starts_with(operation))
+                    .count(),
+                1,
+                "resuming must not repeat {operation}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_lead_keeps_prompt_pending_until_first_run_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let cfg = crate::config::load(&dir.path().join("config"), None).unwrap();
+        let store = Store::open(&state, dir.path()).unwrap();
+        let h = crate::herdr::fake::FakeHerdr::new(vec![]);
+        h.start_results
+            .borrow_mut()
+            .push_back(crate::herdr::AgentStart::NotReady);
+        let ctx = LeadContext {
+            bin: Path::new("/tmp/bin/herdr-shepherd"),
+            state_dir: &state,
+            workspace_id: "w1",
+        };
+        let record = start(&h, &store, &cfg, &ctx).unwrap();
+        assert_eq!(record.runner, "claude-opus");
+        assert_eq!(record.status, AgentStatus::Blocked);
+        assert!(record.prompt_pending);
+        h.agent_records.borrow_mut()[0].cwd = Some(dir.path().into());
+        for (live_status, stored_status) in [
+            ("blocked", AgentStatus::Blocked),
+            ("initializing", AgentStatus::Starting),
+        ] {
+            h.agent_records.borrow_mut()[0].agent_status = live_status.into();
+            let resumed = resume(&h, &store, &cfg, &ctx).unwrap();
+            assert_eq!(resumed.status, stored_status);
+            assert!(resumed.prompt_pending);
+            assert!(
+                !h.calls
+                    .borrow()
+                    .iter()
+                    .any(|call| call.starts_with("prompt_agent"))
+            );
+        }
+
+        h.agent_records.borrow_mut()[0].agent_status = "idle".into();
+        let resumed = resume(&h, &store, &cfg, &ctx).unwrap();
+        assert_eq!(resumed.status, AgentStatus::Working);
+        assert!(!resumed.prompt_pending);
+        resume(&h, &store, &cfg, &ctx).unwrap();
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("prompt_agent"))
+                .collect::<Vec<_>>(),
+            [&format!(
+                "prompt_agent {} {} true",
+                record.name, record.task
+            )]
+        );
+    }
+
     #[test]
     fn ping_queued_when_lead_blocked() {
         let dir = tempfile::tempdir().unwrap();

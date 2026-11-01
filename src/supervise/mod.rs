@@ -1489,6 +1489,68 @@ mod tests {
     }
 
     #[test]
+    fn claude_dialog_input_revalidates_screen_and_owned_cwd() {
+        for (screen, owned, expected) in [
+            (
+                include_str!("../../tests/fixtures/claude-trust.txt").to_owned(),
+                true,
+                true,
+            ),
+            (
+                include_str!("../../tests/fixtures/claude-trust.txt")
+                    .replace(" ❯ No, exit", "   No, exit")
+                    .replace("   Yes,", " ❯ Yes,"),
+                true,
+                false,
+            ),
+            (
+                include_str!("../../tests/fixtures/claude-trust.txt").to_owned(),
+                false,
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, cfg, h) = fixture(dir.path());
+            store
+                .update(|data| {
+                    data.agents[0].runner = "claude-opus".into();
+                    Ok(())
+                })
+                .unwrap();
+            h.agent_records.borrow_mut()[0].agent = "claude".into();
+            if !owned {
+                h.agent_records.borrow_mut()[0].cwd = Some(dir.path().into());
+            }
+            h.visible_screens.borrow_mut().push_back(screen);
+            let rec = store.read().unwrap().agents[0].clone();
+            apply(
+                &ApplyContext {
+                    h: &h,
+                    store: &store,
+                    cfg: &cfg,
+                    state_dir: &dir.path().join("state"),
+                    now_s: 1,
+                },
+                &rec,
+                &Decision::SendKeys {
+                    rule: "claude-trust".into(),
+                    keys: vec!["down".into(), "enter".into()],
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                h.calls
+                    .borrow()
+                    .iter()
+                    .any(|call| call.starts_with("send_keys")
+                        && call.contains("down")
+                        && call.contains("enter")),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn changed_policy_dialog_is_rechecked_before_input() {
         let dir = tempfile::tempdir().unwrap();
         let (store, cfg, h) = fixture(dir.path());

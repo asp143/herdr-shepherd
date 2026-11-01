@@ -25,8 +25,36 @@ fn validate_config_adds_resolved_fields() {
     assert_eq!(data["upkeep"]["regroup"], true);
     assert!(data["source"]["global"].is_string());
     assert_eq!(data["warnings"], serde_json::json!([]));
-    assert_eq!(data["shepherd"]["runner"], "codex-sol-high");
+    assert_eq!(data["shepherd"]["runner"], "claude-opus");
     assert_eq!(data["roles"].as_array().unwrap().len(), 5);
+    for (name, runner) in [
+        ("planner", "codex-sol-high"),
+        ("researcher", "omp-astra"),
+        ("coder", "codex-sol-high"),
+        ("reviewer", "omp-astra"),
+        ("qa", "codex-sol-high"),
+    ] {
+        let role = data["roles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|role| role["name"] == name)
+            .unwrap();
+        assert_eq!(role["runners"], serde_json::json!([runner]));
+    }
+    assert_eq!(
+        data["runners"].as_object().unwrap().keys().next().unwrap(),
+        "claude-opus"
+    );
+    assert_eq!(data["runners"]["claude-opus"]["harness"], "claude");
+    assert_eq!(
+        data["runners"]["claude-opus"]["args"],
+        serde_json::json!([
+            "--model",
+            "claude-opus-5-5",
+            "--dangerously-skip-permissions"
+        ])
+    );
     assert_eq!(data["runners"]["omp-astra"]["harness"], "omp");
     assert_eq!(data["supervision"]["rules"][0]["name"], "codex-trust");
     assert_eq!(
@@ -100,6 +128,8 @@ fn validate_config_rejects_invalid_rules() {
         "name = 'codex-trust'\npattern = 'Continue'\nkeys = ['enter']",
         "name = 'press-enter'\npattern = 'Continue'\nkeys = ['enter']",
         "name = 'codex-update-notice'\npattern = 'Continue'\nkeys = ['enter']",
+        "name = 'claude-trust'\npattern = 'Continue'\nkeys = ['enter']",
+        "name = 'claude-bypass-permissions'\npattern = 'Continue'\nkeys = ['enter']",
         "name = 'custom'\npattern = 'Continue'\nkeys = ['enter']\n[[supervision.rules]]\nname = 'custom'\npattern = 'Next'\nkeys = ['y']",
     ] {
         let text = format!("[[supervision.rules]]\n{fields}");
@@ -150,6 +180,7 @@ fn validate_config_preserves_catalog_file_order() {
             "z-last",
             "omp-astra",
             "a-first",
+            "claude-opus",
             "codex-sol-high",
             "omp-glm-infra"
         ]

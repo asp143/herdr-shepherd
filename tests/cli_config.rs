@@ -53,3 +53,23 @@ fn bad_project_config_exits_2() {
             .contains(path.to_str().unwrap())
     );
 }
+
+#[test]
+fn missing_config_uses_claude_lead_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+        .args(["--json", "--config-dir"])
+        .arg(dir.path())
+        .args(["validate-config", "--project-root"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["data"]["shepherd"]["runner"], "claude-opus");
+    assert_eq!(value["data"]["runners"]["claude-opus"]["harness"], "claude");
+}

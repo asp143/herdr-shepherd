@@ -102,7 +102,10 @@ Global settings come from `shepherd.toml` inside the first available location:
 `[supervision]` from the selected file. Its existing output fields are retained,
 with `shepherd`, `roles`, `runners`, and `supervision` added alongside them.
 Defaults include planner, researcher, coder, reviewer, and QA roles, with the
-`codex-sol-high`, `omp-astra`, and `omp-glm-infra` runner catalog. Named role and
+`claude-opus`, `codex-sol-high`, `omp-astra`, and `omp-glm-infra` runner catalog,
+in that order. The lead defaults to `claude-opus`, which runs Claude Code with
+`--model claude-opus-5-5 --dangerously-skip-permissions`. Planner, coder, and QA
+use `codex-sol-high`; researcher and reviewer use `omp-astra`. Named role and
 runner entries override built-in fields; new roles default to the ticket
 worktree and `codex-sol-high`. No fields are merged between config files.
 Configured roles and runners retain file order, followed by unspecified
@@ -114,7 +117,11 @@ Shepherd defaults are two concurrent tickets, six parallel agents, three
 revision rounds, and PR polling every 180 seconds. Supervision defaults are a
 30-second sweep, 120-second report grace, 20-minute stall threshold, and
 15-minute escalation threshold. User regex rules run before built-in
-`codex-trust`, `press-enter`, and `codex-update-notice` rules. Rule keys are
+`codex-trust`, `press-enter`, `codex-update-notice`, `claude-trust`, and
+`claude-bypass-permissions` rules. The Claude rules recognize the startup dialogs
+verified in Claude Code 2.1.316, require the selected `No, exit` option, and send
+`down`, then `enter`. Other text, menu layouts, and selections require manual
+handling. Rule keys are
 limited to `enter`, `esc`, `y`, `n`, `1` through `9`, `down`, and `up`. The supervisor executes these rules for owned panes inside their assigned worktrees.
 Rules require a nonempty pattern and keys, unique names (including built-ins),
 and either no harness filter or one of `codex`, `omp`, `claude`, and `pi`.
