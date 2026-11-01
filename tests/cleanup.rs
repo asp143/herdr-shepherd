@@ -1585,3 +1585,60 @@ fn tickets_without_child_cleanup_intent_still_load() {
         assert!(loaded.child_cleanup.is_empty());
     }
 }
+
+#[test]
+fn integration_refuses_final_cleanup_intent_before_mutation() {
+    let repo = Repo::new();
+    let native = recorded_child(&repo, 1, false);
+    herdr_shepherd::store::Store::open(&repo.state, &repo.main)
+        .unwrap()
+        .update(|data| {
+            data.tickets[0].children[0].integrated = false;
+            Ok(())
+        })
+        .unwrap();
+    repo.merge();
+    ok(&repo.main, &["worktree", "lock", native.to_str().unwrap()]);
+    let error = cleanup::run(repo.preflight(false).unwrap(), false).unwrap_err();
+    assert!(error.to_string().contains("locked"), "{error}");
+    let store = herdr_shepherd::store::Store::open(&repo.state, &repo.main).unwrap();
+    let before = store.read().unwrap().tickets.remove(0);
+    assert!(!before.children[0].integrated);
+    assert_eq!(before.child_cleanup[0].child, before.children[0]);
+    assert_eq!(
+        ok(&native, &["rev-parse", "HEAD"]),
+        format!("{}\n", before.children[0].base_sha)
+    );
+    let head = ok(&repo.ticket, &["rev-parse", "HEAD"]);
+    let fake = repo._dir.path().join("fake.json");
+    fs::write(&fake, "{}").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+        .env("SHEPHERD_FAKE_HERDR", fake)
+        .args(["--json", "--state-dir"])
+        .arg(&repo.state)
+        .arg("--config-dir")
+        .arg(repo._dir.path().join("config"))
+        .args(["ticket", "--project-root"])
+        .arg(&repo.main)
+        .args(["integrate", "T"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        message.contains("finish the outstanding cleanup"),
+        "{message}"
+    );
+    assert_eq!(store.read().unwrap().tickets[0], before);
+    assert_eq!(ok(&repo.ticket, &["rev-parse", "HEAD"]), head);
+    ok(
+        &repo.main,
+        &["worktree", "unlock", native.to_str().unwrap()],
+    );
+    cleanup::run(repo.preflight(false).unwrap(), false).unwrap();
+    assert_cleanup_finished(&repo);
+}

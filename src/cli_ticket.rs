@@ -368,6 +368,17 @@ pub fn integrate(
         .into_iter()
         .find(|t| t.id == id)
         .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
+    // Final cleanup can own an unintegrated (including empty) child. Changing
+    // that identity would invalidate its durable receipt and strand both retries.
+    if ticket
+        .child_cleanup
+        .iter()
+        .any(|receipt| !receipt.child.integrated || !ticket.children.contains(&receipt.child))
+    {
+        return Err(ShepherdError::Usage(
+            "finish the outstanding cleanup before integrating this ticket".into(),
+        ));
+    }
     let path = ticket
         .worktree
         .clone()
