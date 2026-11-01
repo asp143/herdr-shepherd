@@ -341,6 +341,8 @@ fn child_hook_blocks_ticket_branch_push() {
         ),
         "feat/tiny--2"
     );
+    Repo::commit(&child, "payload", "child content\n", "child work");
+    integrate(&repo.ticket, &mut [child.clone()]).unwrap();
     let output = git(
         &child.path,
         &["push", "origin", "HEAD:refs/heads/feat/tiny"],
@@ -1561,11 +1563,58 @@ fn ancestry_cleanup_retry_after_later_edit() {
 }
 
 #[test]
+fn integration_ignores_inherited_ours_strategy() {
+    let repo = Repo::new();
+    let child = repo.child(1);
+    let tip = Repo::commit(&child, "payload", "child content\n", "child work");
+    ok(
+        &repo.ticket,
+        &["config", "branch.feat/tiny.mergeOptions", "-s ours"],
+    );
+    let mut children = [child];
+    integrate(&repo.ticket, &mut children).unwrap();
+    ok(&repo.ticket, &["merge-base", "--is-ancestor", &tip, "HEAD"]);
+    assert_eq!(ok(&repo.ticket, &["show", "HEAD:payload"]), "child content");
+    assert!(children[0].integrated);
+}
+
+#[test]
+fn integration_ignores_inherited_ours_conflict_resolution() {
+    let repo = Repo::new();
+    let child = repo.child(1);
+    Repo::commit(&child, "shared.txt", "child content\n", "child work");
+    fs::write(repo.ticket.join("shared.txt"), "ticket content\n").unwrap();
+    ok(&repo.ticket, &["commit", "-am", "ticket work"]);
+    let before = ok(&repo.ticket, &["rev-parse", "HEAD"]);
+    ok(
+        &repo.ticket,
+        &["config", "branch.feat/tiny.mergeOptions", "-X ours"],
+    );
+    let mut children = [child];
+    let error = integrate(&repo.ticket, &mut children).unwrap_err();
+    assert!(matches!(error, ShepherdError::Conflict { unit: 1, .. }));
+    assert_eq!(ok(&repo.ticket, &["rev-parse", "HEAD"]), before);
+    assert!(ok(&repo.ticket, &["status", "--porcelain"]).is_empty());
+    assert!(!children[0].integrated);
+
+    // Removing the competing ticket edit makes the child's content land.
+    ok(&repo.ticket, &["reset", "--hard", &children[0].base_sha]);
+    integrate(&repo.ticket, &mut children).unwrap();
+    assert_eq!(
+        ok(&repo.ticket, &["show", "HEAD:shared.txt"]),
+        "child content"
+    );
+}
+
+#[test]
 fn ancestry_merge_overrides_conflicting_git_defaults() {
     let repo = Repo::new();
     let child = repo.child(1);
     let tip = Repo::commit(&child, "payload", "work\n", "child work");
     ok(&repo.ticket, &["config", "merge.ff", "only"]);
+    ok(&repo.ticket, &["config", "merge.squash", "true"]);
+    ok(&repo.ticket, &["config", "merge.autoStash", "true"]);
+    ok(&repo.ticket, &["config", "pull.twohead", "ours"]);
     ok(&repo.ticket, &["config", "commit.gpgsign", "true"]);
     ok(&repo.ticket, &["config", "gpg.program", "/does/not/exist"]);
     ok(
@@ -1579,6 +1628,7 @@ fn ancestry_merge_overrides_conflicting_git_defaults() {
     let mut children = [child];
     integrate(&repo.ticket, &mut children).unwrap();
     ok(&repo.ticket, &["merge-base", "--is-ancestor", &tip, "HEAD"]);
+    assert_eq!(ok(&repo.ticket, &["show", "HEAD:payload"]), "work");
     assert_eq!(
         ok(&repo.ticket, &["rev-list", "--parents", "-1", "HEAD"])
             .split_whitespace()
@@ -1611,37 +1661,221 @@ fn ancestry_integrates_children_with_only_empty_commits() {
 }
 
 #[test]
-fn ancestry_merge_hook_failure_restores_transaction() {
+fn integration_disables_merge_hooks() {
     use std::os::unix::fs::PermissionsExt;
     let repo = Repo::new();
     let mut children = [repo.child(1), repo.child(2)];
-    Repo::commit(&children[0], "one", "first unit\n", "first unit");
-    Repo::commit(&children[1], "two", "second unit\n", "second unit");
     let hooks = repo.dir.path().join("merge-hooks");
     fs::create_dir(&hooks).unwrap();
-    let hook = hooks.join("pre-merge-commit");
-    fs::write(&hook, "#!/bin/sh\ntest ! -f two\n").unwrap();
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = repo.dir.path().join("hook-ran");
+    let pre_commit = hooks.join("pre-commit");
+    fs::write(
+        &pre_commit,
+        format!(
+            "#!/bin/sh\nprintf ran >> {}\n",
+            herdr_shepherd::gate::shim::shell_quote(&marker)
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&pre_commit, fs::Permissions::from_mode(0o700)).unwrap();
     ok(
         &repo.ticket,
         &["config", "core.hooksPath", hooks.to_str().unwrap()],
     );
-    let before = ok(&repo.ticket, &["rev-parse", "HEAD"]);
-    let error = integrate(&repo.ticket, &mut children).unwrap_err();
-    assert!(matches!(error, ShepherdError::Conflict { unit: 2, .. }));
-    assert_eq!(ok(&repo.ticket, &["rev-parse", "HEAD"]), before);
+    Repo::commit(&children[0], "one", "first unit\n", "first unit");
+    Repo::commit(&children[1], "two", "second unit\n", "second unit");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "ranran");
+    fs::remove_file(&marker).unwrap();
+    for name in [
+        "pre-merge-commit",
+        "prepare-commit-msg",
+        "commit-msg",
+        "post-merge",
+        "reference-transaction",
+    ] {
+        let hook = hooks.join(name);
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf ran >> {}\nprintf damaged > shared.txt\nexit 1\n",
+                herdr_shepherd::gate::shim::shell_quote(&marker)
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    integrate(&repo.ticket, &mut children).unwrap();
+    assert!(!marker.exists(), "integration must not execute Git hooks");
+    assert_eq!(
+        fs::read_to_string(repo.ticket.join("shared.txt")).unwrap(),
+        "base\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.ticket.join("one")).unwrap(),
+        "first unit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.ticket.join("two")).unwrap(),
+        "second unit\n"
+    );
+    assert_eq!(
+        ok(&repo.ticket, &["config", "core.hooksPath"]),
+        hooks.to_str().unwrap()
+    );
     assert!(ok(&repo.ticket, &["status", "--porcelain"]).is_empty());
     assert!(
         !git(&repo.ticket, &["rev-parse", "--verify", "MERGE_HEAD"])
             .status
             .success()
     );
-    assert!(
-        children
-            .iter()
-            .all(|child| !child.integrated && child.path.exists())
-    );
-    fs::remove_file(hook).unwrap();
-    integrate(&repo.ticket, &mut children).unwrap();
     assert!(children.iter().all(|child| child.integrated));
+}
+
+fn install_integration_driver(repo: &Repo, script: &str) {
+    let driver = repo.dir.path().join("merge-driver");
+    fs::write(&driver, script).unwrap();
+    fs::write(
+        repo.main.join(".git/info/attributes"),
+        "shared.txt merge=fixture\n",
+    )
+    .unwrap();
+    ok(
+        &repo.ticket,
+        &[
+            "config",
+            "merge.fixture.driver",
+            &format!(
+                "sh {} %O %A %B",
+                herdr_shepherd::gate::shim::shell_quote(&driver)
+            ),
+        ],
+    );
+}
+
+#[test]
+fn integration_rollback_preserves_moved_checkout() {
+    integration_rollback_preserves_external_head(true);
+}
+
+#[test]
+fn integration_rollback_preserves_unexpected_ticket_tip() {
+    integration_rollback_preserves_external_head(false);
+}
+
+fn integration_rollback_preserves_external_head(switch_branch: bool) {
+    let repo = Repo::new();
+    let mut children = [repo.child(1), repo.child(2)];
+    Repo::commit(&children[0], "shared.txt", "first unit\n", "first unit");
+    Repo::commit(&children[1], "shared.txt", "second unit\n", "second unit");
+    let original = ok(&repo.ticket, &["rev-parse", "HEAD"]);
+    ok(
+        &repo.main,
+        &["commit", "--allow-empty", "-m", "external work"],
+    );
+    let external = ok(&repo.main, &["rev-parse", "HEAD"]);
+    ok(&repo.main, &["branch", "unrelated", &external]);
+    let action = if switch_branch {
+        "git symbolic-ref HEAD refs/heads/unrelated".into()
+    } else {
+        format!("git update-ref refs/heads/feat/tiny {external}")
+    };
+    // A real project merge driver runs inside the second merge, after the
+    // first unit landed. No production test hook or timing race is needed.
+    install_integration_driver(&repo, &format!("set -eu\n{action}\nexit 1\n"));
+    let error = integrate(&repo.ticket, &mut children).unwrap_err();
+    assert_eq!(
+        ok(&repo.ticket, &["rev-parse", "HEAD"]),
+        external,
+        "{error}"
+    );
+    assert_eq!(ok(&repo.ticket, &["rev-parse", "unrelated"]), external);
+    assert_eq!(
+        ok(&repo.ticket, &["symbolic-ref", "HEAD"]),
+        if switch_branch {
+            "refs/heads/unrelated"
+        } else {
+            "refs/heads/feat/tiny"
+        }
+    );
+    assert!(error.to_string().contains("rollback refused"), "{error}");
+    assert!(error.to_string().contains(&original), "{error}");
+    assert!(error.to_string().contains("recover"), "{error}");
+    assert!(children.iter().all(|child| !child.integrated));
+    assert!(
+        git(&repo.ticket, &["rev-parse", "--verify", "MERGE_HEAD"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn integration_leaves_edits_in_place_without_autostashing() {
+    let repo = Repo::new();
+    fs::write(repo.ticket.join("local.txt"), "base\n").unwrap();
+    ok(&repo.ticket, &["add", "local.txt"]);
+    ok(&repo.ticket, &["commit", "-m", "local base"]);
+    let mut children = [repo.child(1), repo.child(2)];
+    Repo::commit(&children[0], "shared.txt", "first unit\n", "first unit");
+    Repo::commit(&children[1], "shared.txt", "second unit\n", "second unit");
+    Repo::commit(
+        &children[1],
+        "local.txt",
+        "second unit edit\n",
+        "edit local",
+    );
+    // The driver deliberately resolves the first conflict using the child,
+    // but also leaves an unrelated edit before the second merge begins.
+    fs::write(repo.ticket.join("shared.txt"), "ticket content\n").unwrap();
+    ok(&repo.ticket, &["commit", "-am", "ticket edit"]);
+    install_integration_driver(
+        &repo,
+        "set -eu\ncp \"$3\" \"$2\"\nprintf 'local edit\\n' > local.txt\n",
+    );
+    ok(&repo.ticket, &["config", "merge.autoStash", "true"]);
+    ok(
+        &repo.ticket,
+        &["config", "branch.feat/tiny.mergeOptions", "--autostash"],
+    );
+    let error = integrate(&repo.ticket, &mut children).unwrap_err();
+    assert!(error.to_string().contains("worktree has edits"), "{error}");
+    assert_eq!(
+        fs::read_to_string(repo.ticket.join("local.txt")).unwrap(),
+        "local edit\n"
+    );
+    assert_eq!(ok(&repo.ticket, &["show", "HEAD:shared.txt"]), "first unit");
+    assert!(ok(&repo.ticket, &["stash", "list"]).is_empty());
+    assert!(ok(&repo.ticket, &["ls-files", "-u"]).is_empty());
+    assert!(children.iter().all(|child| !child.integrated));
+}
+
+#[test]
+fn integration_reports_abort_failure_without_resetting() {
+    let repo = Repo::new();
+    let mut children = [repo.child(1), repo.child(2)];
+    Repo::commit(&children[0], "shared.txt", "first unit\n", "first unit");
+    Repo::commit(&children[1], "shared.txt", "second unit\n", "second unit");
+    let original = ok(&repo.ticket, &["rev-parse", "HEAD"]);
+    // Change repository settings inside a real merge driver so abort itself
+    // fails. Restoring the setting is an explicit manual recovery step.
+    install_integration_driver(
+        &repo,
+        "set -eu\ngit config extensions.worktreeConfig true\ngit config --worktree core.bare true\nexit 1\n",
+    );
+    let error = integrate(&repo.ticket, &mut children).unwrap_err();
+    ok(
+        &repo.ticket,
+        &["config", "--worktree", "core.bare", "false"],
+    );
+    assert!(
+        error.to_string().contains("merge --abort failed"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("recover"), "{error}");
+    assert_ne!(ok(&repo.ticket, &["rev-parse", "HEAD"]), original);
+    assert!(
+        git(&repo.ticket, &["rev-parse", "--verify", "MERGE_HEAD"])
+            .status
+            .success()
+    );
+    assert!(children.iter().all(|child| !child.integrated));
 }

@@ -68,6 +68,58 @@ pub fn conflict_ranges(children: &[ChildWorktree]) -> Vec<String> {
         .collect()
 }
 
+fn rollback_integration(
+    ticket_wt: &Path,
+    ticket_ref: &str,
+    original_head: &str,
+    owned_heads: &HashSet<String>,
+) -> Result<(), ShepherdError> {
+    let recovery = |reason: String| {
+        ShepherdError::Runtime(anyhow::anyhow!(
+            "integration rollback refused: {reason}; no hard reset performed. \
+             To recover, preserve local edits, inspect git status, and restore \
+             {ticket_ref} from {original_head} after resolving or aborting the merge"
+        ))
+    };
+    let check_owner = || -> Result<(), ShepherdError> {
+        let current_ref = git(ticket_wt, &["symbolic-ref", "--quiet", "HEAD"])
+            .map_err(|error| recovery(format!("cannot verify HEAD branch: {error}")))?;
+        let head = git(ticket_wt, &["rev-parse", "HEAD"])
+            .map_err(|error| recovery(format!("cannot verify HEAD tip: {error}")))?;
+        if current_ref != ticket_ref || !owned_heads.contains(&head) {
+            return Err(recovery(format!(
+                "HEAD changed to {current_ref} at {head}, expected {ticket_ref} at an integration-owned tip"
+            )));
+        }
+        Ok(())
+    };
+    // Abort also moves refs and files, so check ownership before either step.
+    check_owner()?;
+    let git_dir = git(ticket_wt, &["rev-parse", "--absolute-git-dir"])?;
+    if Path::new(&git_dir).join("MERGE_HEAD").exists() {
+        git(
+            ticket_wt,
+            &["-c", "core.hooksPath=/dev/null", "merge", "--abort"],
+        )
+        .map_err(|error| recovery(format!("merge --abort failed: {error}")))?;
+    }
+    if !git(ticket_wt, &["status", "--porcelain"])?.is_empty() {
+        return Err(recovery("worktree has edits after the failed merge".into()));
+    }
+    check_owner()?;
+    git(
+        ticket_wt,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "reset",
+            "--hard",
+            original_head,
+        ],
+    )?;
+    Ok(())
+}
+
 /// Integrate pending units in ascending order and mark them only after success.
 pub fn integrate(
     ticket_wt: &Path,
@@ -107,6 +159,7 @@ pub fn integrate(
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
     let ticket_branch = git(ticket_wt, &["branch", "--show-current"])?;
+    let ticket_ref = format!("refs/heads/{ticket_branch}");
     let mut seen = HashSet::new();
     for (_, child) in &pending {
         if child.unit == 0
@@ -143,28 +196,55 @@ pub fn integrate(
     let mut units = Vec::new();
     let mut ranges = Vec::new();
     let mut indices = Vec::new();
+    let mut owned_heads = HashSet::from([original_head.clone()]);
+    let mut previous_head = original_head.clone();
     for (index, child) in pending {
         let range = format!("{}..{}", child.base_sha, child.branch);
         let tip = git(ticket_wt, &["rev-parse", &child.branch])?;
+        // Branch defaults can accumulate strategies/-X options or suppress the
+        // commit while still claiming ancestry. Pin transactional semantics;
+        // project attributes and their merge drivers remain in effect.
         if git(
             ticket_wt,
             &[
                 "-c",
                 "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                &format!("branch.{ticket_branch}.mergeOptions="),
                 "merge",
+                "--strategy=ort",
                 "--no-ff",
                 "--no-edit",
                 "--no-squash",
+                "--no-autostash",
+                "--no-verify",
                 "--commit",
                 &child.branch,
             ],
         )
-        .and_then(|_| git(ticket_wt, &["merge-base", "--is-ancestor", &tip, "HEAD"]))
+        .and_then(|_| {
+            let head = git(ticket_wt, &["rev-parse", "HEAD"])?;
+            // Only record a tip this invocation actually produced, never an
+            // unrelated commit written concurrently while merge was running.
+            if git(ticket_wt, &["symbolic-ref", "--quiet", "HEAD"])? != ticket_ref
+                || (head != previous_head
+                    && git(ticket_wt, &["rev-list", "--parents", "-1", &head])?
+                        != format!("{head} {previous_head} {tip}"))
+            {
+                return Err(ShepherdError::Runtime(anyhow::anyhow!(
+                    "HEAD changed during integration"
+                )));
+            }
+            owned_heads.insert(head.clone());
+            previous_head = head;
+            git(ticket_wt, &["merge-base", "--is-ancestor", &tip, "HEAD"])
+        })
         .is_err()
         {
             // A later unit must not leave earlier merges from this invocation.
-            let _ = git(ticket_wt, &["merge", "--abort"]);
-            git(ticket_wt, &["reset", "--hard", &original_head])?;
+            rollback_integration(ticket_wt, &ticket_ref, &original_head, &owned_heads)?;
             return Err(ShepherdError::Conflict {
                 unit: child.unit,
                 range,
