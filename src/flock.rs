@@ -103,7 +103,12 @@ pub fn reconcile(
                     .is_some_and(|info| matches!(info.agent_status.as_str(), "idle" | "done"));
             match &live {
                 Some(info) => {
-                    current.pane_id = Some(info.pane_id.clone());
+                    // Unknown delivery must retain the destination that was
+                    // actually used. Adopting a same-name replacement pane
+                    // would turn its later Working status into false evidence.
+                    if !current.prompt_delivery_uncertain() {
+                        current.pane_id = Some(info.pane_id.clone());
+                    }
                     current.status =
                         if info.agent_status == "blocked" || current.prompt_delivery_uncertain() {
                             AgentStatus::Blocked

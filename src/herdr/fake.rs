@@ -16,6 +16,7 @@ pub type StartObserver = Box<dyn Fn(&str) + Send>;
 pub struct FakeHerdr {
     pub on_start: RefCell<Option<StartObserver>>,
     pub on_prompt: RefCell<Option<StartObserver>>,
+    pub on_send_keys: RefCell<Option<StartObserver>>,
     pub workspaces: RefCell<Vec<Workspace>>,
     pub calls: RefCell<Vec<String>>,
     pub notify_error: Cell<bool>,
@@ -39,6 +40,7 @@ impl FakeHerdr {
         Self {
             on_start: RefCell::new(None),
             on_prompt: RefCell::new(None),
+            on_send_keys: RefCell::new(None),
             workspaces: RefCell::new(workspaces),
             calls: RefCell::new(Vec::new()),
             notify_error: Cell::new(false),
@@ -171,6 +173,9 @@ impl Herdr for FakeHerdr {
         self.calls
             .borrow_mut()
             .push(format!("send_keys {name} {keys:?}"));
+        if let Some(observer) = self.on_send_keys.borrow().as_ref() {
+            observer(name);
+        }
         Ok(())
     }
     fn read_visible(&self, name: &str) -> Result<String, ShepherdError> {

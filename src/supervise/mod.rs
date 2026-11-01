@@ -53,6 +53,10 @@ fn active(status: AgentStatus) -> bool {
     )
 }
 
+fn cancellable(rec: &AgentRecord) -> bool {
+    active(rec.status) && rec.report.is_none() && !rec.prompt_delivery_uncertain()
+}
+
 #[derive(Default, Debug, Serialize)]
 pub struct SweepReport {
     pub projects: usize,
@@ -74,6 +78,7 @@ pub fn observe(
         &mut snapshot,
         harness,
         crate::launch::now().parse().unwrap_or(0),
+        None,
     )?
     .0)
 }
@@ -83,6 +88,7 @@ fn observe_at(
     rec: &mut AgentRecord,
     harness: &dyn Harness,
     now: u64,
+    data: Option<&StoreData>,
 ) -> Result<(Option<Condition>, Option<AgentInfo>), ShepherdError> {
     let Some(info) = h.agent_get(&rec.name)? else {
         return Ok((
@@ -94,6 +100,17 @@ fn observe_at(
             None,
         ));
     };
+    let session = h.pane_session_ref(&info.pane_id)?;
+    // A name/status lookup alone cannot prove that this task is executing.
+    // Validate before forming a decision or replacing saved session evidence.
+    if rec.prompt_delivery_uncertain()
+        && (!owned_terminal(rec, &info)
+            || data.is_some_and(|data| !owned(data, rec, &info))
+            || !same_session(rec, session.as_deref()))
+    {
+        rec.status = AgentStatus::Blocked;
+        return Ok((Some(Condition::PromptDeliveryUncertain), Some(info)));
+    }
     let screen = h.read_visible(&rec.name)?;
     let mut previous = prior(rec);
     let hash = format!("{:x}", Sha256::digest(screen.as_bytes()));
@@ -132,7 +149,7 @@ fn observe_at(
         rec.nudges = 0;
         previous.last_nudge_at = None;
     }
-    if let Some(reference) = h.pane_session_ref(&info.pane_id)? {
+    if let Some(reference) = session {
         previous.session_ref = Some(reference);
     }
     previous.hash = hash;
@@ -163,8 +180,17 @@ fn observe_at(
     Ok((condition, Some(info)))
 }
 
-fn owned(data: &StoreData, rec: &AgentRecord, info: &AgentInfo) -> bool {
-    if info.name.as_deref() != Some(rec.name.as_str()) {
+fn same_session(rec: &AgentRecord, session: Option<&str>) -> bool {
+    prior(rec)
+        .session_ref
+        .as_deref()
+        .is_none_or(|expected| session == Some(expected))
+}
+
+fn owned_terminal(rec: &AgentRecord, info: &AgentInfo) -> bool {
+    if info.name.as_deref() != Some(rec.name.as_str())
+        || rec.pane_id.as_deref() != Some(info.pane_id.as_str())
+    {
         return false;
     }
     let Ok(root) = rec.worktree.canonicalize() else {
@@ -176,6 +202,16 @@ fn owned(data: &StoreData, rec: &AgentRecord, info: &AgentInfo) -> bool {
     if !cwd.starts_with(&root) {
         return false;
     }
+    true
+}
+
+fn owned(data: &StoreData, rec: &AgentRecord, info: &AgentInfo) -> bool {
+    if !owned_terminal(rec, info) {
+        return false;
+    }
+    let Ok(root) = rec.worktree.canonicalize() else {
+        return false;
+    };
     if rec.role == "lead" {
         return data
             .lead
@@ -308,7 +344,7 @@ pub fn apply(
     let Some(current) = data
         .agents
         .iter()
-        .find(|r| r.name == rec.name && active(r.status))
+        .find(|r| r.name == rec.name && active(r.status) && r.report.is_none())
     else {
         return Ok(());
     };
@@ -402,7 +438,16 @@ pub fn apply(
                 ctx.h.send_keys(&rec.name, &["esc".into()])?;
             }
             block(ctx, rec, BlockedReason::Policy, reason)?;
-            if in_worktree {
+            // Reports do not wait for terminal operation ownership. Escape
+            // may have raced the real report; do not close its terminal next.
+            if in_worktree
+                && ctx
+                    .store
+                    .read()?
+                    .agents
+                    .iter()
+                    .any(|a| a.name == rec.name && cancellable(a))
+            {
                 if let Some(tab) = &rec.tab_id {
                     ctx.h.close_tab(tab)?;
                 }
@@ -410,22 +455,42 @@ pub fn apply(
                     if let Some(a) = d
                         .agents
                         .iter_mut()
-                        .find(|a| a.name == rec.name && active(a.status))
+                        .find(|a| a.name == rec.name && cancellable(a))
                     {
                         a.status = AgentStatus::Retired;
                     }
                     Ok(())
                 })?;
             }
-            // Every sibling is validated independently; a moved pane is never
-            // controlled just because its ticket has been denied.
-            for sibling in data.agents.iter().filter(|a| {
+            // The snapshot only schedules siblings. Never wait on another
+            // agent while owning the primary: simultaneous denials must not
+            // deadlock, and busy delivery is not permission to cancel it.
+            for candidate in data.agents.iter().filter(|a| {
                 a.ticket == rec.ticket && a.name != rec.name && a.role != "lead" && active(a.status)
             }) {
+                let Some(_operation) =
+                    crate::flock::try_agent_operation(ctx.store, &candidate.name)?
+                else {
+                    continue;
+                };
+                let fresh = ctx.store.read()?;
+                let Some(sibling) = fresh.agents.iter().find(|a| {
+                    a.name == candidate.name
+                        && a.ticket == rec.ticket
+                        && a.role != "lead"
+                        && cancellable(a)
+                }) else {
+                    continue;
+                };
                 if let Some(info) = ctx.h.agent_get(&sibling.name)?
-                    && owned(&data, sibling, &info)
+                    && owned(&fresh, sibling, &info)
+                    && same_session(sibling, ctx.h.pane_session_ref(&info.pane_id)?.as_deref())
+                    && ctx.store.read()?.agents.iter().any(|a| a == sibling)
                 {
                     let _ = ctx.h.send_keys(&sibling.name, &["esc".into()]);
+                    if !ctx.store.read()?.agents.iter().any(|a| a == sibling) {
+                        continue;
+                    }
                     if let Some(tab) = &sibling.tab_id {
                         ctx.h.close_tab(tab)?;
                     }
@@ -433,7 +498,7 @@ pub fn apply(
                         if let Some(a) = d
                             .agents
                             .iter_mut()
-                            .find(|a| a.name == sibling.name && active(a.status))
+                            .find(|a| a.name == sibling.name && cancellable(a))
                         {
                             a.status = AgentStatus::Retired;
                         }
@@ -771,7 +836,7 @@ pub fn supervise_project(
                 .get(&rec.runner)
                 .ok_or_else(|| ShepherdError::Usage(format!("unknown runner {}", rec.runner)))?;
             let harness = harness_for(&runner.harness)?;
-            let (condition, live) = observe_at(h, &mut rec, &*harness, now)?;
+            let (condition, live) = observe_at(h, &mut rec, &*harness, now, Some(&data))?;
             if rec.status == AgentStatus::Starting && live.is_none() {
                 return Ok(0);
             }
@@ -1442,6 +1507,481 @@ mod tests {
                 .iter()
                 .any(|c| c.contains("send_keys") && c.contains("enter"))
         );
+    }
+
+    fn add_sibling(store: &Store, h: &FakeHerdr) -> AgentRecord {
+        let mut sibling = store.read().unwrap().agents[0].clone();
+        sibling.name = "sh-owned-coder-2".into();
+        sibling.pane_id = Some("w1:p2".into());
+        sibling.tab_id = Some("w1:t2".into());
+        store
+            .update(|data| {
+                data.agents.push(sibling.clone());
+                Ok(())
+            })
+            .unwrap();
+        let live = h.agent_records.borrow()[0].clone();
+        h.agent_records.borrow_mut().push(AgentInfo {
+            name: Some(sibling.name.clone()),
+            pane_id: sibling.pane_id.clone().unwrap(),
+            ..live
+        });
+        sibling
+    }
+
+    fn assert_no_terminal_mutation(h: &FakeHerdr, rec: &AgentRecord) {
+        assert!(
+            !h.calls.borrow().iter().any(|call| {
+                call.starts_with(&format!("send_keys {} ", rec.name))
+                    || call.starts_with(&format!("prompt_agent {} ", rec.name))
+                    || call.starts_with(&format!("start_agent {} ", rec.name))
+                    || call == &format!("resume_agent {}", rec.name)
+                    || rec
+                        .tab_id
+                        .as_ref()
+                        .is_some_and(|tab| call == &format!("close_tab {tab}"))
+            }),
+            "unexpected terminal mutation: {:?}",
+            h.calls.borrow()
+        );
+    }
+
+    #[test]
+    fn denial_rechecks_sibling_quarantine_ownership_and_operation() {
+        for case in [
+            "uncertain",
+            "outside",
+            "pane",
+            "session",
+            "busy",
+            "reported",
+            "retired",
+            "safe",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, cfg, h) = fixture(dir.path());
+            let primary = store.read().unwrap().agents[0].clone();
+            let sibling = add_sibling(&store, &h);
+            store
+                .update(|data| {
+                    match case {
+                        "uncertain" => data.agents[1].set_prompt_delivery_uncertain(true),
+                        "retired" => data.agents[1].status = AgentStatus::Retired,
+                        "session" => {
+                            let mut observation = prior(&data.agents[1]);
+                            observation.session_ref = Some("assigned-session".into());
+                            remember(&mut data.agents[1], &observation);
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            if case == "reported" {
+                crate::flock::store_report(&store, &sibling.name, r#"{"status":"completed","summary":"real sibling report","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+            }
+            if case == "outside" {
+                h.agent_records.borrow_mut()[1].cwd = Some(dir.path().into());
+            }
+            if case == "pane" {
+                h.agent_records.borrow_mut()[1].pane_id = "w1:repurposed".into();
+            }
+            if case == "session" {
+                h.pane_sessions
+                    .borrow_mut()
+                    .insert("w1:p2".into(), "different-session".into());
+            }
+            let _sibling_operation = (case == "busy").then(|| {
+                crate::flock::try_agent_operation(&store, &sibling.name)
+                    .unwrap()
+                    .unwrap()
+            });
+            let before = store.read().unwrap().agents[1].clone();
+            let _primary_operation = crate::flock::try_agent_operation(&store, &primary.name)
+                .unwrap()
+                .unwrap();
+            apply(
+                &ApplyContext {
+                    h: &h,
+                    store: &store,
+                    cfg: &cfg,
+                    state_dir: &dir.path().join("state"),
+                    now_s: 1,
+                },
+                &primary,
+                &Decision::Deny {
+                    reason: "fixture policy denial".into(),
+                },
+            )
+            .unwrap();
+            let data = store.read().unwrap();
+            assert_eq!(data.tickets[0].state, TicketState::Blocked, "{case}");
+            assert_eq!(data.tickets[0].blocked_reason, Some(BlockedReason::Policy));
+            assert_eq!(data.agents[0].status, AgentStatus::Retired);
+            if case == "safe" {
+                assert_eq!(data.agents[1].status, AgentStatus::Retired);
+                assert_eq!(
+                    h.calls
+                        .borrow()
+                        .iter()
+                        .filter(|c| *c == &format!("send_keys {} [\"esc\"]", sibling.name))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    h.calls
+                        .borrow()
+                        .iter()
+                        .filter(|c| *c == "close_tab w1:t2")
+                        .count(),
+                    1
+                );
+            } else {
+                assert_no_terminal_mutation(&h, &sibling);
+                assert_eq!(data.agents[1], before, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn denial_snapshot_cannot_cancel_newly_uncertain_or_finished_sibling() {
+        for case in [
+            "unknown-unaccepted",
+            "unknown-accepted",
+            "accepted",
+            "reported",
+            "retired",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, cfg, h) = fixture(dir.path());
+            let primary = store.read().unwrap().agents[0].clone();
+            let sibling = add_sibling(&store, &h);
+            let callback_store = store.clone();
+            let sibling_name = sibling.name.clone();
+            let primary_name = primary.name.clone();
+            *h.on_send_keys.borrow_mut() = Some(Box::new(move |name| {
+                if name != primary_name {
+                    return;
+                }
+                let _operation = crate::flock::try_agent_operation(&callback_store, &sibling_name)
+                    .unwrap()
+                    .unwrap();
+                match case {
+                    "reported" => {
+                        crate::flock::store_report(&callback_store, &sibling_name, r#"{"status":"completed","summary":"real report after denial snapshot","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+                    }
+                    "retired" => callback_store
+                        .update(|data| {
+                            data.agents[1].status = AgentStatus::Retired;
+                            Ok(())
+                        })
+                        .unwrap(),
+                    _ => {
+                        callback_store
+                            .update(|data| {
+                                data.agents[1].prompt_pending = true;
+                                Ok(())
+                            })
+                            .unwrap();
+                        let transport = FakeHerdr::new(vec![]);
+                        let accepted = case != "unknown-unaccepted";
+                        if case != "accepted" {
+                            transport.prompt_results.borrow_mut().push_back((
+                                accepted,
+                                Err(ShepherdError::HerdrCommand {
+                                    code: "timeout".into(),
+                                    message: "unknown acceptance".into(),
+                                }),
+                            ));
+                        }
+                        let result = crate::flock::deliver_pending_prompt(
+                            &transport,
+                            &callback_store,
+                            &sibling_name,
+                        );
+                        if case == "accepted" {
+                            assert!(result.unwrap());
+                        } else {
+                            assert!(result.unwrap_err().prompt_submission_uncertain());
+                        }
+                        assert_eq!(transport.calls.borrow().len(), 1);
+                        assert_eq!(
+                            transport.accepted_prompts.borrow().len(),
+                            usize::from(accepted)
+                        );
+                    }
+                }
+            }));
+            let _operation = crate::flock::try_agent_operation(&store, &primary.name)
+                .unwrap()
+                .unwrap();
+            apply(
+                &ApplyContext {
+                    h: &h,
+                    store: &store,
+                    cfg: &cfg,
+                    state_dir: &dir.path().join("state"),
+                    now_s: 1,
+                },
+                &primary,
+                &Decision::Deny {
+                    reason: "fixture policy denial".into(),
+                },
+            )
+            .unwrap();
+            let data = store.read().unwrap();
+            assert_eq!(data.tickets[0].state, TicketState::Blocked);
+            let current = &data.agents[1];
+            if case == "accepted" {
+                assert_eq!(current.status, AgentStatus::Retired);
+                assert_eq!(
+                    h.calls
+                        .borrow()
+                        .iter()
+                        .filter(|c| *c == "close_tab w1:t2")
+                        .count(),
+                    1
+                );
+            } else {
+                assert_no_terminal_mutation(&h, &sibling);
+                match case {
+                    "reported" => {
+                        assert_eq!(current.status, AgentStatus::Reported);
+                        assert_eq!(
+                            current.report.as_ref().unwrap().summary,
+                            "real report after denial snapshot"
+                        );
+                    }
+                    "retired" => assert_eq!(current.status, AgentStatus::Retired),
+                    _ => {
+                        assert_eq!(current.status, AgentStatus::Blocked);
+                        assert!(current.prompt_delivery_uncertain());
+                        assert!(!current.prompt_pending);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn denial_does_not_close_agent_that_reports_during_escape() {
+        for target_sibling in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, cfg, h) = fixture(dir.path());
+            let primary = store.read().unwrap().agents[0].clone();
+            let sibling = add_sibling(&store, &h);
+            let target = if target_sibling {
+                sibling
+            } else {
+                primary.clone()
+            };
+            let callback_store = store.clone();
+            let target_name = target.name.clone();
+            *h.on_send_keys.borrow_mut() = Some(Box::new(move |name| {
+                if name == target_name {
+                    crate::flock::store_report(&callback_store, name, r#"{"status":"completed","summary":"real report during escape","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+                }
+            }));
+            let _operation = crate::flock::try_agent_operation(&store, &primary.name)
+                .unwrap()
+                .unwrap();
+            apply(
+                &ApplyContext {
+                    h: &h,
+                    store: &store,
+                    cfg: &cfg,
+                    state_dir: &dir.path().join("state"),
+                    now_s: 1,
+                },
+                &primary,
+                &Decision::Deny {
+                    reason: "fixture policy denial".into(),
+                },
+            )
+            .unwrap();
+            let data = store.read().unwrap();
+            let current = data.agents.iter().find(|a| a.name == target.name).unwrap();
+            assert_eq!(current.status, AgentStatus::Reported);
+            assert_eq!(
+                current.report.as_ref().unwrap().summary,
+                "real report during escape"
+            );
+            assert!(
+                !h.calls
+                    .borrow()
+                    .iter()
+                    .any(|call| call == &format!("close_tab {}", target.tab_id.as_ref().unwrap())),
+                "reported terminal was closed: {:?}",
+                h.calls.borrow()
+            );
+            assert_eq!(data.tickets[0].state, TicketState::Blocked);
+        }
+    }
+
+    #[test]
+    fn simultaneous_denials_do_not_wait_on_each_others_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg, h) = fixture(dir.path());
+        add_sibling(&store, &h);
+        let records = store.read().unwrap().agents;
+        let live_records = h.agent_records.borrow().clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let calls = std::thread::scope(|scope| {
+            let threads: Vec<_> = records
+                .iter()
+                .map(|rec| {
+                    let store = &store;
+                    let cfg = &cfg;
+                    let live_records = live_records.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        let _operation = crate::flock::try_agent_operation(store, &rec.name)
+                            .unwrap()
+                            .unwrap();
+                        let h = FakeHerdr::new(vec![]);
+                        *h.agent_records.borrow_mut() = live_records;
+                        let name = rec.name.clone();
+                        *h.on_send_keys.borrow_mut() = Some(Box::new(move |target| {
+                            assert_eq!(target, name, "a busy sibling must not receive input");
+                            barrier.wait();
+                        }));
+                        apply(
+                            &ApplyContext {
+                                h: &h,
+                                store,
+                                cfg,
+                                state_dir: &store.root().join("fixture-state"),
+                                now_s: 1,
+                            },
+                            rec,
+                            &Decision::Deny {
+                                reason: "simultaneous fixture denial".into(),
+                            },
+                        )
+                        .unwrap();
+                        h.calls.into_inner()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .flat_map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for rec in &records {
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call.starts_with(&format!("send_keys {} ", rec.name)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| *call == &format!("close_tab {}", rec.tab_id.as_ref().unwrap()))
+                    .count(),
+                1
+            );
+        }
+        let data = store.read().unwrap();
+        assert!(
+            data.agents
+                .iter()
+                .all(|rec| rec.status == AgentStatus::Retired)
+        );
+        assert_eq!(data.tickets[0].state, TicketState::Blocked);
+    }
+
+    #[test]
+    fn unowned_working_cannot_release_quarantine() {
+        for mismatch in ["outside", "pane", "session", "missing-session", "ticket"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, cfg, h) = fixture(dir.path());
+            store
+                .update(|data| {
+                    let rec = &mut data.agents[0];
+                    rec.set_prompt_delivery_uncertain(true);
+                    let mut observation = prior(rec);
+                    observation.session_ref = Some("owned-session".into());
+                    remember(rec, &observation);
+                    if mismatch == "ticket" {
+                        data.tickets[0].worktree = Some(dir.path().into());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let original = store.read().unwrap().agents[0].clone();
+            h.agent_records.borrow_mut()[0].agent_status = "working".into();
+            let live_pane = if mismatch == "pane" {
+                "w1:other-pane"
+            } else {
+                "w1:p1"
+            };
+            h.agent_records.borrow_mut()[0].pane_id = live_pane.into();
+            h.pane_sessions.borrow_mut().insert(
+                live_pane.into(),
+                if mismatch == "session" {
+                    "other-session"
+                } else {
+                    "owned-session"
+                }
+                .into(),
+            );
+            if mismatch == "missing-session" {
+                h.pane_sessions.borrow_mut().clear();
+            }
+            if mismatch == "outside" {
+                h.agent_records.borrow_mut()[0].cwd = Some(dir.path().into());
+            }
+            let harness = harness_for("codex").unwrap();
+            if mismatch != "ticket" {
+                assert_eq!(
+                    observe(&h, &original, &*harness).unwrap(),
+                    Some(Condition::PromptDeliveryUncertain),
+                    "{mismatch}"
+                );
+            }
+            for now in [1, 1000] {
+                let sweep =
+                    supervise_project(&h, &store, &cfg, &dir.path().join("state"), now).unwrap();
+                assert!(sweep.errors.is_empty(), "{sweep:?}");
+                let current = store.read().unwrap().agents[0].clone();
+                assert!(current.prompt_delivery_uncertain(), "{mismatch}");
+                assert_eq!(current.status, AgentStatus::Blocked);
+                assert_eq!(current.pane_id, original.pane_id);
+                assert_eq!(prior(&current).session_ref, prior(&original).session_ref);
+                assert_eq!(current.last_progress_at, original.last_progress_at);
+                assert_no_terminal_mutation(&h, &current);
+            }
+            h.agent_records.borrow_mut()[0].cwd = Some(original.worktree.clone());
+            h.agent_records.borrow_mut()[0].pane_id = original.pane_id.clone().unwrap();
+            h.pane_sessions
+                .borrow_mut()
+                .insert("w1:p1".into(), "owned-session".into());
+            store
+                .update(|data| {
+                    data.tickets[0].worktree = Some(original.worktree.clone());
+                    Ok(())
+                })
+                .unwrap();
+            h.visible_cache
+                .borrow_mut()
+                .insert(original.name.clone(), "owned task progress".into());
+            assert!(matches!(
+                observe(&h, &original, &*harness).unwrap(),
+                Some(Condition::Stalled { .. })
+            ));
+            let sweep =
+                supervise_project(&h, &store, &cfg, &dir.path().join("state"), 1001).unwrap();
+            assert!(sweep.errors.is_empty(), "{sweep:?}");
+            let current = store.read().unwrap().agents[0].clone();
+            assert!(!current.prompt_delivery_uncertain());
+            assert_eq!(current.status, AgentStatus::Working);
+            assert_eq!(current.last_progress_at, "1001");
+            assert!(!current.prompt_pending);
+            assert_no_terminal_mutation(&h, &current);
+        }
     }
 
     #[test]
