@@ -17,10 +17,12 @@ pub struct FakeHerdr {
     pub on_start: RefCell<Option<StartObserver>>,
     pub on_prompt: RefCell<Option<StartObserver>>,
     pub on_send_keys: RefCell<Option<StartObserver>>,
+    pub on_get: RefCell<Option<StartObserver>>,
     pub workspaces: RefCell<Vec<Workspace>>,
     pub calls: RefCell<Vec<String>>,
     pub notify_error: Cell<bool>,
     pub agent_records: RefCell<Vec<AgentInfo>>,
+    pub agent_get_results: RefCell<VecDeque<Option<AgentInfo>>>,
     pub start_results: RefCell<VecDeque<AgentStart>>,
     /// Script transport outcomes independently of application acceptance.
     pub prompt_results: RefCell<VecDeque<(bool, Result<(), ShepherdError>)>>,
@@ -41,10 +43,12 @@ impl FakeHerdr {
             on_start: RefCell::new(None),
             on_prompt: RefCell::new(None),
             on_send_keys: RefCell::new(None),
+            on_get: RefCell::new(None),
             workspaces: RefCell::new(workspaces),
             calls: RefCell::new(Vec::new()),
             notify_error: Cell::new(false),
             agent_records: RefCell::new(Vec::new()),
+            agent_get_results: RefCell::new(VecDeque::new()),
             start_results: RefCell::new(VecDeque::new()),
             prompt_results: RefCell::new(VecDeque::new()),
             accepted_prompts: RefCell::new(Vec::new()),
@@ -71,6 +75,9 @@ impl Herdr for FakeHerdr {
             .borrow_mut()
             .push(format!("create_tab {ws} {label} {}", cwd.display()));
         let sequence = self.calls.borrow().len();
+        self.pane_cwds
+            .borrow_mut()
+            .insert(format!("{ws}:p{sequence}"), cwd.into());
         Ok((format!("{ws}:t{sequence}"), format!("{ws}:p{sequence}")))
     }
     fn create_worktree(
@@ -127,7 +134,7 @@ impl Herdr for FakeHerdr {
                 "blocked"
             }
             .into(),
-            cwd: None,
+            cwd: self.pane_cwds.borrow().get(pane).cloned(),
             pane_id: pane.into(),
             workspace_id: None,
         });
@@ -135,6 +142,23 @@ impl Herdr for FakeHerdr {
             observer(name);
         }
         Ok(result)
+    }
+    fn agent_get(&self, name: &str) -> Result<Option<AgentInfo>, ShepherdError> {
+        let info = self
+            .agent_get_results
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or_else(|| {
+                self.agent_records
+                    .borrow()
+                    .iter()
+                    .find(|agent| agent.name.as_deref() == Some(name))
+                    .cloned()
+            });
+        if let Some(observer) = self.on_get.borrow().as_ref() {
+            observer(name);
+        }
+        Ok(info)
     }
     fn prompt_agent(
         &self,

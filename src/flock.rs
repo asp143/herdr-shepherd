@@ -1,3 +1,6 @@
+pub(crate) mod automatic;
+pub use automatic::retire as retire_automatically;
+
 use crate::{error::ShepherdError, store::Report};
 
 pub fn validate_report(text: &str) -> Result<Report, ShepherdError> {
@@ -45,6 +48,7 @@ pub fn store_report(
         agent.status = AgentStatus::Reported;
         agent.prompt_pending = false;
         agent.set_prompt_delivery_uncertain(false);
+        agent.set_prompt_claim(None);
         agent.report = Some(report.clone());
         let rec = agent.clone();
         if let Some(ticket) = data.tickets.iter_mut().find(|t| t.id == rec.ticket) {
@@ -88,13 +92,46 @@ pub fn reconcile(
         let Some(_operation) = try_agent_operation(store, &rec.name)? else {
             continue;
         };
+        // The outer snapshot only schedules recovery. Reports and operation
+        // completion may have changed it before this lock was acquired.
+        let Some(rec) = store.read()?.agents.into_iter().find(|a| {
+            a.name == rec.name
+                && matches!(
+                    a.status,
+                    AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
+                )
+                && a.report.is_none()
+        }) else {
+            continue;
+        };
         let live = h.agent_get(&rec.name)?;
+        let session = live
+            .as_ref()
+            .map(|info| h.pane_session_ref(&info.pane_id))
+            .transpose()?
+            .flatten();
+        let fresh = store.read()?;
+        if !fresh.agents.contains(&rec) {
+            continue;
+        }
+        if rec.prompt_pending
+            && live.as_ref().is_some_and(|info| {
+                !crate::supervise::owned(&fresh, &rec, info)
+                    || !crate::supervise::same_session(&rec, session.as_deref())
+            })
+        {
+            store.update(|data| {
+                if let Some(current) = data.agents.iter_mut().find(|a| **a == rec) {
+                    current.status = AgentStatus::Blocked;
+                }
+                Ok(())
+            })?;
+            return Err(ShepherdError::PolicyDenied(
+                "recovered agent is outside its reserved recipient or project".into(),
+            ));
+        }
         let send_pending = store.update(|data| {
-            let Some(current) = data
-                .agents
-                .iter_mut()
-                .find(|r| r.name == rec.name && r.status == rec.status)
-            else {
+            let Some(current) = data.agents.iter_mut().find(|r| **r == rec) else {
                 return Ok(false);
             };
             let send_pending = current.prompt_pending
@@ -106,7 +143,7 @@ pub fn reconcile(
                     // Unknown delivery must retain the destination that was
                     // actually used. Adopting a same-name replacement pane
                     // would turn its later Working status into false evidence.
-                    if !current.prompt_delivery_uncertain() {
+                    if !current.prompt_delivery_uncertain() && !current.prompt_pending {
                         current.pane_id = Some(info.pane_id.clone());
                     }
                     current.status =
@@ -146,18 +183,18 @@ pub fn reconcile(
             Ok(send_pending)
         })?;
         if send_pending {
-            let inside = live
-                .as_ref()
-                .and_then(|i| i.cwd.as_ref())
-                .and_then(|p| p.canonicalize().ok())
-                .zip(rec.worktree.canonicalize().ok())
-                .is_some_and(|(cwd, root)| cwd.starts_with(root));
-            let delivery = if inside {
+            let current = store
+                .read()?
+                .agents
+                .into_iter()
+                .find(|a| a.name == rec.name);
+            let delivery = if let Some(current) = current
+                && automatic::recipient(h, store, &current, false)?
+                    .is_some_and(|info| matches!(info.agent_status.as_str(), "idle" | "done"))
+            {
                 deliver_pending_prompt(h, store, &rec.name).map(|_| ())
             } else {
-                Err(ShepherdError::PolicyDenied(
-                    "recovered agent is outside its worktree".into(),
-                ))
+                Ok(())
             };
             if let Err(error) = delivery
                 && !error.prompt_submission_uncertain()
@@ -188,41 +225,14 @@ pub fn ping(h: &dyn crate::herdr::Herdr, store: &crate::store::Store, text: &str
         .chars()
         .take(160)
         .collect();
-    let delivered = (|| -> Result<bool, ShepherdError> {
-        let Some(lead) = store.read()?.lead else {
-            return Ok(false);
-        };
-        let Some(_operation) = try_agent_operation(store, &lead.agent_name)? else {
-            return Ok(false);
-        };
-        if store
-            .read()?
-            .agents
-            .iter()
-            .any(|agent| agent.name == lead.agent_name && agent.prompt_delivery_uncertain())
-        {
-            return Ok(false);
-        }
-        let Some(live) = h.agent_get(&lead.agent_name)? else {
-            return Ok(false);
-        };
-        if matches!(
-            live.agent_status.as_str(),
-            "blocked" | "working" | "unknown"
-        ) {
-            return Ok(false);
-        }
-        h.prompt_agent(&lead.agent_name, &text, false)?;
-        Ok(true)
-    })()
-    .unwrap_or(false);
-    if !delivered
-        && let Err(error) = store.update(|data| {
+    if let Err(error) = store
+        .update(|data| {
             data.pending_pings.push(text);
             Ok(())
         })
+        .and_then(|_| crate::lead::flush_pings(h, store).map(|_| ()))
     {
-        eprintln!("shepherd: queue lead ping: {error}");
+        eprintln!("shepherd: queue/deliver lead ping: {error}");
     }
 }
 
@@ -380,53 +390,7 @@ pub fn deliver_pending_prompt(
     }) else {
         return Ok(false);
     };
-    let task = current.task.clone();
-    let claimed = store.update(|data| {
-        let Some(current) = data.agents.iter_mut().find(|a| {
-            a.name == name
-                && a.prompt_pending
-                && a.report.is_none()
-                && matches!(
-                    a.status,
-                    AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
-                )
-        }) else {
-            return Ok(false);
-        };
-        current.prompt_pending = false;
-        current.status = AgentStatus::Blocked;
-        current.set_prompt_delivery_uncertain(true);
-        Ok(true)
-    })?;
-    if !claimed {
-        return Ok(false);
-    }
-    let delivery = h
-        .prompt_agent(name, &task, true)
-        .map_err(ShepherdError::into_prompt_error);
-    store.update(|data| {
-        if let Some(current) = data.agents.iter_mut().find(|a| {
-            a.name == name
-                && a.report.is_none()
-                && matches!(
-                    a.status,
-                    AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
-                )
-        }) {
-            let uncertain = delivery
-                .as_ref()
-                .is_err_and(|error| error.prompt_submission_uncertain());
-            current.prompt_pending = delivery.is_err() && !uncertain;
-            current.status = if delivery.is_ok() {
-                AgentStatus::Working
-            } else {
-                AgentStatus::Blocked
-            };
-            current.set_prompt_delivery_uncertain(uncertain);
-        }
-        Ok(())
-    })?;
-    delivery.map(|_| true)
+    automatic::dispatch(h, store, current, automatic::Prompt::Initial)
 }
 
 #[cfg(test)]
@@ -456,6 +420,8 @@ mod tests {
                 data.tickets.push(Ticket {
                     id: "T-1".into(),
                     state: TicketState::Building,
+                    worktree: Some(rec.worktree.clone()),
+                    workspace_id: Some("w1".into()),
                     ..Ticket::default()
                 });
                 data.agents.push(rec.clone());
@@ -546,6 +512,78 @@ mod tests {
                 "completed operation remained locked by inherited fd"
             );
         });
+    }
+
+    #[test]
+    fn automatic_pending_recovery_keeps_reserved_recipient_identity() {
+        for mismatch in [
+            "pane",
+            "session",
+            "workspace",
+            "project",
+            "owner-during-get",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = crate::store::Store::open(&dir.path().join("state"), dir.path()).unwrap();
+            let original = stored_agent(&store);
+            store
+                .update(|data| {
+                    data.agents[0].prompt_pending = true;
+                    data.agents[0].status = crate::store::AgentStatus::Starting;
+                    data.agents[0].observed = Some(r#"{"session_ref":"saved"}"#.into());
+                    data.tickets[0].worktree = Some(original.worktree.clone());
+                    data.tickets[0].workspace_id = Some("w1".into());
+                    if mismatch == "project" {
+                        data.tickets[0].worktree = None;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let h = crate::herdr::fake::FakeHerdr::new(vec![]);
+            let pane = if mismatch == "pane" { "other" } else { "p1" };
+            h.agent_records.borrow_mut().push(crate::herdr::AgentInfo {
+                name: Some(original.name),
+                agent: "codex".into(),
+                agent_status: "idle".into(),
+                cwd: Some(original.worktree),
+                pane_id: pane.into(),
+                workspace_id: Some(
+                    if mismatch == "workspace" {
+                        "other"
+                    } else {
+                        "w1"
+                    }
+                    .into(),
+                ),
+            });
+            h.pane_sessions.borrow_mut().insert(
+                pane.into(),
+                if mismatch == "session" {
+                    "other"
+                } else {
+                    "saved"
+                }
+                .into(),
+            );
+            if mismatch == "owner-during-get" {
+                let callback_store = store.clone();
+                *h.on_get.borrow_mut() = Some(Box::new(move |_| {
+                    callback_store
+                        .update(|data| {
+                            data.tickets[0].workspace_id = Some("other".into());
+                            Ok(())
+                        })
+                        .unwrap();
+                }));
+            }
+            for _ in 0..2 {
+                let _ = reconcile(&h, &store);
+            }
+            let rec = store.read().unwrap().agents[0].clone();
+            assert!(rec.prompt_pending, "{mismatch}");
+            assert_eq!(rec.pane_id.as_deref(), Some("p1"));
+            assert!(h.accepted_prompts.borrow().is_empty(), "{mismatch}");
+        }
     }
 
     #[test]

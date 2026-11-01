@@ -30,6 +30,7 @@ struct Observation {
     actions: Vec<String>,
     answered_hash: Option<String>,
     prompt_delivery_uncertain: bool,
+    prompt_claim: Option<crate::store::PromptClaim>,
 }
 fn prior(rec: &AgentRecord) -> Observation {
     let mut observation: Observation = rec
@@ -111,6 +112,14 @@ fn observe_at(
         rec.status = AgentStatus::Blocked;
         return Ok((Some(Condition::PromptDeliveryUncertain), Some(info)));
     }
+    if rec.prompt_delivery_uncertain()
+        && rec
+            .prompt_claim()
+            .is_some_and(|claim| claim.kind != "initial")
+    {
+        rec.status = AgentStatus::Blocked;
+        return Ok((Some(Condition::PromptDeliveryUncertain), Some(info)));
+    }
     let screen = h.read_visible(&rec.name)?;
     let mut previous = prior(rec);
     let hash = format!("{:x}", Sha256::digest(screen.as_bytes()));
@@ -157,6 +166,7 @@ fn observe_at(
     let elapsed = now.saturating_sub(previous.condition_since);
     if status == "working" {
         previous.prompt_delivery_uncertain = false;
+        previous.prompt_claim = None;
     }
     let condition = if previous.prompt_delivery_uncertain {
         rec.status = AgentStatus::Blocked;
@@ -180,14 +190,14 @@ fn observe_at(
     Ok((condition, Some(info)))
 }
 
-fn same_session(rec: &AgentRecord, session: Option<&str>) -> bool {
+pub(crate) fn same_session(rec: &AgentRecord, session: Option<&str>) -> bool {
     prior(rec)
         .session_ref
         .as_deref()
         .is_none_or(|expected| session == Some(expected))
 }
 
-fn owned_terminal(rec: &AgentRecord, info: &AgentInfo) -> bool {
+pub(crate) fn owned_terminal(rec: &AgentRecord, info: &AgentInfo) -> bool {
     if info.name.as_deref() != Some(rec.name.as_str())
         || rec.pane_id.as_deref() != Some(info.pane_id.as_str())
     {
@@ -205,7 +215,7 @@ fn owned_terminal(rec: &AgentRecord, info: &AgentInfo) -> bool {
     true
 }
 
-fn owned(data: &StoreData, rec: &AgentRecord, info: &AgentInfo) -> bool {
+pub(crate) fn owned(data: &StoreData, rec: &AgentRecord, info: &AgentInfo) -> bool {
     if !owned_terminal(rec, info) {
         return false;
     }
@@ -213,26 +223,37 @@ fn owned(data: &StoreData, rec: &AgentRecord, info: &AgentInfo) -> bool {
         return false;
     };
     if rec.role == "lead" {
-        return data
-            .lead
-            .as_ref()
-            .is_some_and(|lead| lead.agent_name == rec.name)
-            && data.project_root.canonicalize().is_ok_and(|p| p == root);
+        return data.lead.as_ref().is_some_and(|lead| {
+            lead.agent_name == rec.name
+                && lead.pane_id == rec.pane_id
+                && info
+                    .workspace_id
+                    .as_deref()
+                    .is_none_or(|workspace| lead.workspace_id.as_deref() == Some(workspace))
+        }) && data.project_root.canonicalize().is_ok_and(|p| p == root);
     }
     data.tickets
         .iter()
         .find(|t| t.id == rec.ticket)
         .is_some_and(|ticket| {
-            ticket
+            let workspace = if ticket
                 .worktree
                 .as_ref()
-                .and_then(|p| p.canonicalize().ok())
-                .as_ref()
-                == Some(&root)
-                || ticket
-                    .children
-                    .iter()
-                    .any(|child| child.path.canonicalize().is_ok_and(|p| p == root))
+                .is_some_and(|p| p.canonicalize().is_ok_and(|p| p == root))
+            {
+                ticket.workspace_id.as_deref()
+            } else if let Some(child) = ticket
+                .children
+                .iter()
+                .find(|child| child.path.canonicalize().is_ok_and(|p| p == root))
+            {
+                Some(child.workspace_id.as_str())
+            } else {
+                return false;
+            };
+            info.workspace_id
+                .as_deref()
+                .is_none_or(|observed| workspace == Some(observed))
         })
 }
 
@@ -246,8 +267,30 @@ pub struct ApplyContext<'a> {
     pub now_s: u64,
 }
 
-fn save_observation(store: &Store, rec: &AgentRecord) -> Result<(), ShepherdError> {
+fn save_observation(
+    store: &Store,
+    rec: &AgentRecord,
+    live: Option<&AgentInfo>,
+) -> Result<(), ShepherdError> {
     store.update(|data| {
+        // Ticket/lead ownership can change while terminal observation runs.
+        // Validate initial-task acceptance against the state being committed,
+        // not the sweep's earlier project snapshot. Followups need their own
+        // acknowledgement or a real report; an earlier Working turn is no proof.
+        if let Some(current) = data
+            .agents
+            .iter()
+            .find(|a| a.name == rec.name && active(a.status))
+            && current.prompt_delivery_uncertain()
+            && !rec.prompt_delivery_uncertain()
+            && (current
+                .prompt_claim()
+                .is_some_and(|claim| claim.kind != "initial")
+                || live.is_none_or(|info| !owned(data, current, info))
+                || !same_session(current, prior(rec).session_ref.as_deref()))
+        {
+            return Ok(());
+        }
         if let Some(current) = data
             .agents
             .iter_mut()
@@ -355,10 +398,9 @@ pub fn apply(
     {
         return Ok(());
     }
-    let live = ctx.h.agent_get(&rec.name)?;
-    let in_worktree = live
-        .as_ref()
-        .is_some_and(|info| owned(&data, current, info));
+    let rec = current;
+    let live = crate::flock::automatic::recipient(ctx.h, ctx.store, rec, false)?;
+    let in_worktree = live.is_some();
     match decision {
         Decision::SendKeys { rule, keys } => {
             if !in_worktree
@@ -413,18 +455,21 @@ pub fn apply(
             }
             // Persist the input intent first. An interruption may require a
             // lead to retry, but must never auto-answer a later dialog twice.
-            ctx.store.update(|d| {
-                if let Some(a) = d
-                    .agents
-                    .iter_mut()
-                    .find(|a| a.name == rec.name && active(a.status))
-                {
-                    let mut observation = prior(a);
-                    observation.answered_hash = Some(hash);
-                    remember(a, &observation);
-                }
-                Ok(())
+            let claimed = ctx.store.update(|d| {
+                let Some(a) = d.agents.iter_mut().find(|a| *a == rec) else {
+                    return Ok(None);
+                };
+                let mut observation = prior(a);
+                observation.answered_hash = Some(hash);
+                remember(a, &observation);
+                Ok(Some(a.clone()))
             })?;
+            let Some(claimed) = claimed else {
+                return Ok(());
+            };
+            if crate::flock::automatic::recipient(ctx.h, ctx.store, &claimed, false)?.is_none() {
+                return Ok(());
+            }
             ctx.h.send_keys(&rec.name, keys)?;
             hooks::emit(
                 ctx.cfg,
@@ -440,13 +485,16 @@ pub fn apply(
             block(ctx, rec, BlockedReason::Policy, reason)?;
             // Reports do not wait for terminal operation ownership. Escape
             // may have raced the real report; do not close its terminal next.
+            let fresh = ctx.store.read()?.agents.into_iter().find(|a| {
+                a.name == rec.name
+                    && cancellable(a)
+                    && a.pane_id == rec.pane_id
+                    && a.worktree == rec.worktree
+                    && a.runner == rec.runner
+            });
             if in_worktree
-                && ctx
-                    .store
-                    .read()?
-                    .agents
-                    .iter()
-                    .any(|a| a.name == rec.name && cancellable(a))
+                && let Some(fresh) = fresh
+                && crate::flock::automatic::recipient(ctx.h, ctx.store, &fresh, false)?.is_some()
             {
                 if let Some(tab) = &rec.tab_id {
                     ctx.h.close_tab(tab)?;
@@ -517,20 +565,21 @@ pub fn apply(
             } else {
                 "Report one status line describing progress and any blocker; continue the assigned task."
             };
-            ctx.h.prompt_agent(&rec.name, text, false)?;
-            ctx.store.update(|d| {
-                if let Some(a) = d
-                    .agents
-                    .iter_mut()
-                    .find(|a| a.name == rec.name && active(a.status))
-                {
-                    a.nudges = a.nudges.saturating_add(1);
-                    let mut obs = prior(a);
-                    obs.last_nudge_at = Some(ctx.now_s);
-                    remember(a, &obs);
-                }
-                Ok(())
-            })?;
+            crate::flock::automatic::dispatch(
+                ctx.h,
+                ctx.store,
+                current,
+                crate::flock::automatic::Prompt::Followup {
+                    text,
+                    kind: if matches!(decision, Decision::NudgeReport) {
+                        "nudge_report"
+                    } else {
+                        "nudge_status"
+                    },
+                    nudge_at: Some(ctx.now_s),
+                    queued: false,
+                },
+            )?;
         }
         Decision::Resume => resume(ctx, current)?,
         Decision::Respawn => respawn(ctx, current, &data, in_worktree)?,
@@ -589,7 +638,10 @@ fn resume(ctx: &ApplyContext<'_>, rec: &AgentRecord) -> Result<(), ShepherdError
         pane_id: pane.into(),
         workspace_id: None,
     };
-    if !owned(&data, rec, &own_info) || ctx.h.agents()?.iter().any(|a| a.pane_id == pane) {
+    if !owned(&data, rec, &own_info)
+        || !same_session(rec, ctx.h.pane_session_ref(pane)?.as_deref())
+        || ctx.h.agents()?.iter().any(|a| a.pane_id == pane)
+    {
         return block(
             ctx,
             rec,
@@ -605,16 +657,17 @@ fn resume(ctx: &ApplyContext<'_>, rec: &AgentRecord) -> Result<(), ShepherdError
         .get(&rec.runner)
         .ok_or_else(|| ShepherdError::Usage("unknown pinned runner".into()))?;
     let harness = harness_for(&runner.harness)?;
-    ctx.store.update(|data| {
-        let a = data
-            .agents
-            .iter_mut()
-            .find(|a| a.name == rec.name)
-            .expect("owned record");
+    let claimed = ctx.store.update(|data| {
+        let Some(a) = data.agents.iter_mut().find(|a| *a == rec) else {
+            return Ok(false);
+        };
         a.restarts = a.restarts.saturating_add(1);
         a.status = AgentStatus::Starting;
-        Ok(())
+        Ok(true)
     })?;
+    if !claimed {
+        return Ok(());
+    }
     let project = ctx.store.read()?.project_root;
     let result = ctx.h.start_agent(
         &rec.name,
@@ -698,29 +751,43 @@ fn respawn(
             "Provider fallback has no owned workspace",
         );
     };
+    if crate::flock::automatic::recipient(ctx.h, ctx.store, rec, false)?.is_none() {
+        return Ok(());
+    }
     if let Some(tab) = &rec.tab_id {
         ctx.h.close_tab(tab)?;
+    }
+    if !ctx.store.read()?.agents.contains(rec) {
+        return Ok(());
     }
     let label = child
         .filter(|child| child.unit > 1 && rec.role == "coder")
         .map(|child| format!("coder-{}", child.unit))
         .unwrap_or_else(|| rec.role.clone());
     let (tab, pane) = ctx.h.create_tab(workspace, &label, &rec.worktree)?;
-    ctx.store.update(|d| {
-        let a = d
-            .agents
-            .iter_mut()
-            .find(|a| a.name == rec.name)
-            .expect("owned record");
+    let replaced = ctx.store.update(|d| {
+        let Some(a) = d.agents.iter_mut().find(|a| *a == rec) else {
+            return Ok(false);
+        };
         a.runner = runner.name.clone();
         a.tab_id = Some(tab);
         a.pane_id = Some(pane.clone());
         a.status = AgentStatus::Starting;
         a.prompt_pending = true;
         a.nudges = 0;
+        // This pane starts a new task/session. Keep action history, but none
+        // of the predecessor terminal's session, screen or nudge evidence.
+        let observation = Observation {
+            actions: prior(a).actions,
+            ..Default::default()
+        };
+        remember(a, &observation);
         a.last_progress_at = ctx.now_s.to_string();
-        Ok(())
+        Ok(true)
     })?;
+    if !replaced {
+        return Ok(());
+    }
     let harness = harness_for(&runner.harness)?;
     let start = ctx.h.start_agent(
         &rec.name,
@@ -775,11 +842,10 @@ fn deliver_pending(h: &dyn Herdr, store: &Store, rec: &AgentRecord) -> Result<()
     if !rec.prompt_pending {
         return Ok(());
     }
-    let data = store.read()?;
-    let Some(info) = h.agent_get(&rec.name)? else {
+    let Some(info) = crate::flock::automatic::recipient(h, store, rec, false)? else {
         return Ok(());
     };
-    if !owned(&data, rec, &info) || !matches!(info.agent_status.as_str(), "idle" | "done") {
+    if !matches!(info.agent_status.as_str(), "idle" | "done") {
         return Ok(());
     }
     match crate::flock::deliver_pending_prompt(h, store, &rec.name) {
@@ -852,7 +918,7 @@ pub fn supervise_project(
                 default.as_deref(),
                 base,
             )?;
-            save_observation(store, &rec)?;
+            save_observation(store, &rec, live.as_ref())?;
             if let Some(condition) = condition {
                 let mut decision = decide(
                     &rec,
@@ -1289,7 +1355,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        save_observation(&store, &rec).unwrap();
+        save_observation(&store, &rec, None).unwrap();
         assert!(!store.read().unwrap().agents[0].prompt_pending);
     }
 
@@ -2177,6 +2243,291 @@ mod tests {
         );
     }
     #[test]
+    fn automatic_working_proof_rechecks_project_at_observation_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg, h) = fixture(dir.path());
+        store
+            .update(|data| {
+                data.agents[0].set_prompt_delivery_uncertain(true);
+                Ok(())
+            })
+            .unwrap();
+        h.agent_records.borrow_mut()[0].agent_status = "working".into();
+        let callback_store = store.clone();
+        *h.on_get.borrow_mut() = Some(Box::new(move |_| {
+            callback_store
+                .update(|data| {
+                    data.tickets[0].worktree = None;
+                    Ok(())
+                })
+                .unwrap();
+        }));
+        let sweep = supervise_project(&h, &store, &cfg, &dir.path().join("state"), 10).unwrap();
+        assert!(sweep.errors.is_empty(), "{sweep:?}");
+        let rec = store.read().unwrap().agents[0].clone();
+        assert!(rec.prompt_delivery_uncertain());
+        assert_eq!(rec.status, AgentStatus::Blocked);
+        assert_no_terminal_mutation(&h, &rec);
+    }
+
+    #[test]
+    fn automatic_nudges_claim_unknown_followups_before_dispatch() {
+        for decision in [Decision::NudgeReport, Decision::NudgeStatus] {
+            for outcome in [
+                "timeout",
+                "agent_prompt_stalled",
+                "local-deadline",
+                "malformed",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let (store, cfg, h) = fixture(dir.path());
+                h.agent_records.borrow_mut()[0].agent_status = "working".into();
+                let error = match outcome {
+                    "local-deadline" => {
+                        ShepherdError::Runtime(crate::proc::DeadlineExceeded.into())
+                    }
+                    "malformed" => anyhow::anyhow!("malformed acknowledgement").into(),
+                    code => ShepherdError::HerdrCommand {
+                        code: code.into(),
+                        message: "accepted without acknowledgement".into(),
+                    },
+                };
+                h.prompt_results.borrow_mut().push_back((true, Err(error)));
+                let callback_store = store.clone();
+                *h.on_prompt.borrow_mut() = Some(Box::new(move |_| {
+                    let rec = callback_store.read().unwrap().agents[0].clone();
+                    assert!(
+                        rec.prompt_delivery_uncertain(),
+                        "claim must precede dispatch"
+                    );
+                    assert_eq!(rec.nudges, 1);
+                    assert_eq!(prior(&rec).last_nudge_at, Some(10));
+                    let observation: serde_json::Value =
+                        serde_json::from_str(rec.observed.as_deref().unwrap()).unwrap();
+                    assert!(
+                        observation["prompt_claim"]["text"]
+                            .as_str()
+                            .unwrap()
+                            .to_ascii_lowercase()
+                            .contains("report")
+                    );
+                }));
+                let ctx = ApplyContext {
+                    h: &h,
+                    store: &store,
+                    cfg: &cfg,
+                    state_dir: &dir.path().join("state"),
+                    now_s: 10,
+                };
+                let rec = store.read().unwrap().agents[0].clone();
+                assert!(
+                    apply(&ctx, &rec, &decision)
+                        .unwrap_err()
+                        .prompt_submission_uncertain()
+                );
+                *h.on_prompt.borrow_mut() = None;
+                for now in [11, 1000] {
+                    apply(&ctx, &rec, &decision).unwrap();
+                    let sweep = supervise_project(&h, &store, &cfg, &dir.path().join("state"), now)
+                        .unwrap();
+                    assert!(sweep.errors.is_empty(), "{sweep:?}");
+                    let current = store.read().unwrap().agents[0].clone();
+                    assert!(
+                        current.prompt_delivery_uncertain(),
+                        "an earlier Working turn is not followup acceptance"
+                    );
+                    assert_eq!(current.nudges, 1);
+                    assert_eq!(prior(&current).last_nudge_at, Some(10));
+                }
+                assert_eq!(h.accepted_prompts.borrow().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_nudge_rejection_restores_clock_and_remains_recoverable() {
+        for decision in [Decision::NudgeReport, Decision::NudgeStatus] {
+            for code in ["agent_blocked", "agent_not_ready", "empty_agent_prompt"] {
+                let dir = tempfile::tempdir().unwrap();
+                let (store, cfg, h) = fixture(dir.path());
+                h.agent_records.borrow_mut()[0].agent_status = "idle".into();
+                h.prompt_results.borrow_mut().push_back((
+                    false,
+                    Err(ShepherdError::HerdrCommand {
+                        code: code.into(),
+                        message: "before input".into(),
+                    }),
+                ));
+                let ctx = ApplyContext {
+                    h: &h,
+                    store: &store,
+                    cfg: &cfg,
+                    state_dir: &dir.path().join("state"),
+                    now_s: 10,
+                };
+                let rec = store.read().unwrap().agents[0].clone();
+                assert!(
+                    !apply(&ctx, &rec, &decision)
+                        .unwrap_err()
+                        .prompt_submission_uncertain()
+                );
+                let current = store.read().unwrap().agents[0].clone();
+                assert!(!current.prompt_delivery_uncertain());
+                assert_eq!(current.prompt_claim(), None);
+                assert_eq!(current.nudges, 0);
+                assert_eq!(prior(&current).last_nudge_at, None);
+                apply(&ctx, &current, &decision).unwrap();
+                assert_eq!(h.accepted_prompts.borrow().len(), 1);
+                assert_eq!(store.read().unwrap().agents[0].nudges, 1);
+                assert_eq!(
+                    prior(&store.read().unwrap().agents[0]).last_nudge_at,
+                    Some(10)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_nudge_crash_and_real_report_preserve_ownership() {
+        for outcome in ["crash", "report", "retire"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, cfg, h) = fixture(dir.path());
+            h.agent_records.borrow_mut()[0].agent_status = "working".into();
+            let callback_store = store.clone();
+            *h.on_prompt.borrow_mut() = Some(Box::new(move |name| {
+                assert!(callback_store.read().unwrap().agents[0].prompt_delivery_uncertain());
+                match outcome {
+                    "crash" => panic!("fixture interruption after durable claim"),
+                    "report" => {
+                        crate::flock::store_report(&callback_store, name, r#"{"status":"completed","summary":"real report","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+                    }
+                    _ => {
+                        callback_store
+                            .update(|data| {
+                                data.agents[0].status = AgentStatus::Retired;
+                                Ok(())
+                            })
+                            .unwrap();
+                    }
+                }
+            }));
+            h.prompt_results.borrow_mut().push_back((
+                true,
+                Err(ShepherdError::HerdrCommand {
+                    code: "timeout".into(),
+                    message: "unknown".into(),
+                }),
+            ));
+            let rec = store.read().unwrap().agents[0].clone();
+            let ctx = ApplyContext {
+                h: &h,
+                store: &store,
+                cfg: &cfg,
+                state_dir: &dir.path().join("state"),
+                now_s: 10,
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                apply(&ctx, &rec, &Decision::NudgeReport)
+            }));
+            if outcome == "crash" {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().unwrap_err().prompt_submission_uncertain());
+            }
+            *h.on_prompt.borrow_mut() = None;
+            let current = store.read().unwrap().agents[0].clone();
+            if outcome == "report" {
+                assert_eq!(current.status, AgentStatus::Reported);
+                assert_eq!(current.report.unwrap().summary, "real report");
+            } else {
+                assert!(current.prompt_delivery_uncertain());
+                assert!(current.prompt_claim().unwrap().text.contains("JSON report"));
+            }
+            if outcome == "retire" {
+                assert_eq!(current.status, AgentStatus::Retired);
+            }
+            for now in [11, 1000] {
+                let sweep =
+                    supervise_project(&h, &store, &cfg, &dir.path().join("state"), now).unwrap();
+                assert!(sweep.errors.is_empty(), "{sweep:?}");
+            }
+            assert_eq!(
+                h.calls
+                    .borrow()
+                    .iter()
+                    .filter(|call| call.starts_with("prompt_agent "))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_fallback_forgets_only_predecessor_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mut cfg, h) = fixture(dir.path());
+        cfg.raw = "[roles.coder]\nrunners=['codex-sol-high','omp-astra']\n"
+            .parse()
+            .unwrap();
+        store
+            .update(|data| {
+                let rec = &mut data.agents[0];
+                rec.restarts = 2;
+                rec.observed = Some(r#"{"session_ref":"old-codex-session"}"#.into());
+                Ok(())
+            })
+            .unwrap();
+        h.pane_sessions
+            .borrow_mut()
+            .insert("w1:p1".into(), "old-codex-session".into());
+        h.prompt_results.borrow_mut().push_back((
+            true,
+            Err(ShepherdError::HerdrCommand {
+                code: "timeout".into(),
+                message: "accepted without acknowledgement".into(),
+            }),
+        ));
+        let rec = store.read().unwrap().agents[0].clone();
+        apply(
+            &ApplyContext {
+                h: &h,
+                store: &store,
+                cfg: &cfg,
+                state_dir: &dir.path().join("state"),
+                now_s: 1,
+            },
+            &rec,
+            &Decision::Respawn,
+        )
+        .unwrap();
+        let replacement = store.read().unwrap().agents[0].clone();
+        assert_eq!(replacement.restarts, 2);
+        assert!(replacement.prompt_delivery_uncertain());
+        assert_eq!(prior(&replacement).session_ref, None);
+        {
+            let live = &mut h.agent_records.borrow_mut()[0];
+            live.agent_status = "working".into();
+            live.cwd = Some(rec.worktree);
+            h.pane_sessions
+                .borrow_mut()
+                .insert(live.pane_id.clone(), "new-omp-session".into());
+        }
+        for now in [2, 3] {
+            let sweep =
+                supervise_project(&h, &store, &cfg, &dir.path().join("state"), now).unwrap();
+            assert!(sweep.errors.is_empty(), "{sweep:?}");
+            let current = store.read().unwrap().agents[0].clone();
+            assert!(!current.prompt_delivery_uncertain());
+            assert_eq!(current.status, AgentStatus::Working);
+            assert_eq!(
+                prior(&current).session_ref.as_deref(),
+                Some("new-omp-session")
+            );
+        }
+        assert_eq!(h.accepted_prompts.borrow().len(), 1);
+    }
+
+    #[test]
     fn provider_fallback_quarantines_unknown_delivery_and_stale_actions() {
         let dir = tempfile::tempdir().unwrap();
         let (store, mut cfg, h) = fixture(dir.path());
@@ -2650,6 +3001,7 @@ mod tests {
             })
             .unwrap();
         h.agent_records.borrow_mut()[0].cwd = Some(child);
+        h.agent_records.borrow_mut()[0].workspace_id = Some("w-child".into());
         let rec = store.read().unwrap().agents[0].clone();
         apply(
             &ApplyContext {

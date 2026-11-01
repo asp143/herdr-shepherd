@@ -217,6 +217,26 @@ fn forward_fixture_env(
     }
 }
 
+/// The launch operation owns a newly created tab before task submission.
+/// Reports remain independent of that operation and always win over fallback.
+fn current_launch(store: &Store, record: &AgentRecord) -> Result<bool, ShepherdError> {
+    Ok(store.read()?.agents.iter().any(|current| {
+        current == record
+            && current.report.is_none()
+            && current.status != AgentStatus::Retired
+            && !current.prompt_delivery_uncertain()
+    }))
+}
+
+fn owned_launch(h: &dyn Herdr, store: &Store, record: &AgentRecord) -> Result<bool, ShepherdError> {
+    let Some(info) = h.agent_get(&record.name)? else {
+        return Ok(false);
+    };
+    Ok(crate::supervise::owned_terminal(record, &info)
+        && crate::supervise::same_session(record, h.pane_session_ref(&info.pane_id)?.as_deref())
+        && current_launch(store, record)?)
+}
+
 fn launch_reserved(
     h: &dyn Herdr,
     store: &Store,
@@ -261,6 +281,9 @@ fn launch_reserved(
         forward_fixture_env(&fixture, &req.state_dir, &req.worktree, &mut env);
     }
     for runner in &req.runners {
+        if !current_launch(store, record)? {
+            return Ok(());
+        }
         let harness = crate::harness::harness_for(&runner.harness)?;
         record.task = req
             .prompt
@@ -280,11 +303,25 @@ fn launch_reserved(
             &harness.managed_args(harness.launch_args(runner), &req.state_dir)?,
             &env,
         )?;
+        if !current_launch(store, record)? {
+            return Ok(());
+        }
         if start == AgentStart::NotReady {
             let screen = h.read_visible(&record.name)?;
             if harness.provider_failure(&screen) {
+                // No task has crossed the prompt boundary, but verify the
+                // reserved recipient again before each destructive effect.
+                if !owned_launch(h, store, record)? {
+                    return Ok(());
+                }
                 h.send_keys(&record.name, &["esc".into()])?;
+                if !owned_launch(h, store, record)? {
+                    return Ok(());
+                }
                 h.close_tab(&tab)?;
+                if !current_launch(store, record)? {
+                    return Ok(());
+                }
                 record.status = AgentStatus::LaunchFailed;
                 record.observed = Some("provider_failure".into());
                 save(store, record)?;
@@ -664,6 +701,18 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let state = dir.path().join("state");
             let store = Store::open(&state, dir.path()).unwrap();
+            store
+                .update(|data| {
+                    data.tickets.push(crate::store::Ticket {
+                        id: "T-1".into(),
+                        state: crate::store::TicketState::Building,
+                        worktree: Some(dir.path().into()),
+                        workspace_id: Some("w1".into()),
+                        ..Default::default()
+                    });
+                    Ok(())
+                })
+                .unwrap();
             let h = FakeHerdr::new(vec![]);
             h.prompt_results.borrow_mut().push_back((
                 false,
@@ -843,6 +892,59 @@ mod tests {
             h.start_envs.borrow()[0]["HERDR_SHEPHERD_PROJECT_ROOT"],
             dir.path().to_string_lossy()
         );
+    }
+
+    #[test]
+    fn automatic_startup_fallback_preserves_report_and_retirement() {
+        for outcome in ["report", "retire", "uncertain"] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = dir.path().join("state");
+            let store = Store::open(&state, dir.path()).unwrap();
+            let h = FakeHerdr::new(vec![]);
+            h.start_results.borrow_mut().push_back(AgentStart::NotReady);
+            h.visible_screens
+                .borrow_mut()
+                .push_back("rate limit reached".into());
+            let callback_store = store.clone();
+            *h.on_start.borrow_mut() = Some(Box::new(move |name| match outcome {
+                "report" => {
+                    crate::flock::store_report(&callback_store, name, r#"{"status":"completed","summary":"real report","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+                }
+                "retire" => {
+                    callback_store
+                        .update(|data| {
+                            data.agents[0].status = AgentStatus::Retired;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                _ => {
+                    callback_store
+                        .update(|data| {
+                            data.agents[0].status = AgentStatus::Blocked;
+                            data.agents[0].set_prompt_delivery_uncertain(true);
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            }));
+            let record = launch(&h, &store, req(dir.path(), &state)).unwrap();
+            assert_eq!(record.runner, "codex-sol-high");
+            match outcome {
+                "report" => assert_eq!(record.report.unwrap().summary, "real report"),
+                "retire" => assert_eq!(record.status, AgentStatus::Retired),
+                _ => assert!(record.prompt_delivery_uncertain()),
+            }
+            assert_eq!(h.start_args.borrow().len(), 1);
+            assert!(
+                !h.calls
+                    .borrow()
+                    .iter()
+                    .any(|call| call.starts_with("send_keys ")
+                        || call.starts_with("close_tab ")
+                        || call.starts_with("prompt_agent "))
+            );
+        }
     }
 
     #[test]

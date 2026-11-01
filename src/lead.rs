@@ -142,15 +142,14 @@ pub fn flush_pings(h: &dyn Herdr, store: &Store) -> Result<usize, ShepherdError>
     let Some(_operation) = crate::flock::try_agent_operation(store, &lead.agent_name)? else {
         return Ok(0);
     };
-    if store
-        .read()?
-        .agents
-        .iter()
-        .any(|agent| agent.name == lead.agent_name && agent.prompt_delivery_uncertain())
-    {
+    let data = store.read()?;
+    if data.lead.as_ref() != Some(&lead) {
         return Ok(0);
     }
-    let Some(live) = h.agent_get(&lead.agent_name)? else {
+    let Some(rec) = data.agents.iter().find(|a| a.name == lead.agent_name) else {
+        return Ok(0);
+    };
+    let Some(live) = crate::flock::automatic::recipient(h, store, rec, false)? else {
         return Ok(0);
     };
     if !matches!(live.agent_status.as_str(), "idle" | "done") {
@@ -171,14 +170,18 @@ pub fn flush_pings(h: &dyn Herdr, store: &Store) -> Result<usize, ShepherdError>
     let Some(message) = store.read()?.pending_pings.first().cloned() else {
         return Ok(0);
     };
-    h.prompt_agent(&lead.agent_name, &message, false)?;
-    store.update(|data| {
-        if data.pending_pings.first() == Some(&message) {
-            data.pending_pings.remove(0);
-        }
-        Ok(())
-    })?;
-    Ok(1)
+    crate::flock::automatic::dispatch(
+        h,
+        store,
+        rec,
+        crate::flock::automatic::Prompt::Followup {
+            text: &message,
+            kind: "notification",
+            nudge_at: None,
+            queued: true,
+        },
+    )
+    .map(usize::from)
 }
 
 #[derive(Debug, Serialize)]
@@ -324,29 +327,8 @@ mod tests {
     #[test]
     fn ping_queued_when_lead_blocked() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("state"), dir.path()).unwrap();
-        let name = "sh-123abc-lead";
-        store
-            .update(|data| {
-                data.lead = Some(LeadRecord {
-                    agent_name: name.into(),
-                    tab_id: Some("w1:t1".into()),
-                    pane_id: Some("w1:p1".into()),
-                    started_at: "1".into(),
-                    workspace_id: Some("w1".into()),
-                });
-                Ok(())
-            })
-            .unwrap();
-        let h = crate::herdr::fake::FakeHerdr::new(vec![]);
-        h.agent_records.borrow_mut().push(crate::herdr::AgentInfo {
-            name: Some(name.into()),
-            agent: "codex".into(),
-            agent_status: "blocked".into(),
-            cwd: Some(dir.path().into()),
-            pane_id: "w1:p1".into(),
-            workspace_id: Some("w1".into()),
-        });
+        let (store, h) = notification_fixture(dir.path());
+        h.agent_records.borrow_mut()[0].agent_status = "blocked".into();
         ping_lead(&h, &store, &format!("T-1:\n{}", "report ".repeat(40)));
         let pending = store.read().unwrap().pending_pings;
         assert_eq!(pending.len(), 1);
@@ -369,6 +351,383 @@ mod tests {
                 .any(|call| call.starts_with("prompt_agent"))
         );
     }
+    fn notification_fixture(root: &Path) -> (Store, crate::herdr::fake::FakeHerdr) {
+        let store = Store::open(&root.join("state"), root).unwrap();
+        store
+            .update(|data| {
+                data.lead = Some(LeadRecord {
+                    agent_name: "lead".into(),
+                    pane_id: Some("w1:p1".into()),
+                    tab_id: Some("w1:t1".into()),
+                    workspace_id: Some("w1".into()),
+                    started_at: "0".into(),
+                });
+                data.agents.push(AgentRecord {
+                    name: "lead".into(),
+                    ticket: String::new(),
+                    role: "lead".into(),
+                    runner: "omp-astra".into(),
+                    status: AgentStatus::Working,
+                    pane_id: Some("w1:p1".into()),
+                    tab_id: Some("w1:t1".into()),
+                    worktree: root.into(),
+                    task: "coordinate".into(),
+                    report: None,
+                    observed: None,
+                    last_progress_at: "0".into(),
+                    nudges: 0,
+                    restarts: 0,
+                    prompt_pending: false,
+                });
+                Ok(())
+            })
+            .unwrap();
+        let h = crate::herdr::fake::FakeHerdr::new(vec![]);
+        h.agent_records.borrow_mut().push(crate::herdr::AgentInfo {
+            name: Some("lead".into()),
+            agent: "omp".into(),
+            agent_status: "idle".into(),
+            cwd: Some(root.into()),
+            pane_id: "w1:p1".into(),
+            workspace_id: Some("w1".into()),
+        });
+        (store, h)
+    }
+
+    #[test]
+    fn automatic_notifications_preserve_ambiguous_payload_without_replay() {
+        for direct_ping in [true, false] {
+            for code in ["timeout", "agent_prompt_stalled"] {
+                let dir = tempfile::tempdir().unwrap();
+                let (store, h) = notification_fixture(dir.path());
+                store
+                    .update(|data| {
+                        data.pending_pings.push("first".into());
+                        Ok(())
+                    })
+                    .unwrap();
+                let callback_store = store.clone();
+                *h.on_prompt.borrow_mut() = Some(Box::new(move |_| {
+                    let data = callback_store.read().unwrap();
+                    assert!(data.agents[0].prompt_delivery_uncertain());
+                    assert!(!data.pending_pings.contains(&"first".to_string()));
+                    callback_store
+                        .update(|data| {
+                            data.pending_pings.push("concurrent".into());
+                            Ok(())
+                        })
+                        .unwrap();
+                }));
+                h.prompt_results.borrow_mut().push_back((
+                    true,
+                    Err(ShepherdError::HerdrCommand {
+                        code: code.into(),
+                        message: "accepted without acknowledgement".into(),
+                    }),
+                ));
+                if direct_ping {
+                    ping_lead(&h, &store, "second");
+                } else {
+                    assert!(
+                        flush_pings(&h, &store)
+                            .unwrap_err()
+                            .prompt_submission_uncertain()
+                    );
+                }
+                *h.on_prompt.borrow_mut() = None;
+                for _ in 0..2 {
+                    assert_eq!(flush_pings(&h, &store).unwrap(), 0);
+                }
+                let data = store.read().unwrap();
+                assert!(data.agents[0].prompt_delivery_uncertain());
+                let observation: serde_json::Value =
+                    serde_json::from_str(data.agents[0].observed.as_deref().unwrap()).unwrap();
+                assert_eq!(observation["prompt_claim"]["text"], "first");
+                assert_eq!(
+                    data.pending_pings,
+                    if direct_ping {
+                        vec!["second", "concurrent"]
+                    } else {
+                        vec!["concurrent"]
+                    }
+                );
+                assert_eq!(h.accepted_prompts.borrow().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_notification_requires_latest_recipient_to_be_ready() {
+        for status in ["working", "blocked", "unknown"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, h) = notification_fixture(dir.path());
+            let idle = h.agent_records.borrow()[0].clone();
+            let mut busy = idle.clone();
+            busy.agent_status = status.into();
+            h.agent_get_results
+                .borrow_mut()
+                .extend([Some(idle), Some(busy)]);
+            ping_lead(&h, &store, "first");
+            assert!(h.accepted_prompts.borrow().is_empty(), "{status}");
+            assert_eq!(store.read().unwrap().pending_pings, ["first"]);
+        }
+    }
+
+    #[test]
+    fn automatic_notification_rechecks_lead_ownership_after_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, h) = notification_fixture(dir.path());
+        let callback_store = store.clone();
+        *h.on_get.borrow_mut() = Some(Box::new(move |_| {
+            callback_store
+                .update(|data| {
+                    data.lead.as_mut().unwrap().workspace_id = Some("other".into());
+                    Ok(())
+                })
+                .unwrap();
+        }));
+        ping_lead(&h, &store, "first");
+        assert!(h.accepted_prompts.borrow().is_empty());
+        assert_eq!(store.read().unwrap().pending_pings, ["first"]);
+    }
+
+    #[test]
+    fn automatic_notification_crash_keeps_claim_and_concurrent_enqueue() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, h) = notification_fixture(dir.path());
+        store
+            .update(|data| {
+                data.pending_pings.push("first".into());
+                Ok(())
+            })
+            .unwrap();
+        let callback_store = store.clone();
+        *h.on_prompt.borrow_mut() = Some(Box::new(move |_| {
+            callback_store
+                .update(|data| {
+                    data.pending_pings.push("concurrent".into());
+                    Ok(())
+                })
+                .unwrap();
+            panic!("fixture interruption during input");
+        }));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| flush_pings(&h, &store)))
+                .is_err()
+        );
+        *h.on_prompt.borrow_mut() = None;
+        for _ in 0..2 {
+            assert_eq!(flush_pings(&h, &store).unwrap(), 0);
+        }
+        let data = store.read().unwrap();
+        assert_eq!(data.agents[0].prompt_claim().unwrap().text, "first");
+        assert!(data.agents[0].prompt_delivery_uncertain());
+        assert_eq!(data.pending_pings, ["concurrent"]);
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("prompt_agent "))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn automatic_simultaneous_flushes_share_one_durable_claim() {
+        for uncertain in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, h) = notification_fixture(dir.path());
+            store
+                .update(|data| {
+                    data.pending_pings.push("first".into());
+                    Ok(())
+                })
+                .unwrap();
+            let info = h.agent_records.borrow()[0].clone();
+            let barrier = std::sync::Barrier::new(2);
+            let calls = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..2)
+                    .map(|_| {
+                        let info = info.clone();
+                        let store = &store;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            let h = crate::herdr::fake::FakeHerdr::new(vec![]);
+                            h.agent_records.borrow_mut().push(info);
+                            if uncertain {
+                                h.prompt_results.borrow_mut().push_back((
+                                    true,
+                                    Err(ShepherdError::HerdrCommand {
+                                        code: "timeout".into(),
+                                        message: "accepted without acknowledgement".into(),
+                                    }),
+                                ));
+                            }
+                            barrier.wait();
+                            let result = flush_pings(&h, store);
+                            if let Err(error) = result {
+                                assert!(error.prompt_submission_uncertain());
+                            }
+                            h.accepted_prompts.borrow().len()
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .sum::<usize>()
+            });
+            assert_eq!(calls, 1);
+            let data = store.read().unwrap();
+            assert_eq!(data.agents[0].prompt_delivery_uncertain(), uncertain);
+            assert!(data.pending_pings.is_empty());
+        }
+    }
+
+    #[test]
+    fn automatic_notification_rejection_and_success_preserve_queue_order() {
+        for code in ["agent_blocked", "agent_not_ready"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, h) = notification_fixture(dir.path());
+            store
+                .update(|data| {
+                    data.pending_pings.extend(["first".into(), "second".into()]);
+                    Ok(())
+                })
+                .unwrap();
+            let callback_store = store.clone();
+            *h.on_prompt.borrow_mut() = Some(Box::new(move |_| {
+                callback_store
+                    .update(|data| {
+                        data.pending_pings.push("concurrent".into());
+                        Ok(())
+                    })
+                    .unwrap();
+            }));
+            h.prompt_results.borrow_mut().push_back((
+                false,
+                Err(ShepherdError::HerdrCommand {
+                    code: code.into(),
+                    message: "before input".into(),
+                }),
+            ));
+            assert!(
+                !flush_pings(&h, &store)
+                    .unwrap_err()
+                    .prompt_submission_uncertain()
+            );
+            *h.on_prompt.borrow_mut() = None;
+            let data = store.read().unwrap();
+            assert_eq!(data.pending_pings, ["first", "second", "concurrent"]);
+            assert!(!data.agents[0].prompt_delivery_uncertain());
+            for expected in ["first", "second", "concurrent"] {
+                assert_eq!(store.read().unwrap().pending_pings[0], expected);
+                assert_eq!(flush_pings(&h, &store).unwrap(), 1);
+            }
+            assert_eq!(flush_pings(&h, &store).unwrap(), 0);
+            assert_eq!(h.accepted_prompts.borrow().len(), 3);
+        }
+    }
+
+    #[test]
+    fn automatic_notifications_skip_busy_and_unowned_recipients() {
+        for mismatch in [
+            "busy",
+            "pane",
+            "session",
+            "worktree",
+            "workspace",
+            "retired",
+            "reported",
+            "initial-pending",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, h) = notification_fixture(dir.path());
+            let _operation = (mismatch == "busy").then(|| {
+                crate::flock::try_agent_operation(&store, "lead")
+                    .unwrap()
+                    .unwrap()
+            });
+            match mismatch {
+                "pane" => h.agent_records.borrow_mut()[0].pane_id = "other".into(),
+                "worktree" => h.agent_records.borrow_mut()[0].cwd = None,
+                "workspace" => h.agent_records.borrow_mut()[0].workspace_id = Some("other".into()),
+                "session" => {
+                    store
+                        .update(|data| {
+                            data.agents[0].observed = Some(r#"{"session_ref":"saved"}"#.into());
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                "initial-pending" => {
+                    store
+                        .update(|data| {
+                            data.agents[0].prompt_pending = true;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                "retired" | "reported" => {
+                    store
+                        .update(|data| {
+                            data.agents[0].status = if mismatch == "retired" {
+                                AgentStatus::Retired
+                            } else {
+                                AgentStatus::Reported
+                            };
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                _ => {}
+            }
+            ping_lead(&h, &store, "first");
+            for _ in 0..2 {
+                assert_eq!(flush_pings(&h, &store).unwrap(), 0);
+            }
+            assert_eq!(store.read().unwrap().pending_pings, ["first"]);
+            assert!(h.accepted_prompts.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn automatic_resume_keeps_a_missing_uncertain_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, h) = notification_fixture(dir.path());
+        store
+            .update(|data| {
+                data.agents[0].set_prompt_delivery_uncertain(true);
+                Ok(())
+            })
+            .unwrap();
+        h.agent_records.borrow_mut().clear();
+        let cfg = crate::config::load(&dir.path().join("config"), None).unwrap();
+        assert!(
+            resume(
+                &h,
+                &store,
+                &cfg,
+                &LeadContext {
+                    bin: Path::new("fixture"),
+                    state_dir: &dir.path().join("state"),
+                    workspace_id: "w1"
+                }
+            )
+            .is_err()
+        );
+        assert!(store.read().unwrap().agents[0].prompt_delivery_uncertain());
+        assert!(
+            !h.calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("create_tab ")
+                    || call.starts_with("start_agent ")
+                    || call.starts_with("prompt_agent "))
+        );
+    }
+
     #[test]
     fn init_does_not_touch_herdr_config() {
         let Some(home) = std::env::var_os("SHEPHERD_INIT_TEST_HOME") else {

@@ -130,7 +130,36 @@ pub struct AgentRecord {
     pub prompt_pending: bool,
 }
 
+/// Persisted before automatic input. Follow-up acceptance cannot be inferred
+/// from Working because that may describe an earlier turn in the same session.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PromptClaim {
+    pub kind: String,
+    pub text: String,
+}
+
 impl AgentRecord {
+    pub fn prompt_claim(&self) -> Option<PromptClaim> {
+        self.observed
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .and_then(|value| serde_json::from_value(value.get("prompt_claim")?.clone()).ok())
+    }
+
+    pub(crate) fn set_prompt_claim(&mut self, claim: Option<PromptClaim>) {
+        let mut observation = self.observation();
+        observation["prompt_claim"] = serde_json::to_value(claim).expect("claim serializes");
+        self.observed = Some(observation.to_string());
+    }
+
+    fn observation(&self) -> serde_json::Value {
+        self.observed
+            .as_deref()
+            .and_then(|text| serde_json::from_str(text).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}))
+    }
+
     pub fn prompt_delivery_uncertain(&self) -> bool {
         self.observed.as_deref().is_some_and(|text| {
             // Older launchers wrote this literal before supervision observations.
@@ -145,12 +174,7 @@ impl AgentRecord {
     }
 
     pub fn set_prompt_delivery_uncertain(&mut self, uncertain: bool) {
-        let mut observation = self
-            .observed
-            .as_deref()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-            .filter(serde_json::Value::is_object)
-            .unwrap_or_else(|| serde_json::json!({}));
+        let mut observation = self.observation();
         observation["prompt_delivery_uncertain"] = uncertain.into();
         self.observed = Some(observation.to_string());
     }

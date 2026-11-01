@@ -491,6 +491,10 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
+            self.h
+                .pane_cwds
+                .borrow_mut()
+                .insert("w1:p2".into(), self.store.read().unwrap().project_root);
         }
     }
 
@@ -816,6 +820,48 @@ mod tests {
     }
 
     #[test]
+    fn automatic_ci_handoff_defers_unknown_or_busy_flock() {
+        for blocked_by in ["unknown", "busy"] {
+            let fixture = Fixture::new(TicketState::CiWait);
+            fixture.reported_agent();
+            fixture
+                .store
+                .update(|data| {
+                    data.agents[0].status = crate::store::AgentStatus::Blocked;
+                    if blocked_by == "unknown" {
+                        data.agents[0].set_prompt_delivery_uncertain(true);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let _operation = (blocked_by == "busy").then(|| {
+                crate::flock::try_agent_operation(&fixture.store, "qa")
+                    .unwrap()
+                    .unwrap()
+            });
+            for now in [100, 101] {
+                let gh = FakeBackend::new(vec![Ok(Some(Fixture::status(Checks::Passing)))]);
+                assert!(!fixture.tick(&gh, now).errors.is_empty());
+                assert_eq!(fixture.ticket().state, TicketState::CiWait);
+                assert_ne!(
+                    fixture.store.read().unwrap().agents[0].status,
+                    crate::store::AgentStatus::Retired
+                );
+            }
+            assert!(
+                !fixture
+                    .h
+                    .calls
+                    .borrow()
+                    .iter()
+                    .any(|call| call.starts_with("send_keys ")
+                        || call.starts_with("close_tab ")
+                        || call.starts_with("remove_worktree "))
+            );
+        }
+    }
+
+    #[test]
     fn ci_loop_cap_notifies() {
         let fixture = Fixture::new(TicketState::CiWait);
         fixture
@@ -945,6 +991,29 @@ mod tests {
     #[test]
     fn comment_during_ci_wait_deferred_then_pinged_once() {
         let fixture = Fixture::new(TicketState::CiWait);
+        fixture
+            .store
+            .update(|data| {
+                data.agents.push(crate::store::AgentRecord {
+                    name: "lead".into(),
+                    ticket: String::new(),
+                    role: "lead".into(),
+                    runner: "codex-sol-high".into(),
+                    status: crate::store::AgentStatus::Working,
+                    pane_id: Some("w1:p1".into()),
+                    tab_id: Some("w1:t1".into()),
+                    worktree: data.project_root.clone(),
+                    task: "coordinate".into(),
+                    report: None,
+                    observed: None,
+                    last_progress_at: "0".into(),
+                    nudges: 0,
+                    restarts: 0,
+                    prompt_pending: false,
+                });
+                Ok(())
+            })
+            .unwrap();
         let gh = FakeBackend::new(vec![
             Ok(Some(Fixture::status(Checks::Pending))),
             Ok(Some(Fixture::status(Checks::Passing))),

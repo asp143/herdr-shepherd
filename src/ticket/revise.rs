@@ -99,6 +99,28 @@ pub fn resume_revision(
         }
         Ok((base_head, verified_head(gate)?))
     })();
+    // Close a completed stage only under that recipient's operation lock and
+    // outside the state transaction. A report racing this preflight waits for
+    // the next dispatch; it must not bypass ownership checks inside update.
+    if preparation.is_ok()
+        && let Some(run) = &initial.revision_run
+    {
+        let data = store.read()?;
+        let candidate = run
+            .agent
+            .as_deref()
+            .and_then(|name| data.agents.iter().find(|a| a.name == name))
+            .or_else(|| {
+                data.agents.iter().rev().find(|a| {
+                    a.ticket == id && a.task.contains(&run_marker(run)) && a.report.is_some()
+                })
+            });
+        if let Some(agent) = candidate.filter(|a| a.status == AgentStatus::Reported)
+            && !crate::flock::retire_automatically(h, store, agent)?
+        {
+            return Ok(RevisionOutcome::Waiting);
+        }
+    }
     let prepared = store.update(|data| {
         let ticket = data
             .tickets
@@ -142,10 +164,8 @@ pub fn resume_revision(
                 .find(|agent| {
                     agent.ticket == id
                         && agent.task.contains(&marker)
-                        && !matches!(
-                            agent.status,
-                            AgentStatus::Retired | AgentStatus::LaunchFailed
-                        )
+                        && agent.status != AgentStatus::LaunchFailed
+                        && (agent.status != AgentStatus::Retired || agent.report.is_some())
                 })
                 .map(|agent| agent.name.clone());
         }
@@ -159,14 +179,11 @@ pub fn resume_revision(
                 AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked => {
                     return Ok(Ok(None));
                 }
-                AgentStatus::Reported => {
+                AgentStatus::Reported => return Ok(Ok(None)),
+                AgentStatus::Retired if agent.report.is_some() => {
                     let report = agent.report.as_ref().ok_or_else(|| {
                         ShepherdError::Usage("revision agent has no report".into())
                     })?;
-                    if let Some(tab) = &agent.tab_id {
-                        h.close_tab(tab)?;
-                    }
-                    agent.status = AgentStatus::Retired;
                     run.agent = None;
                     let rejected = report.status != "completed"
                         || !report.blockers.is_empty()

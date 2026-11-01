@@ -270,6 +270,17 @@ submission. Upgrade an incompatible OMP build before using managed OMP runners.
 Already running agents are unaffected. Ambiguous prompt outcomes remain
 quarantined for operator inspection and are never automatically replayed.
 
+Every automatic prompt claims its recipient durably before input. Initial tasks
+can leave quarantine after independently observed owned Working evidence; a
+follow-up cannot, because Working may describe an earlier turn. Uncertain nudges
+retain their clock and payload in the agent's `observed.prompt_claim`; queued
+notifications move there before input while later enqueues remain ordered.
+Only a proven rejection before input restores a notification to the queue.
+A real report resolves its recipient's claim. Automatic retirement uses
+nonblocking operation ownership and fresh pane/session/worktree/project checks;
+deferred retirement keeps resources and stops CI handoff or cleanup. Explicit
+`agent cancel` remains available to the operator after inspecting uncertainty.
+
 An opt-in PTY regression uses the installed OMP with empty fixture HOME/XDG and
 agent directories, no tools/extensions/context files, and a loopback fake
 provider inside a separate network namespace. It requires Python 3 and bwrap:

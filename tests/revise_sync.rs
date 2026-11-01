@@ -1181,3 +1181,70 @@ impl herdr_shepherd::github::PrBackend for PushBackend {
         panic!("lead handles ack")
     }
 }
+
+#[test]
+fn automatic_revision_retirement_waits_for_owned_reported_recipient() {
+    if !local_transport_enabled("automatic_revision_retirement_waits_for_owned_reported_recipient")
+    {
+        return;
+    }
+    use herdr_shepherd::{store::AgentStatus, ticket::revise::RevisionOutcome};
+    for blocked_by in ["busy", "uncertain", "pane", "session", "worktree"] {
+        let repo = Repo::new();
+        let store = stored_revision(&repo);
+        let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+        let gh = PushBackend::new(&repo);
+        let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+        let RevisionOutcome::Started { agent, .. } =
+            resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "now").unwrap()
+        else {
+            panic!("expected coder")
+        };
+        herdr_shepherd::flock::store_report(&store, &agent, &serde_json::json!({"status":"completed", "summary":"real report", "tests":["fixture"], "changed_paths":[], "blockers":[], "findings":[], "commit_sha":git(&repo.root, &["rev-parse", "HEAD"])}).to_string()).unwrap();
+        let _operation = (blocked_by == "busy").then(|| {
+            herdr_shepherd::flock::try_agent_operation(&store, &agent)
+                .unwrap()
+                .unwrap()
+        });
+        match blocked_by {
+            "uncertain" => {
+                store
+                    .update(|data| {
+                        data.agents[0].set_prompt_delivery_uncertain(true);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            "pane" => h.agent_records.borrow_mut()[0].pane_id = "other".into(),
+            "worktree" => h.agent_records.borrow_mut()[0].cwd = Some(repo.user.clone()),
+            "session" => {
+                store
+                    .update(|data| {
+                        data.agents[0].observed = Some(r#"{"session_ref":"saved"}"#.into());
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let before = store.read().unwrap().agents[0].clone();
+        h.calls.borrow_mut().clear();
+        assert_eq!(
+            resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later").unwrap(),
+            RevisionOutcome::Waiting,
+            "{blocked_by}"
+        );
+        assert_eq!(store.read().unwrap().agents[0], before);
+        assert_eq!(before.status, AgentStatus::Reported);
+        assert!(
+            !h.calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("close_tab ")
+                    || call.starts_with("start_agent ")
+                    || call.starts_with("prompt_agent ")),
+            "{blocked_by}"
+        );
+        assert_eq!(gh.pushes.get(), 0);
+    }
+}
