@@ -16,6 +16,17 @@ pub fn tick_tickets(
     state: &Path,
     now: u64,
 ) -> super::TickReport {
+    tick_with_progress(h, gh, cfg, state, now, &mut super::WatchState::default())
+}
+
+pub(super) fn tick_with_progress(
+    h: &dyn Herdr,
+    gh: &dyn PrBackend,
+    cfg: &Config,
+    state: &Path,
+    now: u64,
+    progress: &mut super::WatchState,
+) -> super::TickReport {
     let mut report = super::TickReport::default();
     if !cfg.enabled {
         return report;
@@ -30,6 +41,7 @@ pub fn tick_tickets(
             return report;
         }
     };
+    let mut pending = Vec::new();
     for store in stores {
         let result = (|| -> Result<(), ShepherdError> {
             let data = store.read()?;
@@ -37,21 +49,46 @@ pub fn tick_tickets(
             if !selected.enabled {
                 return Ok(());
             }
-            for ticket in data.tickets.iter().filter(|ticket| {
-                ticket.pr_number.is_some()
-                    && !matches!(ticket.state, TicketState::CleanedUp | TicketState::Failed)
-            }) {
-                let result = poll_ticket(h, gh, &store, &selected, ticket, now);
-                report.polled += 1;
-                match result {
-                    Ok(changed) => report.updated += usize::from(changed),
-                    Err(error) => report.errors.push(format!("{}: {error}", ticket.id)),
-                }
-            }
+            let project = crate::store::project_hash(&data.project_root);
+            let tickets: Vec<_> = data
+                .tickets
+                .into_iter()
+                .filter(|ticket| {
+                    ticket.pr_number.is_some()
+                        && !matches!(ticket.state, TicketState::CleanedUp | TicketState::Failed)
+                })
+                .collect();
+            pending.push((store, selected, project, tickets));
             Ok(())
         })();
         if let Err(error) = result {
             report.errors.push(error.to_string());
+        }
+    }
+    // Flatten across projects: rotating within each store still starves later
+    // projects when an earlier project's provider never finishes.
+    let mut work: Vec<_> = pending
+        .iter()
+        .flat_map(|(store, cfg, project, tickets)| {
+            tickets
+                .iter()
+                .map(move |ticket| (format!("{project}:{}", ticket.id), store, cfg, ticket))
+        })
+        .collect();
+    super::resume_after(&mut work, progress.ticket_cursor.as_deref(), |item| {
+        item.0.clone()
+    });
+    for (key, store, selected, ticket) in work {
+        progress.ticket_cursor = Some(key);
+        if let Err(error) = progress.checkpoint() {
+            report.errors.push(error.to_string());
+            break;
+        }
+        let result = poll_ticket(h, gh, store, selected, ticket, now);
+        report.polled += 1;
+        match result {
+            Ok(changed) => report.updated += usize::from(changed),
+            Err(error) => report.errors.push(format!("{}: {error}", ticket.id)),
         }
     }
     report
@@ -749,6 +786,222 @@ mod tests {
         assert_eq!(
             fixture.store.read().unwrap().agents[0].status,
             crate::store::AgentStatus::Reported
+        );
+    }
+
+    #[test]
+    fn interrupted_workers_reach_all_tickets_and_sidebars() {
+        use std::{
+            cell::RefCell,
+            panic::{AssertUnwindSafe, catch_unwind},
+        };
+        struct Interrupted(RefCell<Vec<String>>, std::cell::Cell<bool>);
+        impl PrBackend for Interrupted {
+            fn view(&self, _: &Path, branch: &str) -> Result<Option<PrStatus>, ShepherdError> {
+                self.0.borrow_mut().push(branch.into());
+                // Model a hard deadline without waiting for the real 180 seconds.
+                if self.1.get() || branch == "feat/t1" {
+                    panic!("simulated worker termination");
+                }
+                let mut status = Fixture::status(Checks::Passing);
+                status.head = branch.into();
+                if let Some(number) = branch.strip_prefix("feat/t") {
+                    status.number = number.parse().unwrap();
+                }
+                Ok(Some(status))
+            }
+            fn comments(
+                &self,
+                _: &Path,
+                _: u64,
+            ) -> Result<Vec<crate::github::PrComment>, ShepherdError> {
+                Ok(vec![])
+            }
+            fn push(&self, _: &crate::gate::Gate) -> Result<(), ShepherdError> {
+                unreachable!()
+            }
+            fn create(
+                &self,
+                _: &crate::gate::Gate,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<PrStatus, ShepherdError> {
+                unreachable!()
+            }
+            fn add_reviewers(
+                &self,
+                _: &crate::gate::Gate,
+                _: u64,
+                _: &[String],
+            ) -> Result<(), ShepherdError> {
+                unreachable!()
+            }
+            fn reply(
+                &self,
+                _: &crate::gate::Gate,
+                _: u64,
+                _: Option<u64>,
+                _: &str,
+            ) -> Result<(), ShepherdError> {
+                unreachable!()
+            }
+        }
+        let fixture = Fixture::new(TicketState::CiWait);
+        fixture
+            .store
+            .update(|data| {
+                for number in 2..=4 {
+                    let mut ticket = data.tickets[0].clone();
+                    ticket.id = format!("T{number}");
+                    ticket.branch = format!("feat/t{number}");
+                    ticket.pr_number = Some(number);
+                    data.tickets.push(ticket);
+                }
+                Ok(())
+            })
+            .unwrap();
+        let other = Fixture::new(TicketState::CiWait);
+        let root = other.store.read().unwrap().project_root;
+        crate::trusted::ensure_snapshot(&fixture.state, &root).unwrap();
+        let other_store = Store::open(&fixture.state, &root).unwrap();
+        other_store
+            .update(|data| {
+                let mut ticket = other.ticket();
+                ticket.id = "T5".into();
+                ticket.branch = "feat/t5".into();
+                ticket.pr_number = Some(5);
+                data.tickets.push(ticket);
+                Ok(())
+            })
+            .unwrap();
+        for number in 2..=3 {
+            let root = fixture._dir.path().join(format!("sidebar-{number}"));
+            std::fs::create_dir(&root).unwrap();
+            assert!(
+                Command::new("git")
+                    .args(["init", "--quiet", "--initial-branch"])
+                    .arg(format!("side/{number}"))
+                    .arg(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            fixture.h.workspaces.borrow_mut().push(Workspace {
+                workspace_id: format!("w{number}"),
+                label: "sidebar".into(),
+                worktree: Some(WorktreeInfo {
+                    repo_key: "fixture".into(),
+                    repo_root: None,
+                    checkout_path: Some(root),
+                    is_linked_worktree: true,
+                }),
+            });
+        }
+        let backend = Interrupted(RefCell::new(vec![]), std::cell::Cell::new(true));
+        let cycle = || {
+            let mut state = super::super::WatchState::load(&fixture.state).unwrap();
+            state.state_dir = Some(fixture.state.clone());
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| super::super::tick(
+                    &fixture.h,
+                    &backend,
+                    &fixture.cfg,
+                    &crate::notify::Notifier::new(&fixture.h, false),
+                    &mut state,
+                )))
+                .is_err()
+            );
+            // Discard memory exactly as the resident watcher's killed worker does.
+        };
+        for _ in 0..10 {
+            cycle();
+        }
+        let calls = backend.0.borrow();
+        assert_eq!(calls.len(), 10);
+        for branch in [
+            "feat/t1", "feat/t2", "feat/t3", "feat/t4", "feat/t5", "main", "side/2", "side/3",
+        ] {
+            assert!(
+                calls.iter().any(|call| call == branch),
+                "starved {branch}: {calls:?}"
+            );
+        }
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|branch| branch.starts_with("feat/"))
+                .count(),
+            5
+        );
+        // Removing the cursor's ticket must not restart the surviving prefix.
+        let removed = calls
+            .iter()
+            .rev()
+            .find(|branch| branch.starts_with("feat/"))
+            .unwrap()
+            .clone();
+        drop(calls);
+        for store in [&fixture.store, &other_store] {
+            store
+                .update(|data| {
+                    data.tickets.retain(|ticket| ticket.branch != removed);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        backend.0.borrow_mut().clear();
+        for _ in 0..8 {
+            cycle();
+        }
+        let calls = backend.0.borrow();
+        assert_eq!(calls.len(), 8);
+        for branch in [
+            "feat/t1", "feat/t2", "feat/t3", "feat/t4", "feat/t5", "main", "side/2", "side/3",
+        ] {
+            assert_eq!(
+                calls.iter().any(|call| call == branch),
+                branch != removed,
+                "{calls:?}"
+            );
+        }
+        drop(calls);
+        // A persistently slow first ticket must not prevent healthy tickets
+        // from completing their CI handoff or sidebar tokens from being saved.
+        backend.1.set(false);
+        for _ in 0..4 {
+            cycle();
+        }
+        for store in [&fixture.store, &other_store] {
+            for ticket in store.read().unwrap().tickets {
+                assert_eq!(
+                    ticket.state,
+                    if ticket.branch == "feat/t1" {
+                        TicketState::CiWait
+                    } else {
+                        TicketState::PrOpen
+                    },
+                    "{}",
+                    ticket.id
+                );
+            }
+        }
+        assert_eq!(
+            super::super::WatchState::load(&fixture.state)
+                .unwrap()
+                .owned_tokens
+                .len(),
+            3
+        );
+        assert_eq!(
+            fixture
+                .h
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("workspace_tokens "))
+                .count(),
+            3
         );
     }
 

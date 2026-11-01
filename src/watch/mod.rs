@@ -29,6 +29,14 @@ pub struct WatchState {
     /// Older state files cannot prove ownership of any particular name.
     #[serde(default)]
     pub owned_tokens: HashMap<String, String>,
+    /// Last attempted items, checkpointed before external calls so a killed
+    /// worker resumes with their successors rather than repeating the prefix.
+    #[serde(default)]
+    pub ticket_cursor: Option<String>,
+    #[serde(default)]
+    pub sidebar_cursor: Option<String>,
+    #[serde(default)]
+    pub sidebar_first: bool,
     /// Runtime location; never persist the caller's state directory.
     #[serde(skip)]
     pub state_dir: Option<std::path::PathBuf>,
@@ -43,6 +51,13 @@ impl WatchState {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(anyhow::Error::from(error).into()),
         }
+    }
+
+    fn checkpoint(&self) -> Result<(), ShepherdError> {
+        if let Some(dir) = &self.state_dir {
+            self.save(dir)?;
+        }
+        Ok(())
     }
 
     pub fn save(&self, state_dir: &Path) -> Result<(), ShepherdError> {
@@ -107,16 +122,51 @@ pub fn tick(
     if !cfg.enabled {
         return report;
     }
-    if let Some(state_dir) = st.state_dir.as_deref() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let tickets = tick_tickets(h, gh, cfg, state_dir, now);
-        report.polled += tickets.polled;
-        report.updated += tickets.updated;
-        report.errors.extend(tickets.errors);
+    // Alternate the leading class across worker restarts. A lifecycle call
+    // may consume the whole hard deadline; sidebar work must still get a turn.
+    let sidebar_first = st.sidebar_first;
+    st.sidebar_first = !sidebar_first;
+    if let Err(error) = st.checkpoint() {
+        report.errors.push(error.to_string());
+        return report;
     }
+    for sidebar in [sidebar_first, !sidebar_first] {
+        let next = if sidebar {
+            tick_sidebar(h, gh, cfg, notifier, st)
+        } else if let Some(state_dir) = st.state_dir.clone() {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            tickets::tick_with_progress(h, gh, cfg, &state_dir, now, st)
+        } else {
+            TickReport::default()
+        };
+        report.polled += next.polled;
+        report.updated += next.updated;
+        report.cleared += next.cleared;
+        report.errors.extend(next.errors);
+    }
+    report
+}
+
+/// Rotate stable identities rather than an index into a changing enumeration.
+fn resume_after<T>(items: &mut [T], cursor: Option<&str>, key: impl Fn(&T) -> String) {
+    items.sort_by_key(&key);
+    if let Some(cursor) = cursor {
+        let index = items.partition_point(|item| key(item).as_str() <= cursor);
+        items.rotate_left(index);
+    }
+}
+
+fn tick_sidebar(
+    h: &dyn Herdr,
+    gh: &dyn PrBackend,
+    cfg: &Config,
+    notifier: &Notifier<'_>,
+    st: &mut WatchState,
+) -> TickReport {
+    let mut report = TickReport::default();
     if !cfg.upkeep.pr_status {
         return report;
     }
@@ -132,13 +182,16 @@ pub fn tick(
             return report;
         }
     };
-    let workspaces = match h.workspaces() {
+    let mut workspaces = match h.workspaces() {
         Ok(workspaces) => workspaces,
         Err(error) => {
             report.errors.push(error.to_string());
             return report;
         }
     };
+    resume_after(&mut workspaces, st.sidebar_cursor.as_deref(), |ws| {
+        ws.workspace_id.clone()
+    });
     for ws in workspaces {
         let Some(worktree) = ws.worktree.as_ref().filter(|w| w.is_linked_worktree) else {
             continue;
@@ -146,6 +199,11 @@ pub fn tick(
         let Some(path) = worktree.checkout_path.as_deref() else {
             continue;
         };
+        st.sidebar_cursor = Some(ws.workspace_id.clone());
+        if let Err(error) = st.checkpoint() {
+            report.errors.push(error.to_string());
+            break;
+        }
         let branch = match proc::run(
             Command::new("git")
                 .current_dir(path)
@@ -237,6 +295,10 @@ pub fn tick(
                 }
             }
             Err(error) => report.errors.push(format!("{}: {error}", ws.workspace_id)),
+        }
+        if let Err(error) = st.checkpoint() {
+            report.errors.push(error.to_string());
+            break;
         }
     }
     report
