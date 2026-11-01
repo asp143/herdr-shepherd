@@ -216,7 +216,7 @@ fn integration_registration_case(existing_child: bool) {
                     unit: 1,
                     branch: "fix/ticket--1".into(),
                     path: existing_path.clone(),
-                    workspace_id: "child1".into(),
+                    workspace_id: Some("child1".into()),
                     base_sha: base,
                     integrated: false,
                 });
@@ -240,7 +240,7 @@ fn integration_registration_case(existing_child: bool) {
         unit: 2,
         branch: "fix/ticket--2".into(),
         path: child_path.clone(),
-        workspace_id: "child2".into(),
+        workspace_id: Some("child2".into()),
         base_sha: git(&f.root, &["rev-parse", "HEAD"]),
         integrated: false,
     };
@@ -442,4 +442,227 @@ fn integration_waits_for_admitted_spawn_and_keeps_live_work() {
         AgentStatus::Working
     );
     assert!(f.root.exists());
+}
+
+#[test]
+fn integration_retires_only_child_tab_with_canonical_cwd() {
+    let f = Fixture::git_repo();
+    let base = git(&f.root, &["rev-parse", "HEAD"]);
+    let child = f.dir.path().join("native-child");
+    git(&f.root, &["config", "extensions.worktreeConfig", "true"]);
+    git(
+        &f.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "fix/ticket--1",
+            child.to_str().unwrap(),
+        ],
+    );
+    git(
+        &child,
+        &[
+            "config",
+            "--worktree",
+            "shepherd.ticketBranch",
+            "fix/ticket--1",
+        ],
+    );
+    fs::write(child.join("work.txt"), "child work\n").unwrap();
+    git(&child, &["add", "work.txt"]);
+    git(&child, &["commit", "-m", "child work"]);
+    let alias = f.dir.path().join("child-alias");
+    std::os::unix::fs::symlink(&child, &alias).unwrap();
+    f.store
+        .update(|data| {
+            data.tickets[0]
+                .children
+                .push(herdr_shepherd::store::ChildWorktree {
+                    unit: 1,
+                    branch: "fix/ticket--1".into(),
+                    path: child.clone(),
+                    workspace_id: None,
+                    base_sha: base.clone(),
+                    integrated: false,
+                });
+            for (name, pane, worktree) in
+                [("child", "w1:p1", &alias), ("sibling", "w1:p2", &f.root)]
+            {
+                data.agents.push(herdr_shepherd::store::AgentRecord {
+                    name: name.into(),
+                    ticket: "T-1".into(),
+                    role: "coder".into(),
+                    runner: "fake".into(),
+                    status: AgentStatus::Reported,
+                    pane_id: Some(pane.into()),
+                    tab_id: Some(pane.replace(":p", ":t")),
+                    worktree: worktree.clone(),
+                    task: "work".into(),
+                    report: None,
+                    observed: None,
+                    last_progress_at: "0".into(),
+                    nudges: 0,
+                    restarts: 0,
+                    prompt_pending: false,
+                });
+            }
+            Ok(())
+        })
+        .unwrap();
+    fs::write(f.dir.path().join("fake.json"), serde_json::to_vec(&serde_json::json!({"agents": [
+        {"name":"child", "agent":"fake", "agent_status":"idle", "cwd":child, "pane_id":"w1:p1", "workspace_id":"w1"},
+        {"name":"sibling", "agent":"fake", "agent_status":"idle", "cwd":f.root, "pane_id":"w1:p2", "workspace_id":"w1"}
+    ]})).unwrap()).unwrap();
+    let out = f
+        .command("ticket")
+        .args(["integrate", "T-1"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!child.exists());
+    assert_eq!(
+        fs::read_to_string(f.root.join("work.txt")).unwrap(),
+        "child work\n"
+    );
+    let data = f.store.read().unwrap();
+    assert!(data.tickets[0].children.is_empty());
+    assert_eq!(data.agents[0].status, AgentStatus::Retired);
+    assert_eq!(data.agents[1].status, AgentStatus::Reported);
+    assert!(!git(&f.root, &["branch", "--list", "fix/ticket--1"]).contains("fix/ticket--1"));
+}
+
+#[test]
+fn integration_retries_after_checkout_removal_and_ref_lock() {
+    integration_cleanup_retry_case("ref-lock");
+}
+
+#[test]
+fn integration_retries_after_native_remove_reports_failure() {
+    integration_cleanup_retry_case("remove-error");
+}
+
+#[test]
+fn integration_retries_after_ref_delete_reports_failure() {
+    integration_cleanup_retry_case("ref-error");
+}
+
+#[test]
+fn integration_keeps_receipt_if_ref_is_recreated_after_delete() {
+    integration_cleanup_retry_case("recreate-ref");
+}
+
+fn integration_cleanup_retry_case(fault: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::git_repo();
+    let child = f.dir.path().join("child");
+    let base = git(&f.root, &["rev-parse", "HEAD"]);
+    git(&f.root, &["config", "extensions.worktreeConfig", "true"]);
+    git(
+        &f.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "fix/ticket--1",
+            child.to_str().unwrap(),
+        ],
+    );
+    git(
+        &child,
+        &[
+            "config",
+            "--worktree",
+            "shepherd.ticketBranch",
+            "fix/ticket--1",
+        ],
+    );
+    fs::write(child.join("work"), "integrated work\n").unwrap();
+    git(&child, &["add", "work"]);
+    git(&child, &["commit", "-m", "unit work"]);
+    f.store
+        .update(|data| {
+            data.tickets[0]
+                .children
+                .push(herdr_shepherd::store::ChildWorktree {
+                    unit: 1,
+                    branch: "fix/ticket--1".into(),
+                    path: child.clone(),
+                    workspace_id: None,
+                    base_sha: base,
+                    integrated: false,
+                });
+            Ok(())
+        })
+        .unwrap();
+    let lock = f.root.join(".git/refs/heads/fix/ticket--1.lock");
+    let mut command = f.command("ticket");
+    if fault == "ref-lock" {
+        fs::write(&lock, "locked").unwrap();
+    } else {
+        let bin = f.dir.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let wrapper = bin.join("git");
+        fs::write(
+            &wrapper,
+            r#"#!/bin/sh
+case "$1 $2" in
+  'worktree remove')
+    if [ "$CLEANUP_FAULT" = remove-error ]; then
+      /usr/bin/git "$@" || exit
+      exit 1
+    fi
+    ;;
+  'update-ref -d')
+    /usr/bin/git "$@" || exit
+    if [ "$CLEANUP_FAULT" = recreate-ref ]; then
+      /usr/bin/git update-ref "$3" "$4" || exit
+      exit 0
+    fi
+    exit 1
+    ;;
+esac
+exec /usr/bin/git "$@"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        command
+            .env(
+                "PATH",
+                std::env::join_paths([bin, "/usr/bin".into(), "/bin".into()]).unwrap(),
+            )
+            .env("CLEANUP_FAULT", fault);
+    }
+    let first = command.args(["integrate", "T-1"]).output().unwrap();
+    assert!(!first.status.success(), "{fault}");
+    assert!(!child.exists(), "reproduce failure after checkout removal");
+    assert_eq!(f.store.read().unwrap().tickets[0].child_cleanup.len(), 1);
+    if fault == "ref-lock" {
+        fs::remove_file(lock).unwrap();
+    }
+    let retry = f
+        .command("ticket")
+        .args(["integrate", "T-1"])
+        .output()
+        .unwrap();
+    assert!(
+        retry.status.success(),
+        "retry: {} {}",
+        String::from_utf8_lossy(&retry.stdout),
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let ticket = f.store.read().unwrap().tickets.remove(0);
+    assert!(ticket.children.is_empty());
+    assert!(ticket.child_cleanup.is_empty());
+    assert!(git(&f.root, &["branch", "--list", "fix/ticket--1"]).is_empty());
+    assert_eq!(
+        fs::read_to_string(f.root.join("work")).unwrap(),
+        "integrated work\n"
+    );
 }

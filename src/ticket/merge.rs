@@ -201,14 +201,25 @@ fn verify_children(ticket: &Ticket, h: &dyn Herdr) -> Result<(), ShepherdError> 
             let owned = ticket.children.iter().any(|child| {
                 child.branch == branch
                     && tree_path.is_some_and(|path| same_path(path, &child.path))
-                    && workspaces.iter().any(|workspace| {
-                        workspace.workspace_id == child.workspace_id
-                            && workspace.worktree.as_ref().is_some_and(|tree| {
+                    && match &child.workspace_id {
+                        Some(id) => workspaces.iter().any(|workspace| {
+                            workspace.workspace_id == *id
+                                && workspace.worktree.as_ref().is_some_and(|tree| {
+                                    tree.is_linked_worktree
+                                        && tree
+                                            .checkout_path
+                                            .as_ref()
+                                            .is_some_and(|path| same_path(path, &child.path))
+                                })
+                        }),
+                        None => !workspaces.iter().any(|workspace| {
+                            workspace.worktree.as_ref().is_some_and(|tree| {
                                 tree.checkout_path
                                     .as_ref()
                                     .is_some_and(|path| same_path(path, &child.path))
                             })
-                    })
+                        }),
+                    }
             });
             if !owned {
                 return Err(ShepherdError::PolicyDenied(
@@ -1447,6 +1458,15 @@ mod tests {
 
     #[test]
     fn merged_clean_removes_recorded_children_first() {
+        merged_children_case(true);
+    }
+
+    #[test]
+    fn merged_clean_removes_workspace_free_children() {
+        merged_children_case(false);
+    }
+
+    fn merged_children_case(legacy: bool) {
         let fixture = Fixture::new(TicketState::PrOpen);
         let child = fixture._dir.path().join("child");
         git(
@@ -1464,16 +1484,18 @@ mod tests {
             &child,
             &["config", "--worktree", "shepherd.ticketBranch", "feat/t--1"],
         );
-        fixture.h.fake.workspaces.borrow_mut().push(Workspace {
-            workspace_id: "child".into(),
-            label: "child".into(),
-            worktree: Some(WorktreeInfo {
-                repo_key: "fixture".into(),
-                repo_root: Some(fixture.h.main.clone()),
-                checkout_path: Some(child.clone()),
-                is_linked_worktree: true,
-            }),
-        });
+        if legacy {
+            fixture.h.fake.workspaces.borrow_mut().push(Workspace {
+                workspace_id: "child".into(),
+                label: "child".into(),
+                worktree: Some(WorktreeInfo {
+                    repo_key: "fixture".into(),
+                    repo_root: Some(fixture.h.main.clone()),
+                    checkout_path: Some(child.clone()),
+                    is_linked_worktree: true,
+                }),
+            });
+        }
         fixture
             .store
             .update(|data| {
@@ -1481,7 +1503,7 @@ mod tests {
                     unit: 1,
                     branch: "feat/t--1".into(),
                     path: child.clone(),
-                    workspace_id: "child".into(),
+                    workspace_id: legacy.then(|| "child".into()),
                     base_sha: fixture.status.head_oid.clone().unwrap(),
                     integrated: true,
                 });
@@ -1498,7 +1520,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             removed,
-            ["remove_worktree child false", "remove_worktree w1 false"]
+            if legacy {
+                vec!["remove_worktree child false", "remove_worktree w1 false"]
+            } else {
+                vec!["remove_worktree w1 false"]
+            }
         );
     }
 

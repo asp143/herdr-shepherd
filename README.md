@@ -12,7 +12,7 @@ From this checkout:
 sh scripts/build.sh && herdr plugin link "$PWD"
 ```
 
-The binary is `bin/herdr-shepherd`. Add that directory to your PATH to use the shorter commands below, or invoke the binary by its path. Linking registers upkeep actions plus `herdr-shepherd.init`, `herdr-shepherd.start`, `herdr-shepherd.resume`, and `herdr-shepherd.status`. Creating or removing a herdr worktree automatically regroups workspaces when global upkeep permits it.
+The binary is `bin/herdr-shepherd`. Add that directory to your PATH to use the shorter commands below, or invoke the binary by its path. Linking registers upkeep actions plus `herdr-shepherd.init`, `herdr-shepherd.start`, `herdr-shepherd.resume`, and `herdr-shepherd.status`. Ticket dispatch groups the new ticket workspace immediately when global upkeep permits it; worktree creation and removal events also trigger regrouping.
 
 ## Commands
 
@@ -52,7 +52,7 @@ The binary is `bin/herdr-shepherd`. Add that directory to your PATH to use the s
 | `ticket transition ID --to STATE [--reason REASON]` | Apply a legal transition with the configured revision cap. |
 | `ticket integrate ID` | Integrate child commits, roll back conflicts, and remove proven integrated children. |
 | `ticket cancel ID` | Close a ticket while preserving its worktree and commits. |
-| `agent spawn --ticket ID --role ROLE --task-file FILE [--unit N]` | Launch the configured role; concurrent coders use child worktrees. |
+| `agent spawn --ticket ID --role ROLE --task-file FILE [--unit N]` | Launch a ticket tab; `--unit N` gives a coder a private child checkout. |
 | `agent report --agent NAME --report-file FILE` | Validate and store the report; an inherited caller pane must own that agent. |
 | `agent list`, `agent status NAME`, `agent cancel NAME [--force]` | Inspect or retire owned flock agents. |
 | `config trust [--project-root PATH]` | Explicitly replace the project trust snapshot and print its diff. |
@@ -126,7 +126,7 @@ Future GitHub writers must call that check before sending human-facing text.
 Attribution matching accepts Unicode whitespace between words, including NBSP
 and repeated spaces.
 
-Regroup preserves user labels such as `fix/foo`, skips children whose parent workspace is absent, and is idempotent. Nested generated prefixes are stripped in one run so another invocation does not rename again. Explicit `regroup` always runs; `[upkeep] regroup` controls automatic event handling.
+Regroup preserves user labels such as `fix/foo`, skips children whose parent workspace is absent, and is idempotent. Nested generated prefixes are stripped in one run so another invocation does not rename again. Explicit `regroup` always runs; `[upkeep] regroup` controls initial ticket placement and automatic event handling. A regroup failure is logged and leaves the created ticket available.
 
 Prune defaults to `~/.herdr/worktrees` and reports `MERGED`, `CLOSED`, `ORPHAN`, `STRAY`, `NO-PR`, and `OPEN`, plus optional size, `DIRTY`, `AGENTS=n`, and `BRANCH-SWITCHED` flags. Missing `gh`, unsupported remotes, failed lookups, or timeouts yield `NO-PR`. Probe calls time out after 20 seconds, except size probes after 120 seconds; at most eight entries are probed concurrently. If herdr is unavailable, the report still runs with warnings and no workspace or agent annotations. Prune never deletes, moves, or writes anything.
 
@@ -264,7 +264,7 @@ Stop only the PID returned by that invocation. Logs are in the same state direct
 
 ## Verified cleanup
 
-Cleanup requires a linked worktree with its matching ticket-branch marker and a unique Herdr workspace, no active agents, and a GitHub PR verified merged for that branch. Every child named `<branch>--<number>` must pass ownership and containment checks before any removal. Execution rechecks workspace IDs, repository/remote identity, tips, agents, and the complete child set. Running inside the workspace being removed is refused.
+Cleanup requires a ticket linked worktree with its matching ticket-branch marker and a unique Herdr workspace, no active agents, and a GitHub PR verified merged for that branch. Private unit checkouts have no workspace: cleanup removes them through Git before removing the ticket workspace. Stored children from earlier versions retain their verified workspace cleanup. Every child named `<branch>--<number>` must pass ownership and containment checks before any removal. Execution rechecks workspace IDs, repository/remote identity, tips, agents, and the complete child set. Running inside the workspace being removed is refused.
 
 Squash cleanup requires the PR head commit ID to match the local tip when ancestry or patch equivalence cannot prove containment. Local and remote branches are retained unless ancestry proves containment in the base. Local deletion uses an atomic expected-tip ref update after that proof; branch configuration is retained. The specialized remote-delete gate requires a bound merge proof and uses an expected-tip lease on a deletion-only refspec, so an advanced remote branch is retained. Ordinary pushes continue to refuse all force/lease flags and cannot use this path to rewrite commits.
 
@@ -421,6 +421,20 @@ lead never edits repository code: it uses `ticket add`, `ticket dispatch`,
 submits a JSON report. A report preserves tests, changed paths, findings, and
 its commit SHA. Only the lead talks to the user.
 
+The workspace layout is `repo workspace -> ticket worktree workspace -> flock tabs`.
+Dispatch creates one linked worktree workspace on the ticket branch, labels it
+with the ticket slug, and groups it immediately after the repo workspace when
+`[upkeep] regroup` is enabled. Planner, researcher, coder, reviewer, QA, and
+revision agents all open as tabs in that ticket workspace.
+
+A coder launched with `--unit N` uses a private Git checkout and branch
+`<ticket-branch>--<N>`, including the first unit coder. Its tab stays in the ticket
+workspace while its cwd points to that private checkout. Each writable coder
+has its own checkout and push guard; unit creation adds no Herdr workspace.
+Integration retires only the owning child tabs, removes integrated private
+checkouts and branches, and leaves sibling tabs open. Cancellation preserves
+worktrees and commits for recovery.
+
 The queue gives waiting revisions priority. Capacity exhaustion leaves queued
 and revising tickets unchanged; failed launches block with `launch_failed` and
 other dispatch actions continue. Concurrent spawn calls serialize placement so
@@ -429,6 +443,18 @@ transactional: any conflict restores the pre-integration HEAD, leaves a clean
 branch, and records both ranges in `Ticket.integration_ranges`. A resolver can
 merge the child branches locally, resolve conflicts, report, and rerun
 `ticket integrate` to recognize the contained commits.
+
+Integration merges each child branch in unit order with `git merge --no-ff
+--no-edit`. A child is integrated only when its tip is an ancestor of the ticket's
+HEAD. Retries recognize that ancestry without merging twice, including empty
+children and commits whose changes already exist on the ticket. Later edits,
+reverts, or amendments of a merge retain the original child commits in ticket
+history. Rewriting away that ancestry keeps the child's resources and reports
+how to recover. Old integrated records without ancestry are also retained:
+review the work, merge the child branch locally (resolving conflicts if needed),
+then rerun `ticket integrate` to finish cleanup. Commit messages and equivalent
+patches never prove child integration. A child with outstanding cleanup cannot
+be reused by another agent; finish cleanup first.
 
 Pane events and periodic sweeps supervise owned agents. Safe fixed-key dialog
 rules run only after policy and foreground-cwd checks, and revalidate the screen

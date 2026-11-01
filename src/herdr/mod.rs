@@ -77,6 +77,10 @@ pub trait Herdr {
     fn pane_cwd(&self, _pane: &str) -> Result<Option<std::path::PathBuf>, ShepherdError> {
         Ok(None)
     }
+    /// Distinguish a closed pane from a present pane with unavailable metadata.
+    fn pane_exists(&self, _pane: &str) -> Result<bool, ShepherdError> {
+        Err(unsupported("pane_exists"))
+    }
     fn pane_session_ref(&self, _pane: &str) -> Result<Option<String>, ShepherdError> {
         Ok(None)
     }

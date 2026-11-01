@@ -350,6 +350,25 @@ impl Herdr for CliHerdr {
                 .map(PathBuf::from)
         }))
     }
+    fn pane_exists(&self, pane: &str) -> Result<bool, ShepherdError> {
+        let output = self.capture(&["pane", "get", pane])?;
+        if !output.status.success() {
+            if response_error(&output).as_deref() == Some("not_found") {
+                return Ok(false);
+            }
+            return Err(command_error(&output));
+        }
+        // A present pane need not have a foreground cwd or session yet.
+        let value: serde_json::Value =
+            serde_json::from_str(&output.stdout).map_err(anyhow::Error::from)?;
+        if !value
+            .get("result")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            return Err(anyhow::anyhow!("herdr response lacks pane result").into());
+        }
+        Ok(true)
+    }
     fn pane_session_ref(&self, pane: &str) -> Result<Option<String>, ShepherdError> {
         let value = self.request(&["pane", "get", pane])?;
         Ok([
@@ -678,6 +697,24 @@ mod tests {
             h.pane_session_ref("owned:p1").unwrap().as_deref(),
             Some("fixture-session")
         );
+    }
+
+    #[test]
+    fn closed_pane_is_proven_by_explicit_not_found_only() {
+        let (dir, h, _listener) = output_fixture(r#"{"error":{"code":"not_found"}}"#);
+        std::fs::write(dir.path().join("exit-code"), "1\n").unwrap();
+        assert!(!h.pane_exists("owned:p1").unwrap());
+        let (dir, h, _listener) = output_fixture(r#"{"error":{"code":"pane_not_found"}}"#);
+        std::fs::write(dir.path().join("exit-code"), "1\n").unwrap();
+        assert!(h.pane_exists("owned:p1").is_err());
+        let (dir, h, _listener) = output_fixture("pane not found");
+        std::fs::write(dir.path().join("exit-code"), "1\n").unwrap();
+        assert!(h.pane_exists("owned:p1").is_err());
+        let (dir, h, _listener) = output_fixture(r#"{"error":{"code":"unavailable"}}"#);
+        std::fs::write(dir.path().join("exit-code"), "1\n").unwrap();
+        assert!(h.pane_exists("owned:p1").is_err());
+        let (_dir, h, _listener) = output_fixture(r#"{"result":{"pane":{}}}"#);
+        assert!(h.pane_exists("owned:p1").unwrap());
     }
     #[test]
     fn start_agent_accepts_silent_run_and_text_wait() {

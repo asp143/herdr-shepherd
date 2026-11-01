@@ -135,8 +135,17 @@ pub fn run(
             }
             let task = crate::cli_pr::read_text(task_file)?;
             let mut label = None;
-            if child_mode && parallel {
+            if child_mode && unit.is_some() {
                 let unit = unit.expect("checked unit");
+                if ticket
+                    .child_cleanup
+                    .iter()
+                    .any(|receipt| receipt.child.unit == unit)
+                {
+                    return Err(ShepherdError::Usage(
+                        "child unit has outstanding cleanup; finish cleanup before spawning it again".into(),
+                    ));
+                }
                 if data
                     .agents
                     .iter()
@@ -186,7 +195,6 @@ pub fn run(
                     child
                 };
                 ticket.worktree = Some(child.path);
-                ticket.workspace_id = Some(child.workspace_id);
                 ticket.branch = child.branch;
                 label = Some(format!("{}-{unit}", role.name));
             }

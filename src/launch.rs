@@ -76,6 +76,20 @@ pub fn launch_configured(
         crate::harness::harness_for(&runner.harness)?;
     }
     let (mut record, _operation) = store.update(|data| {
+        let cwd = req
+            .worktree
+            .canonicalize()
+            .unwrap_or_else(|_| req.worktree.clone());
+        if data.tickets.iter().any(|ticket| {
+            ticket.child_cleanup.iter().any(|receipt| {
+                cwd.starts_with(&receipt.path) || req.worktree.starts_with(&receipt.child.path)
+            })
+        }) {
+            return Err(ShepherdError::Usage(
+                "child checkout has outstanding cleanup; finish cleanup before launching an agent"
+                    .into(),
+            ));
+        }
         if req.role.name != "lead"
             && data
                 .agents
@@ -141,7 +155,12 @@ pub fn launch_configured(
             tab_id: None,
             worktree: req.worktree.clone(),
             report: None,
-            observed: None,
+            observed: Some(
+                serde_json::json!({
+                    "tab_workspace_id": req.workspace_id,
+                })
+                .to_string(),
+            ),
             last_progress_at: now(),
             nudges: 0,
             restarts: 0,
@@ -328,7 +347,13 @@ fn launch_reserved(
                     return Ok(());
                 }
                 record.status = AgentStatus::LaunchFailed;
-                record.observed = Some("provider_failure".into());
+                record.observed = Some(
+                    serde_json::json!({
+                        "tab_workspace_id": req.workspace_id,
+                        "condition": "provider_failure",
+                    })
+                    .to_string(),
+                );
                 save(store, record)?;
                 continue;
             }
@@ -650,6 +675,7 @@ mod tests {
                                 id: record.ticket.clone(),
                                 state: crate::store::TicketState::Building,
                                 worktree: Some(record.worktree.clone()),
+                                workspace_id: Some("w1".into()),
                                 ..Default::default()
                             });
                             Ok(())
@@ -1021,7 +1047,39 @@ mod tests {
         h.visible_screens
             .borrow_mut()
             .push_back("rate limit reached".into());
-        let record = launch(&h, &store, req(dir.path(), &state)).unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        store
+            .update(|data| {
+                data.tickets.push(crate::store::Ticket {
+                    id: "T-1".into(),
+                    state: crate::store::TicketState::Building,
+                    worktree: Some(dir.path().into()),
+                    workspace_id: Some("w1".into()),
+                    children: vec![crate::store::ChildWorktree {
+                        unit: 1,
+                        branch: "feat/t--1".into(),
+                        path: child.clone(),
+                        workspace_id: Some("w-legacy".into()),
+                        base_sha: "fixture".into(),
+                        integrated: false,
+                    }],
+                    ..Default::default()
+                });
+                Ok(())
+            })
+            .unwrap();
+        let record = launch(&h, &store, req(&child, &state)).unwrap();
+        assert_eq!(record.worktree, child);
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|c| **c == format!("create_tab w1 coder {}", child.display()))
+                .count(),
+            2
+        );
+        h.agent_records.borrow_mut()[0].workspace_id = Some("w1".into());
         assert_eq!(record.runner, "omp-astra");
         assert_eq!(record.status, AgentStatus::Working);
         assert_eq!(store.read().unwrap().agents.len(), 1);
@@ -1038,6 +1096,8 @@ mod tests {
             .collect();
         assert_eq!(starts.len(), 2);
         assert!(starts[0].0 < close && close < starts[1].0);
+        drop(calls);
+        assert!(crate::flock::retire_automatically(&h, &store, &record).unwrap());
         let args = h.start_args.borrow();
         assert!(!args[0].contains(&"--config".into()));
         assert_eq!(args[1][args[1].len() - 2], "--config");

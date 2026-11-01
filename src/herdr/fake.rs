@@ -35,6 +35,10 @@ pub struct FakeHerdr {
     pub start_envs: RefCell<Vec<HashMap<String, String>>>,
     pub pane_cwds: RefCell<HashMap<String, std::path::PathBuf>>,
     pub pane_sessions: RefCell<HashMap<String, String>>,
+    pub pane_workspaces: RefCell<HashMap<String, String>>,
+    /// Opt in to actual isolated Git resources for end-to-end fixtures.
+    pub git_worktrees: Cell<bool>,
+    pub move_error: Cell<bool>,
 }
 
 impl FakeHerdr {
@@ -60,6 +64,9 @@ impl FakeHerdr {
             start_envs: RefCell::new(Vec::new()),
             pane_cwds: RefCell::new(HashMap::new()),
             pane_sessions: RefCell::new(HashMap::new()),
+            pane_workspaces: RefCell::new(HashMap::new()),
+            git_worktrees: Cell::new(false),
+            move_error: Cell::new(false),
         }
     }
 }
@@ -78,6 +85,9 @@ impl Herdr for FakeHerdr {
         self.pane_cwds
             .borrow_mut()
             .insert(format!("{ws}:p{sequence}"), cwd.into());
+        self.pane_workspaces
+            .borrow_mut()
+            .insert(format!("{ws}:p{sequence}"), ws.into());
         Ok((format!("{ws}:t{sequence}"), format!("{ws}:p{sequence}")))
     }
     fn create_worktree(
@@ -93,6 +103,23 @@ impl Herdr for FakeHerdr {
             repo.display(),
             path.display()
         ));
+        if self.git_worktrees.get() {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["worktree", "add", "-b", branch])
+                .arg(path)
+                .arg(base)
+                .output()
+                .map_err(anyhow::Error::from)?;
+            if !output.status.success() {
+                return Err(anyhow::anyhow!(
+                    "fake git worktree add: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+                .into());
+            }
+        }
         let workspace = Workspace {
             workspace_id: format!("fake-w{}", self.workspaces.borrow().len() + 1),
             label: label.into(),
@@ -136,7 +163,7 @@ impl Herdr for FakeHerdr {
             .into(),
             cwd: self.pane_cwds.borrow().get(pane).cloned(),
             pane_id: pane.into(),
-            workspace_id: None,
+            workspace_id: self.pane_workspaces.borrow().get(pane).cloned(),
         });
         if let Some(observer) = self.on_start.borrow().as_ref() {
             observer(name);
@@ -222,9 +249,21 @@ impl Herdr for FakeHerdr {
     }
     fn close_tab(&self, tab: &str) -> Result<(), ShepherdError> {
         self.calls.borrow_mut().push(format!("close_tab {tab}"));
+        let panes: Vec<String> = self
+            .pane_cwds
+            .borrow()
+            .keys()
+            .filter(|pane| pane.replace(":p", ":t") == tab)
+            .cloned()
+            .collect();
         self.agent_records
             .borrow_mut()
             .retain(|agent| agent.pane_id.replace(":p", ":t") != tab);
+        for pane in panes {
+            self.pane_cwds.borrow_mut().remove(&pane);
+            self.pane_workspaces.borrow_mut().remove(&pane);
+            self.pane_sessions.borrow_mut().remove(&pane);
+        }
         Ok(())
     }
     fn focus_agent(&self, name: &str) -> Result<(), ShepherdError> {
@@ -233,6 +272,15 @@ impl Herdr for FakeHerdr {
     }
     fn pane_cwd(&self, pane: &str) -> Result<Option<std::path::PathBuf>, ShepherdError> {
         Ok(self.pane_cwds.borrow().get(pane).cloned())
+    }
+    fn pane_exists(&self, pane: &str) -> Result<bool, ShepherdError> {
+        Ok(self.pane_cwds.borrow().contains_key(pane)
+            || self.pane_sessions.borrow().contains_key(pane)
+            || self
+                .agent_records
+                .borrow()
+                .iter()
+                .any(|a| a.pane_id == pane))
     }
     fn pane_session_ref(&self, pane: &str) -> Result<Option<String>, ShepherdError> {
         Ok(self.pane_sessions.borrow().get(pane).cloned())
@@ -325,6 +373,9 @@ impl Herdr for FakeHerdr {
         self.calls
             .borrow_mut()
             .push(format!("move {ids:?} {before:?}"));
+        if self.move_error.get() {
+            return Err(anyhow::anyhow!("simulated regroup failure").into());
+        }
         let mut workspaces = self.workspaces.borrow_mut();
         let moved: Vec<Workspace> = ids
             .iter()
@@ -345,5 +396,23 @@ impl Herdr for FakeHerdr {
             .unwrap_or(workspaces.len());
         workspaces.splice(position..position, moved);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_agent_retains_created_tab_workspace_and_cwd() {
+        let h = FakeHerdr::new(vec![]);
+        let (_, pane) = h
+            .create_tab("ticket:workspace", "coder", Path::new("/child"))
+            .unwrap();
+        h.start_agent("coder", "codex", &pane, &[], &HashMap::new())
+            .unwrap();
+        let info = h.agent_get("coder").unwrap().unwrap();
+        assert_eq!(info.workspace_id.as_deref(), Some("ticket:workspace"));
+        assert_eq!(info.cwd.as_deref(), Some(Path::new("/child")));
     }
 }

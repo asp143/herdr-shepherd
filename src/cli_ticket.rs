@@ -106,6 +106,18 @@ pub fn dispatch_with_backend(
                         },
                         cfg.upkeep.notifications,
                     )?;
+                    // Establish placement before launching tabs; optional Herdr
+                    // events may be unavailable. Reuse their setting and lock.
+                    // Upkeep failure must not discard a successfully owned ticket.
+                    if let Err(error) = herdr_shepherd::upkeep::event::handle_event_in_state(
+                        "worktree.created",
+                        &serde_json::json!({"workspace_id": ticket.workspace_id}),
+                        cfg,
+                        h,
+                        state,
+                    ) {
+                        eprintln!("shepherd: ticket workspace regroup warning: {error}");
+                    }
                     entered_stage = Some(ticket.state);
                     herdr_shepherd::hooks::emit(
                         cfg,
@@ -356,6 +368,17 @@ pub fn integrate(
         .into_iter()
         .find(|t| t.id == id)
         .ok_or_else(|| ShepherdError::Usage(format!("unknown ticket: {id}")))?;
+    // Final cleanup can own an unintegrated (including empty) child. Changing
+    // that identity would invalidate its durable receipt and strand both retries.
+    if ticket
+        .child_cleanup
+        .iter()
+        .any(|receipt| !receipt.child.integrated || !ticket.children.contains(&receipt.child))
+    {
+        return Err(ShepherdError::Usage(
+            "finish the outstanding cleanup before integrating this ticket".into(),
+        ));
+    }
     let path = ticket
         .worktree
         .clone()
@@ -425,31 +448,7 @@ pub fn integrate(
                 t.integration_ranges = report.ranges.clone();
                 Ok(())
             })?;
-            for child in &ticket.children {
-                for rec in store.read()?.agents.into_iter().filter(|a| {
-                    a.ticket == id && a.worktree == child.path && a.status == AgentStatus::Reported
-                }) {
-                    if !herdr_shepherd::flock::retire_automatically(h, store, &rec)? {
-                        return Err(ShepherdError::PolicyDenied(format!(
-                            "{}: automatic retirement deferred; child resources kept",
-                            rec.name
-                        )));
-                    }
-                }
-                children::cleanup_integrated(h, &path, std::slice::from_ref(child))?;
-                store.update(|data| {
-                    if let Some(t) = data.tickets.iter_mut().find(|t| t.id == id) {
-                        t.children.retain(|c| {
-                            c.unit != child.unit
-                                || c.path != child.path
-                                || c.branch != child.branch
-                                || c.base_sha != child.base_sha
-                                || c.workspace_id != child.workspace_id
-                        });
-                    }
-                    Ok(())
-                })?;
-            }
+            children::cleanup_integrated_recorded(h, store, &ticket)?;
             Ok(report)
         }
     }
@@ -840,3 +839,7 @@ mod dispatch_tests {
         assert_eq!(report["results"].as_array().unwrap().len(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "ticket_layout_tests.rs"]
+mod layout_tests;
