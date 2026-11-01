@@ -336,7 +336,7 @@ fn notify_comments(
             }
         }
         if count > 0 {
-            data.pending_pings.push(format!(
+            data.enqueue_lead_ping(&format!(
                 "{id}: {count} new PR comment(s), run ticket comments {id} --new"
             ));
         }

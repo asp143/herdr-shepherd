@@ -252,6 +252,48 @@ pub struct StoreData {
     pub protection_cache: crate::github::protection::ProtectionCache,
 }
 
+impl StoreData {
+    /// Queued requests plus notification claims normally share this capacity.
+    /// Preserve older oversized queues so explicit user requests are never lost.
+    pub const MAX_PENDING_PINGS: usize = 256;
+
+    fn pending_lead_requests(&self) -> usize {
+        self.pending_pings.len().saturating_add(
+            self.agents
+                .iter()
+                .filter_map(AgentRecord::prompt_claim)
+                .filter(|claim| claim.kind == "notification")
+                .count(),
+        )
+    }
+
+    /// Explicit requests retain their complete text and intentional duplicates.
+    pub fn enqueue_lead_request(&mut self, text: &str) -> Result<(), crate::error::ShepherdError> {
+        if self.pending_lead_requests() >= Self::MAX_PENDING_PINGS {
+            return Err(crate::error::ShepherdError::Usage(
+                "lead request queue is full; retry after pending requests are delivered".into(),
+            ));
+        }
+        self.pending_pings.push(text.into());
+        Ok(())
+    }
+
+    /// Automatic notices may be coalesced or skipped, never evict user requests.
+    pub fn enqueue_lead_ping(&mut self, text: &str) {
+        if self.pending_lead_requests() >= Self::MAX_PENDING_PINGS
+            || self.pending_pings.iter().any(|pending| pending == text)
+            || self
+                .agents
+                .iter()
+                .filter_map(AgentRecord::prompt_claim)
+                .any(|claim| claim.kind == "notification" && claim.text == text)
+        {
+            return;
+        }
+        self.pending_pings.push(text.into());
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LeadRecord {
     pub agent_name: String,

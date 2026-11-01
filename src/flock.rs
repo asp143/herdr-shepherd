@@ -172,7 +172,7 @@ pub fn reconcile(
                         "{}: {} launch_failed; role re-queued for agent spawn",
                         current.ticket, current.role
                     );
-                    data.pending_pings.push(message);
+                    data.enqueue_lead_ping(&message);
                     result.failed += 1;
                 }
                 None => {
@@ -228,7 +228,7 @@ pub fn ping(h: &dyn crate::herdr::Herdr, store: &crate::store::Store, text: &str
         .collect();
     if let Err(error) = store
         .update(|data| {
-            data.pending_pings.push(text);
+            data.enqueue_lead_ping(&text);
             Ok(())
         })
         .and_then(|_| crate::lead::flush_pings(h, store).map(|_| ()))

@@ -451,12 +451,16 @@ fn finish_revision(
         super::state::transition(ticket, TicketState::CiWait, None, now)?;
         ticket.ci_head_sha = Some(head.clone());
         ticket.ci_none_since = None;
+        let mut notifications = Vec::new();
         for comment in ticket.comments.iter_mut().filter(|comment| comment.verdict.as_deref() == Some("accepted") && !comment.acknowledged) {
             comment.ack_sha = Some(head.clone());
-            data.pending_pings.push(format!("{id}: run ticket ack {id} --comment {} --body-file <path>; explain the change and include commit {head}", comment.id));
+            notifications.push(format!("{id}: run ticket ack {id} --comment {} --body-file <path>; explain the change and include commit {head}", comment.id));
         }
         ticket.revision_run = None;
         ticket.revision_task = None;
+        for notification in notifications {
+            data.enqueue_lead_ping(&notification);
+        }
         Ok(RevisionOutcome::Pushed { sha: head })
     })?;
     if let RevisionOutcome::Pushed { sha } = &outcome {
@@ -490,7 +494,7 @@ fn block_push_conflict(
             Some(crate::store::BlockedReason::Conflict),
             now,
         )?;
-        data.pending_pings.push(message.clone());
+        data.enqueue_lead_ping(&message);
         Ok(())
     })?;
     crate::notify::Notifier::new(h, cfg.upkeep.notifications).send(&message, "");

@@ -158,6 +158,11 @@ pub(crate) fn dispatch(
         .is_err_and(|error| error.prompt_submission_uncertain());
     store.update(|data| {
         if queued && delivery.is_err() && !uncertain {
+            // Notification claims reserve queue capacity during transport. A
+            // report may clear that claim and allow one concurrent enqueue;
+            // retain this older request even then. The project-wide ping lock
+            // allows at most one restoration overflow, and future enqueue
+            // refuses the full queue until it drains.
             data.pending_pings.insert(0, claim.text.clone());
         }
         // A real report or retirement wins, even when it arrives during input.
