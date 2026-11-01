@@ -245,6 +245,9 @@ fn poll_ticket(
         if ticket.state == TicketState::CiWait && (checks == Checks::Passing || no_checks_ready) {
             let _hooks = crate::hooks::defer();
             let _dispatch = crate::ticket::revise::dispatch_lock(store, &ticket.id)?;
+            // Direct and CLI launches use admission rather than dispatch.
+            // Drain them before retiring the flock and making it inactive.
+            let _operation = crate::ticket::operation::exclusive(store, &ticket.id)?;
             if !store
                 .read()?
                 .tickets
@@ -1071,6 +1074,64 @@ mod tests {
                 .any(|call| call == "close_tab w1:t2")
         );
         assert!(fixture.store.read().unwrap().project_root.exists());
+    }
+
+    #[test]
+    fn ci_handoff_drains_nonrevision_admission() {
+        for checks in [Checks::Passing, Checks::None] {
+            let fixture = Fixture::new(TicketState::CiWait);
+            fixture.reported_agent();
+            let store = fixture.store.clone();
+            let agent = store
+                .update(|data| {
+                    data.tickets[0].ci_none_since = Some("0".into());
+                    Ok(data.agents.remove(0))
+                })
+                .unwrap();
+            // A direct or CLI launch owns shared admission before its agent
+            // record is persisted. Complete it while handoff is waiting.
+            let admission = crate::ticket::operation::shared(&store, "T1").unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let gh = FakeBackend::new(vec![Ok(Some(Fixture::status(checks)))]);
+                started_tx.send(()).unwrap();
+                let report = fixture.tick(&gh, 1000);
+                finished_tx.send(()).unwrap();
+                (fixture, report)
+            });
+            started_rx.recv().unwrap();
+            let early = finished_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_ok();
+            store
+                .update(|data| {
+                    data.agents.push(agent);
+                    Ok(())
+                })
+                .unwrap();
+            drop(admission);
+            let (fixture, report) = worker.join().unwrap();
+            assert!(
+                !early,
+                "CI handoff skipped an admitted nonrevision launch: {checks:?}"
+            );
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert_eq!(fixture.ticket().state, TicketState::PrOpen);
+            assert_eq!(
+                store.read().unwrap().agents[0].status,
+                crate::store::AgentStatus::Retired,
+                "handoff must retire the admitted launch before becoming inactive"
+            );
+            assert!(
+                fixture
+                    .h
+                    .calls
+                    .borrow()
+                    .iter()
+                    .any(|call| call == "close_tab w1:t2")
+            );
+        }
     }
 
     #[test]
