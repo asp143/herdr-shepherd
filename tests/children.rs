@@ -96,8 +96,11 @@ fn integrates_two_children_in_order() {
     let report = integrate(&repo.ticket, &mut children).unwrap();
     assert_eq!(report.units, [1, 2]);
     assert_eq!(
-        ok(&repo.ticket, &["log", "-2", "--format=%s"]),
-        "unit two\nunit one"
+        ok(
+            &repo.ticket,
+            &["log", "--first-parent", "-2", "--format=%s"]
+        ),
+        "Merge branch 'feat/tiny--2' into feat/tiny\nMerge branch 'feat/tiny--1' into feat/tiny"
     );
     assert_eq!(
         fs::read_to_string(repo.ticket.join("one.txt")).unwrap(),
@@ -139,10 +142,36 @@ fn conflict_aborts_and_keeps_branch_clean() {
         "base\n"
     );
     assert!(
-        !git(&repo.ticket, &["rev-parse", "--verify", "CHERRY_PICK_HEAD"])
+        !git(&repo.ticket, &["rev-parse", "--verify", "MERGE_HEAD"])
             .status
             .success()
     );
+    ok(
+        &repo.ticket,
+        &["merge", "--no-ff", "--no-edit", &children[0].branch],
+    );
+    assert!(
+        !git(
+            &repo.ticket,
+            &["merge", "--no-ff", "--no-edit", &children[1].branch]
+        )
+        .status
+        .success()
+    );
+    fs::write(repo.ticket.join("shared.txt"), "resolved both units\n").unwrap();
+    ok(&repo.ticket, &["add", "shared.txt"]);
+    ok(&repo.ticket, &["commit", "--no-edit"]);
+    let resolved = ok(&repo.ticket, &["rev-parse", "HEAD"]);
+    let report = integrate(&repo.ticket, &mut children).unwrap();
+    assert_eq!(report.head, resolved, "recognize the resolver's merges");
+    assert_eq!(report.ranges, ranges);
+    assert!(children.iter().all(|child| child.integrated));
+    for child in &children {
+        ok(
+            &repo.ticket,
+            &["merge-base", "--is-ancestor", &child.branch, "HEAD"],
+        );
+    }
 }
 
 #[test]
@@ -1105,7 +1134,7 @@ fn integration_retries_before_integrated_flags_are_persisted() {
     let repo = Repo::new();
     let mut children = vec![repo.child(1), repo.child(2)];
     Repo::commit(&children[0], "one", "one", "unit one");
-    // Retry must recognize provenance for text and binary commits alike.
+    // Retry must recognize ancestry for text and binary commits alike.
     Repo::commit(&children[1], "two", "two  \n", "unit two");
     Repo::commit(&children[1], "binary", "binary\0data", "binary work");
     let store = Store::open(&repo.dir.path().join("state"), &repo.main).unwrap();
@@ -1119,8 +1148,8 @@ fn integration_retries_before_integrated_flags_are_persisted() {
         })
         .unwrap();
     let head = integrate(&repo.ticket, &mut children).unwrap().head;
-    // Force a real persistence failure after all picks landed. The durable
-    // records remain pending and unit two has new cherry-picked commit SHAs.
+    // Force a real persistence failure after all merges landed. The durable
+    // records remain pending, but the child tips are already ancestors.
     fs::create_dir(store.root().join("state.json.tmp")).unwrap();
     assert!(
         store
@@ -1191,7 +1220,7 @@ fn cleanup_preserves_unrecorded_reverted_equivalence() {
 }
 
 #[test]
-fn provenance_does_not_match_another_block_after_revert() {
+fn ancestry_does_not_match_another_block_after_revert() {
     use herdr_shepherd::ticket::children::cleanup_integrated;
     let repo = Repo::new();
     let original = "first function\nA\nB\nC\nold\nD\nE\nF\npadding\npadding\npadding\npadding\nsecond function\nA\nB\nC\nnew\nD\nE\nF\n";
@@ -1235,7 +1264,7 @@ fn provenance_does_not_match_another_block_after_revert() {
 }
 
 #[test]
-fn provenance_records_independent_equivalence_and_empty_commits() {
+fn ancestry_merges_independent_equivalence_and_empty_commits() {
     use herdr_shepherd::ticket::children::cleanup_integrated;
     let repo = Repo::new();
     let child = guarded_child(&repo, 1, true);
@@ -1248,38 +1277,51 @@ fn provenance_records_independent_equivalence_and_empty_commits() {
     fs::write(repo.ticket.join("a"), "identical\n").unwrap();
     ok(&repo.ticket, &["add", "a"]);
     ok(&repo.ticket, &["commit", "-m", "independent equivalent"]);
+    let mut claimed = child.clone();
+    claimed.integrated = true;
+    assert!(cleanup_integrated(&LocalHerdr::default(), &repo.ticket, &[claimed]).is_err());
+    assert!(child.path.exists());
+    assert_eq!(ok(&repo.ticket, &["rev-parse", &child.branch]), empty);
     let before = ok(&repo.ticket, &["rev-parse", "HEAD"]);
     let mut children = [child, guarded_child(&repo, 2, true)];
     let report = integrate(&repo.ticket, &mut children).unwrap();
     assert_ne!(
         report.head, before,
-        "an independent patch needs its own integration record"
+        "an independent patch needs actual child ancestry"
     );
     let messages = ok(
         &repo.ticket,
-        &["log", "--format=%B", &format!("{before}..HEAD")],
+        &[
+            "log",
+            "--first-parent",
+            "--format=%B",
+            &format!("{before}..HEAD"),
+        ],
     );
+    assert_eq!(messages, "Merge branch 'feat/tiny--1' into feat/tiny");
     for sha in [&tip, &empty] {
-        assert!(
-            messages.contains(&format!("(cherry picked from commit {sha})")),
-            "{messages}"
-        );
+        ok(&repo.ticket, &["merge-base", "--is-ancestor", sha, "HEAD"]);
     }
     herdr_shepherd::ticket::pr_body::check_attribution(&messages).unwrap();
     assert!(!messages.contains("Co-Authored-By:"));
     assert_eq!(
         ok(
             &repo.ticket,
-            &["rev-list", "--count", &format!("{before}..HEAD")]
+            &[
+                "rev-list",
+                "--first-parent",
+                "--count",
+                &format!("{before}..HEAD")
+            ]
         ),
-        "2"
+        "1"
     );
     cleanup_integrated(&LocalHerdr::default(), &repo.ticket, &children).unwrap();
     assert!(children.iter().all(|c| !c.path.exists()));
 }
 
 #[test]
-fn provenance_retry_finishes_partial_child_without_duplicate_picks() {
+fn ancestry_retry_recovers_legacy_partial_picks() {
     let repo = Repo::new();
     let child = repo.child(1);
     let first = Repo::commit(&child, "first", "one\n", "first child commit");
@@ -1299,7 +1341,7 @@ fn provenance_retry_finishes_partial_child_without_duplicate_picks() {
     assert!(integrate(&repo.ticket, &mut children).is_err());
     assert!(
         !children[0].integrated,
-        "one recorded pick does not prove the whole child"
+        "one recorded pick does not prove child ancestry"
     );
     assert_eq!(ok(&repo.ticket, &["rev-parse", "HEAD"]), partial);
     fs::write(repo.ticket.join("shared.txt"), "base\n").unwrap();
@@ -1318,7 +1360,7 @@ fn provenance_retry_finishes_partial_child_without_duplicate_picks() {
     let log = ok(&repo.ticket, &["log", "--format=%s"]);
     assert_eq!(
         log.lines().filter(|s| *s == "first child commit").count(),
-        1
+        2
     );
     assert_eq!(
         log.lines().filter(|s| *s == "second child commit").count(),
@@ -1327,27 +1369,28 @@ fn provenance_retry_finishes_partial_child_without_duplicate_picks() {
 }
 
 #[test]
-fn provenance_cleanup_allows_a_deliberate_later_revert() {
+fn ancestry_cleanup_allows_a_deliberate_later_revert() {
     let repo = Repo::new();
     let child = guarded_child(&repo, 1, true);
-    Repo::commit(&child, "a", "landed work\n", "child work");
+    let tip = Repo::commit(&child, "a", "landed work\n", "child work");
     ok(&repo.ticket, &["commit", "--allow-empty", "-m", "diverge"]);
     let mut children = [child];
     integrate(&repo.ticket, &mut children).unwrap();
-    ok(&repo.ticket, &["revert", "--no-edit", "HEAD"]);
+    ok(&repo.ticket, &["revert", "-m", "1", "--no-edit", "HEAD"]);
     herdr_shepherd::ticket::children::cleanup_integrated(
         &LocalHerdr::default(),
         &repo.ticket,
         &children,
     )
     .unwrap();
+    ok(&repo.ticket, &["merge-base", "--is-ancestor", &tip, "HEAD"]);
     assert!(!children[0].path.exists());
     assert!(!repo.ticket.join("a").exists());
     assert!(ok(&repo.ticket, &["log", "--format=%s"]).contains("Revert"));
 }
 
 #[test]
-fn provenance_legacy_integrated_records_require_containment_or_manual_merge() {
+fn ancestry_legacy_integrated_records_require_containment_or_manual_merge() {
     use herdr_shepherd::ticket::children::cleanup_integrated;
     for native in [true, false] {
         let repo = Repo::new();
@@ -1379,7 +1422,10 @@ fn provenance_legacy_integrated_records_require_containment_or_manual_merge() {
                 &child.branch,
             ],
         );
-        cleanup_integrated(&h, &repo.ticket, &[child.clone()]).unwrap();
+        let mut children = [child.clone()];
+        let head = ok(&repo.ticket, &["rev-parse", "HEAD"]);
+        assert_eq!(integrate(&repo.ticket, &mut children).unwrap().head, head);
+        cleanup_integrated(&h, &repo.ticket, &children).unwrap();
         assert!(!child.path.exists());
         assert_eq!(
             fs::read_to_string(repo.ticket.join("a")).unwrap(),
@@ -1389,7 +1435,7 @@ fn provenance_legacy_integrated_records_require_containment_or_manual_merge() {
 }
 
 #[test]
-fn provenance_cleanup_preserves_staged_ticket_refusal() {
+fn ancestry_cleanup_preserves_staged_ticket_refusal() {
     let repo = Repo::new();
     let child = guarded_child(&repo, 1, true);
     let tip = Repo::commit(&child, "a", "landed work\n", "child work");
@@ -1411,4 +1457,191 @@ fn provenance_cleanup_preserves_staged_ticket_refusal() {
         ok(&repo.ticket, &["show", ":shared.txt"]),
         "staged ticket edit"
     );
+}
+
+#[test]
+fn ancestry_rejects_forged_trailer_then_merges_payload() {
+    use herdr_shepherd::ticket::children::cleanup_integrated;
+    let repo = Repo::new();
+    let mut child = guarded_child(&repo, 1, true);
+    let tip = Repo::commit(&child, "payload", "irreplaceable work\n", "child payload");
+    ok(
+        &repo.ticket,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            &format!("fake integration\n\n(cherry picked from commit {tip})"),
+        ],
+    );
+    child.integrated = true;
+    let error =
+        cleanup_integrated(&LocalHerdr::default(), &repo.ticket, &[child.clone()]).unwrap_err();
+    assert!(error.to_string().contains("not integrated"), "{error}");
+    assert!(child.path.exists());
+    assert_eq!(ok(&repo.ticket, &["rev-parse", &child.branch]), tip);
+    child.integrated = false;
+    let mut children = [child];
+    integrate(&repo.ticket, &mut children).unwrap();
+    assert_eq!(
+        fs::read_to_string(repo.ticket.join("payload")).unwrap(),
+        "irreplaceable work\n"
+    );
+    ok(&repo.ticket, &["merge-base", "--is-ancestor", &tip, "HEAD"]);
+    cleanup_integrated(&LocalHerdr::default(), &repo.ticket, &children).unwrap();
+}
+
+#[test]
+fn ancestry_rewrite_keeps_child_resources() {
+    use herdr_shepherd::ticket::children::cleanup_integrated;
+    for rewrite in ["reset", "rebase"] {
+        let repo = Repo::new();
+        let child = guarded_child(&repo, 1, true);
+        let tip = Repo::commit(&child, "payload", "keep original\n", "child payload");
+        ok(
+            &repo.ticket,
+            &["commit", "--allow-empty", "-m", "ticket divergence"],
+        );
+        let before = ok(&repo.ticket, &["rev-parse", "HEAD"]);
+        let mut children = [child];
+        integrate(&repo.ticket, &mut children).unwrap();
+        match rewrite {
+            "reset" => {
+                ok(&repo.ticket, &["reset", "--soft", &before]);
+                ok(
+                    &repo.ticket,
+                    &["commit", "-m", "replacement without ancestry"],
+                );
+            }
+            "rebase" => {
+                // Rebuild onto a distinct ticket commit, flattening the merge.
+                ok(&repo.main, &["checkout", "-b", "replacement-base", &before]);
+                ok(&repo.main, &["commit", "--allow-empty", "-m", "new base"]);
+                ok(
+                    &repo.ticket,
+                    &["rebase", "--onto", "replacement-base", &before],
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !git(&repo.ticket, &["merge-base", "--is-ancestor", &tip, "HEAD"])
+                .status
+                .success()
+        );
+        let error =
+            cleanup_integrated(&LocalHerdr::default(), &repo.ticket, &children).unwrap_err();
+        assert!(
+            error.to_string().contains("not integrated"),
+            "{rewrite}: {error}"
+        );
+        assert!(error.to_string().contains("merge"), "{error}");
+        assert!(children[0].path.exists());
+        assert_eq!(ok(&repo.ticket, &["rev-parse", &children[0].branch]), tip);
+    }
+}
+
+#[test]
+fn ancestry_cleanup_retry_after_later_edit() {
+    use herdr_shepherd::ticket::children::cleanup_integrated;
+    let repo = Repo::new();
+    let h = LocalHerdr::default();
+    let child = guarded_child(&repo, 1, true);
+    let tip = Repo::commit(&child, "shared.txt", "child work\n", "child work");
+    let mut children = [child];
+    integrate(&repo.ticket, &mut children).unwrap();
+    fs::write(children[0].path.join("local"), "keep until clean").unwrap();
+    assert!(cleanup_integrated(&h, &repo.ticket, &children).is_err());
+    fs::write(repo.ticket.join("shared.txt"), "later edit\n").unwrap();
+    ok(&repo.ticket, &["commit", "-am", "edit integrated lines"]);
+    fs::remove_file(children[0].path.join("local")).unwrap();
+    cleanup_integrated(&h, &repo.ticket, &children).unwrap();
+    ok(&repo.ticket, &["merge-base", "--is-ancestor", &tip, "HEAD"]);
+    assert!(!children[0].path.exists());
+}
+
+#[test]
+fn ancestry_merge_overrides_conflicting_git_defaults() {
+    let repo = Repo::new();
+    let child = repo.child(1);
+    let tip = Repo::commit(&child, "payload", "work\n", "child work");
+    ok(&repo.ticket, &["config", "merge.ff", "only"]);
+    ok(&repo.ticket, &["config", "commit.gpgsign", "true"]);
+    ok(&repo.ticket, &["config", "gpg.program", "/does/not/exist"]);
+    ok(
+        &repo.ticket,
+        &[
+            "config",
+            "branch.feat/tiny.mergeOptions",
+            "--squash --no-commit",
+        ],
+    );
+    let mut children = [child];
+    integrate(&repo.ticket, &mut children).unwrap();
+    ok(&repo.ticket, &["merge-base", "--is-ancestor", &tip, "HEAD"]);
+    assert_eq!(
+        ok(&repo.ticket, &["rev-list", "--parents", "-1", "HEAD"])
+            .split_whitespace()
+            .count(),
+        3
+    );
+    assert!(ok(&repo.ticket, &["status", "--porcelain"]).is_empty());
+}
+
+#[test]
+fn ancestry_integrates_children_with_only_empty_commits() {
+    use herdr_shepherd::ticket::children::cleanup_integrated;
+    for commits in [0, 2] {
+        let repo = Repo::new();
+        let child = guarded_child(&repo, 1, true);
+        for _ in 0..commits {
+            ok(
+                &child.path,
+                &["commit", "--allow-empty", "-m", "empty child work"],
+            );
+        }
+        let tip = ok(&child.path, &["rev-parse", "HEAD"]);
+        let mut children = [child];
+        integrate(&repo.ticket, &mut children).unwrap();
+        ok(&repo.ticket, &["merge-base", "--is-ancestor", &tip, "HEAD"]);
+        cleanup_integrated(&LocalHerdr::default(), &repo.ticket, &children).unwrap();
+        assert!(!children[0].path.exists());
+        assert!(ok(&repo.ticket, &["branch", "--list", &children[0].branch]).is_empty());
+    }
+}
+
+#[test]
+fn ancestry_merge_hook_failure_restores_transaction() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = Repo::new();
+    let mut children = [repo.child(1), repo.child(2)];
+    Repo::commit(&children[0], "one", "first unit\n", "first unit");
+    Repo::commit(&children[1], "two", "second unit\n", "second unit");
+    let hooks = repo.dir.path().join("merge-hooks");
+    fs::create_dir(&hooks).unwrap();
+    let hook = hooks.join("pre-merge-commit");
+    fs::write(&hook, "#!/bin/sh\ntest ! -f two\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    ok(
+        &repo.ticket,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    let before = ok(&repo.ticket, &["rev-parse", "HEAD"]);
+    let error = integrate(&repo.ticket, &mut children).unwrap_err();
+    assert!(matches!(error, ShepherdError::Conflict { unit: 2, .. }));
+    assert_eq!(ok(&repo.ticket, &["rev-parse", "HEAD"]), before);
+    assert!(ok(&repo.ticket, &["status", "--porcelain"]).is_empty());
+    assert!(
+        !git(&repo.ticket, &["rev-parse", "--verify", "MERGE_HEAD"])
+            .status
+            .success()
+    );
+    assert!(
+        children
+            .iter()
+            .all(|child| !child.integrated && child.path.exists())
+    );
+    fs::remove_file(hook).unwrap();
+    integrate(&repo.ticket, &mut children).unwrap();
+    assert!(children.iter().all(|child| child.integrated));
 }

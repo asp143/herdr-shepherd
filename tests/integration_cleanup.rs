@@ -563,7 +563,7 @@ fn retry_refuses_changed_resources_and_unintegrated_commits() {
             "ticket-rewind" => {
                 assert_eq!(
                     error,
-                    "child commits are not integrated; missing integration provenance. Review and merge feat/t--1 into the ticket branch, then retry cleanup",
+                    "child commits are not integrated; child tip is not an ancestor of ticket HEAD. Review and merge feat/t--1 into the ticket branch, then retry cleanup",
                     "{change}"
                 );
             }
@@ -611,7 +611,7 @@ fn whole_set_preflight_retains_earlier_children() {
         let expected = match change {
             "dirty" => "child worktree must be clean before cleanup",
             "unintegrated" => {
-                "child commits are not integrated; missing integration provenance. Review and merge feat/t--2 into the ticket branch, then retry cleanup"
+                "child commits are not integrated; child tip is not an ancestor of ticket HEAD. Review and merge feat/t--2 into the ticket branch, then retry cleanup"
             }
             "unguarded" => "child worktree ownership changed",
             "live" => "child still has an unowned or active agent",
@@ -747,7 +747,7 @@ fn reassigned_legacy_workspace_is_not_closed_after_removal() {
 }
 
 #[test]
-fn provenance_receipt_survives_later_edits_to_landed_lines() {
+fn ancestry_receipt_survives_later_edits_to_landed_lines() {
     let f = Fixture::new(&[false, false]);
     git(
         &f.h.root,

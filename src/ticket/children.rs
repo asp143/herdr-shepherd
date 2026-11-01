@@ -146,31 +146,29 @@ pub fn integrate(
     for (index, child) in pending {
         let range = format!("{}..{}", child.base_sha, child.branch);
         let tip = git(ticket_wt, &["rev-parse", &child.branch])?;
-        let head = git(ticket_wt, &["rev-parse", "HEAD"])?;
-        for commit in unlanded_commits(ticket_wt, child, &tip, &head)? {
-            if git(
-                ticket_wt,
-                &[
-                    "-c",
-                    "commit.gpgsign=false",
-                    "cherry-pick",
-                    "-x",
-                    "--keep-redundant-commits",
-                    "--no-edit",
-                    &commit,
-                ],
-            )
-            .is_err()
-            {
-                // Roll back only this invocation. Provenance from any earlier
-                // partial integration stays in history for the next retry.
-                let _ = git(ticket_wt, &["cherry-pick", "--abort"]);
-                git(ticket_wt, &["reset", "--hard", &original_head])?;
-                return Err(ShepherdError::Conflict {
-                    unit: child.unit,
-                    range,
-                });
-            }
+        if git(
+            ticket_wt,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                "--no-squash",
+                "--commit",
+                &child.branch,
+            ],
+        )
+        .and_then(|_| git(ticket_wt, &["merge-base", "--is-ancestor", &tip, "HEAD"]))
+        .is_err()
+        {
+            // A later unit must not leave earlier merges from this invocation.
+            let _ = git(ticket_wt, &["merge", "--abort"]);
+            git(ticket_wt, &["reset", "--hard", &original_head])?;
+            return Err(ShepherdError::Conflict {
+                unit: child.unit,
+                range,
+            });
         }
         units.push(child.unit);
         ranges.push(range);
@@ -413,59 +411,6 @@ fn preflight_integrated(
     Ok(targets)
 }
 
-// Ancestry proves direct containment, including integrations by older
-// binaries. Otherwise only explicit -x records on the ticket's first-parent
-// history count. Patch equivalence cannot distinguish unrelated or reverted
-// work. Read only the final line so inherited records in a picked message do
-// not claim that other commits landed here.
-fn unlanded_commits(
-    ticket_wt: &Path,
-    child: &ChildWorktree,
-    tip: &str,
-    head: &str,
-) -> Result<Vec<String>, ShepherdError> {
-    if git(ticket_wt, &["merge-base", "--is-ancestor", tip, head]).is_ok() {
-        return Ok(Vec::new());
-    }
-    git(
-        ticket_wt,
-        &["merge-base", "--is-ancestor", &child.base_sha, head],
-    )?;
-    let history = git(
-        ticket_wt,
-        &[
-            "log",
-            "--first-parent",
-            "--format=%B%x00",
-            &format!("{}..{head}", child.base_sha),
-        ],
-    )?;
-    let landed: HashSet<_> = history
-        .split('\0')
-        .filter_map(|message| {
-            message
-                .trim_end()
-                .lines()
-                .last()?
-                .strip_prefix("(cherry picked from commit ")?
-                .strip_suffix(')')
-        })
-        .collect();
-    Ok(git(
-        ticket_wt,
-        &[
-            "rev-list",
-            "--reverse",
-            "--topo-order",
-            &format!("{}..{tip}", child.base_sha),
-        ],
-    )?
-    .lines()
-    .filter(|commit| !landed.contains(commit))
-    .map(str::to_owned)
-    .collect())
-}
-
 fn verify_integrated_tip(
     ticket_wt: &Path,
     child: &ChildWorktree,
@@ -482,9 +427,9 @@ fn verify_integrated_tip(
         &["merge-base", "--is-ancestor", &child.base_sha, tip],
     )?;
     git(ticket_wt, &["diff", "--cached", "--quiet", head])?;
-    if !unlanded_commits(ticket_wt, child, tip, head)?.is_empty() {
+    if git(ticket_wt, &["merge-base", "--is-ancestor", tip, head]).is_err() {
         return Err(ShepherdError::PolicyDenied(format!(
-            "child commits are not integrated; missing integration provenance. Review and merge {} into the ticket branch, then retry cleanup",
+            "child commits are not integrated; child tip is not an ancestor of ticket HEAD. Review and merge {} into the ticket branch, then retry cleanup",
             child.branch
         )));
     }
