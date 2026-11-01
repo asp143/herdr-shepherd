@@ -160,7 +160,14 @@ pub fn flush_pings(h: &dyn Herdr, store: &Store) -> Result<usize, ShepherdError>
     let Some(message) = store.read()?.pending_pings.first().cloned() else {
         return Ok(0);
     };
-    h.prompt_agent(&lead.agent_name, &message, false)?;
+    if let Err(error) = h.prompt_agent(&lead.agent_name, &message, false) {
+        if error.herdr_code() == Some("agent_blocked") {
+            return Ok(0);
+        }
+        if !error.prompt_was_submitted() {
+            return Err(error);
+        }
+    }
     store.update(|data| {
         if data.pending_pings.first() == Some(&message) {
             data.pending_pings.remove(0);
