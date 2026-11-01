@@ -106,6 +106,18 @@ pub fn dispatch_with_backend(
                         },
                         cfg.upkeep.notifications,
                     )?;
+                    // Establish placement before launching tabs; optional Herdr
+                    // events may be unavailable. Reuse their setting and lock.
+                    // Upkeep failure must not discard a successfully owned ticket.
+                    if let Err(error) = herdr_shepherd::upkeep::event::handle_event_in_state(
+                        "worktree.created",
+                        &serde_json::json!({"workspace_id": ticket.workspace_id}),
+                        cfg,
+                        h,
+                        state,
+                    ) {
+                        eprintln!("shepherd: ticket workspace regroup warning: {error}");
+                    }
                     entered_stage = Some(ticket.state);
                     herdr_shepherd::hooks::emit(
                         cfg,
@@ -846,3 +858,7 @@ mod dispatch_tests {
         assert_eq!(report["results"].as_array().unwrap().len(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "ticket_layout_tests.rs"]
+mod layout_tests;

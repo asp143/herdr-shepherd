@@ -511,7 +511,7 @@ fn integration_retires_only_child_tab_with_canonical_cwd() {
         })
         .unwrap();
     fs::write(f.dir.path().join("fake.json"), serde_json::to_vec(&serde_json::json!({"agents": [
-        {"name":"child", "agent":"fake", "agent_status":"idle", "cwd":child, "pane_id":"w1:p1", "workspace_id":null},
+        {"name":"child", "agent":"fake", "agent_status":"idle", "cwd":child, "pane_id":"w1:p1", "workspace_id":"w1"},
         {"name":"sibling", "agent":"fake", "agent_status":"idle", "cwd":f.root, "pane_id":"w1:p2", "workspace_id":"w1"}
     ]})).unwrap()).unwrap();
     let out = f
