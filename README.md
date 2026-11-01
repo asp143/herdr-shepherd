@@ -254,6 +254,37 @@ cargo test --locked
 
 Tests use temporary repositories and bare remotes, fake GitHub/Herdr/probe implementations, and sanitized fixtures. Git fixtures ignore host signing configuration. `cargo test --locked --features test-support` additionally verifies the public fake Herdr interface. `proc::capture` exposes exit status and stderr; `proc::run` remains the compatibility wrapper for Phase 1 callers. Cadence and pane-event supervision use owned-agent fixtures. Licensed under MIT.
 
+### Managed OMP prompt delivery
+
+Managed OMP launch, native resume and provider fallback add a final per-run
+`--config <state>/omp-paste-v1.yml` overlay containing only
+`paste.largeMenuThreshold: 0`. This prevents the large-paste menu from consuming
+the submit key for multiline flock tasks. Configured runner arguments, model
+selection and other overlays are retained; shepherd does not read or modify
+user OMP settings. The overlay is written atomically in shepherd's state directory.
+
+This uses the public repeatable `--config` overlay and paste setting verified
+with OMP 18.14.1. Older or other builds must support both features; unsupported
+startup errors are surfaced without dropping the overlay or trying another
+submission. Upgrade an incompatible OMP build before using managed OMP runners.
+Already running agents are unaffected. Ambiguous prompt outcomes remain
+quarantined for operator inspection and are never automatically replayed.
+
+An opt-in PTY regression uses the installed OMP with empty fixture HOME/XDG and
+agent directories, no tools/extensions/context files, and a loopback fake
+provider inside a separate network namespace. It requires Python 3 and bwrap:
+
+```sh
+SHEPHERD_TEST_OMP_BIN=/absolute/path/to/omp cargo test --locked --features test-support --test omp_prompt_delivery -- --ignored --nocapture
+```
+
+The regression passes the actual managed launch arguments and a generated
+multiline flock task to OMP. It checks separate paste/CSI 13u and combined
+paste/CSI 13;1:1u, with exactly one provider turn per intended submission.
+These are causal fixture controls; historical Herdr encoding and chunk
+boundaries and live OMP delivery remain unverified. The test creates its own
+bwrap sandbox; a surrounding sandbox must allow nested user/network namespaces.
+
 ## Credential controls and their limits
 
 Agents use a generated global Git config that omits every credential helper,

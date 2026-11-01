@@ -555,7 +555,10 @@ fn resume(ctx: &ApplyContext<'_>, rec: &AgentRecord) -> Result<(), ShepherdError
         &rec.name,
         harness.kind(),
         pane,
-        &harness.resume_args(runner, session.as_deref()),
+        &harness.managed_args(
+            harness.resume_args(runner, session.as_deref()),
+            ctx.state_dir,
+        )?,
         &launch_env(ctx.state_dir, &project),
     );
     match result {
@@ -658,7 +661,7 @@ fn respawn(
         &rec.name,
         harness.kind(),
         &pane,
-        &harness.launch_args(runner),
+        &harness.managed_args(harness.launch_args(runner), ctx.state_dir)?,
         &launch_env(ctx.state_dir, &data.project_root),
     )?;
     if start == AgentStart::Ready {
@@ -1325,6 +1328,59 @@ mod tests {
         assert_eq!(store.read().unwrap().agents[0].restarts, 1);
     }
     #[test]
+    fn managed_omp_native_resume_preserves_session_and_args() {
+        for session in [None, Some("fixture-session")] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, cfg, h) = fixture(dir.path());
+            store
+                .update(|d| {
+                    d.agents[0].runner = "omp-astra".into();
+                    Ok(())
+                })
+                .unwrap();
+            let rec = store.read().unwrap().agents[0].clone();
+            h.agent_records.borrow_mut().clear();
+            h.pane_cwds
+                .borrow_mut()
+                .insert("w1:p1".into(), rec.worktree.clone());
+            if let Some(session) = session {
+                h.pane_sessions
+                    .borrow_mut()
+                    .insert("w1:p1".into(), session.into());
+            }
+            apply(
+                &ApplyContext {
+                    h: &h,
+                    store: &store,
+                    cfg: &cfg,
+                    state_dir: &dir.path().join("state"),
+                    now_s: 1,
+                },
+                &rec,
+                &Decision::Resume,
+            )
+            .unwrap();
+            let args = h.start_args.borrow();
+            let pinned = roles::resolve(&cfg).unwrap().runners["omp-astra"]
+                .args
+                .clone();
+            assert_eq!(&args[0][..pinned.len()], pinned);
+            assert_eq!(args[0][args[0].len() - 2], "--config");
+            assert_eq!(
+                std::fs::read_to_string(args[0].last().unwrap()).unwrap(),
+                "paste:\n  largeMenuThreshold: 0\n"
+            );
+            assert_eq!(args[0][pinned.len()], "--resume");
+            if let Some(session) = session {
+                assert_eq!(args[0][pinned.len() + 1], session);
+            }
+            assert!(h.accepted_prompts.borrow().is_empty());
+            assert_eq!(store.read().unwrap().agents[0].runner, "omp-astra");
+            assert_eq!(store.read().unwrap().agents[0].pane_id, rec.pane_id);
+        }
+    }
+
+    #[test]
     fn owned_lead_gets_pending_prompt_after_safe_unblock() {
         let dir = tempfile::tempdir().unwrap();
         let (store, cfg, h) = fixture(dir.path());
@@ -1511,6 +1567,12 @@ mod tests {
         let current = store.read().unwrap().agents[0].clone();
         assert_eq!(current.runner, "omp-astra");
         assert_eq!(current.restarts, 1);
+        let args = h.start_args.borrow();
+        assert_eq!(args[0][args[0].len() - 2], "--config");
+        assert_eq!(
+            std::fs::read_to_string(args[0].last().unwrap()).unwrap(),
+            "paste:\n  largeMenuThreshold: 0\n"
+        );
         assert!(!current.prompt_pending);
         assert!(
             h.calls

@@ -737,6 +737,54 @@ esac
         assert!(matches!(result, Ok(AgentStart::Ready)), "{result:?}");
     }
 
+    #[test]
+    fn start_agent_surfaces_unsupported_omp_overlay_without_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("herdr.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let bin = dir.path().join("herdr-fake");
+        let starts = dir.path().join("starts");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/bin/sh
+case "$1 $2" in
+  'pane run'|'pane wait-output') exit 0 ;;
+  'agent start')
+    printf '%s\n' "$@" >> {}
+    printf '%s\n' '{{"error":{{"code":"unsupported_config"}}}}'
+    exit 1 ;;
+  *) exit 9 ;;
+esac
+"#,
+                crate::gate::shim::shell_quote(&starts)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let h = CliHerdr { bin, socket };
+        let values = HashMap::from([(
+            "GIT_CONFIG_GLOBAL".into(),
+            dir.path()
+                .join("agent.gitconfig")
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+        let harness = crate::harness::harness_for("omp").unwrap();
+        let args = harness
+            .managed_args(vec!["--model".into(), "fixture/probe".into()], dir.path())
+            .unwrap();
+        let error = h
+            .start_agent("sh-fixture-coder-1", "omp", "owned:p1", &args, &values)
+            .unwrap_err();
+        assert_eq!(error.herdr_code(), Some("unsupported_config"));
+        let sent = std::fs::read_to_string(starts).unwrap();
+        assert_eq!(sent.lines().filter(|line| *line == "start").count(), 1);
+        assert_eq!(sent.lines().filter(|line| *line == "--config").count(), 1);
+        assert!(sent.ends_with(&format!("{}\n", args.last().unwrap())));
+    }
+
     fn output_fixture(text: &str) -> (tempfile::TempDir, CliHerdr, UnixListener) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();

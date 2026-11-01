@@ -28,6 +28,7 @@ pub struct FakeHerdr {
     pub visible_cache: RefCell<HashMap<String, String>>,
     pub read_errors: RefCell<HashMap<String, String>>,
     pub panic_on_start: Cell<bool>,
+    pub start_args: RefCell<Vec<Vec<String>>>,
     pub start_envs: RefCell<Vec<HashMap<String, String>>>,
     pub pane_cwds: RefCell<HashMap<String, std::path::PathBuf>>,
     pub pane_sessions: RefCell<HashMap<String, String>>,
@@ -49,6 +50,7 @@ impl FakeHerdr {
             visible_cache: RefCell::new(HashMap::new()),
             read_errors: RefCell::new(HashMap::new()),
             panic_on_start: Cell::new(false),
+            start_args: RefCell::new(Vec::new()),
             start_envs: RefCell::new(Vec::new()),
             pane_cwds: RefCell::new(HashMap::new()),
             pane_sessions: RefCell::new(HashMap::new()),
@@ -107,6 +109,7 @@ impl Herdr for FakeHerdr {
         self.calls
             .borrow_mut()
             .push(format!("start_agent {name} {kind} {pane} -- {args:?}"));
+        self.start_args.borrow_mut().push(args.to_vec());
         self.start_envs.borrow_mut().push(env.clone());
         let result = self
             .start_results

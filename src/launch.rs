@@ -277,7 +277,7 @@ fn launch_reserved(
             &record.name,
             harness.kind(),
             &pane,
-            &harness.launch_args(runner),
+            &harness.managed_args(harness.launch_args(runner), &req.state_dir)?,
             &env,
         )?;
         if start == AgentStart::NotReady {
@@ -460,6 +460,38 @@ mod tests {
         assert!(forwarded.is_empty());
         forward_fixture_env(&source, &state, Path::new("/home"), &mut forwarded);
         assert!(forwarded.is_empty());
+    }
+
+    #[test]
+    fn managed_omp_initial_launch_preserves_pinned_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let store = Store::open(&state, dir.path()).unwrap();
+        let h = FakeHerdr::new(vec![]);
+        let mut request = req(dir.path(), &state);
+        request.runners.remove(0);
+        request.runners[0].args.extend([
+            "--config".into(),
+            "custom.yml".into(),
+            "--no-title".into(),
+        ]);
+        let pinned = request.runners[0].args.clone();
+        let record = launch(&h, &store, request).unwrap();
+        let args = h.start_args.borrow();
+        assert_eq!(&args[0][..pinned.len()], pinned);
+        assert_eq!(args[0].len(), pinned.len() + 2);
+        assert_eq!(args[0][pinned.len()], "--config");
+        assert_eq!(
+            std::fs::read_to_string(&args[0][pinned.len() + 1]).unwrap(),
+            "paste:\n  largeMenuThreshold: 0\n"
+        );
+        assert_eq!(record.runner, "omp-astra");
+        assert_eq!(record.status, AgentStatus::Working);
+        assert_eq!(h.accepted_prompts.borrow().len(), 1);
+        assert_eq!(
+            h.start_envs.borrow()[0]["HERDR_PLUGIN_STATE_DIR"],
+            state.to_string_lossy()
+        );
     }
 
     #[test]
@@ -842,5 +874,12 @@ mod tests {
             .collect();
         assert_eq!(starts.len(), 2);
         assert!(starts[0].0 < close && close < starts[1].0);
+        let args = h.start_args.borrow();
+        assert!(!args[0].contains(&"--config".into()));
+        assert_eq!(args[1][args[1].len() - 2], "--config");
+        assert_eq!(
+            std::fs::read_to_string(args[1].last().unwrap()).unwrap(),
+            "paste:\n  largeMenuThreshold: 0\n"
+        );
     }
 }
