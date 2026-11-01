@@ -15,11 +15,15 @@ pub type StartObserver = Box<dyn Fn(&str) + Send>;
 
 pub struct FakeHerdr {
     pub on_start: RefCell<Option<StartObserver>>,
+    pub on_prompt: RefCell<Option<StartObserver>>,
     pub workspaces: RefCell<Vec<Workspace>>,
     pub calls: RefCell<Vec<String>>,
     pub notify_error: Cell<bool>,
     pub agent_records: RefCell<Vec<AgentInfo>>,
     pub start_results: RefCell<VecDeque<AgentStart>>,
+    /// Script transport outcomes independently of application acceptance.
+    pub prompt_results: RefCell<VecDeque<(bool, Result<(), ShepherdError>)>>,
+    pub accepted_prompts: RefCell<Vec<String>>,
     pub visible_screens: RefCell<VecDeque<String>>,
     pub visible_cache: RefCell<HashMap<String, String>>,
     pub read_errors: RefCell<HashMap<String, String>>,
@@ -33,11 +37,14 @@ impl FakeHerdr {
     pub fn new(workspaces: Vec<Workspace>) -> Self {
         Self {
             on_start: RefCell::new(None),
+            on_prompt: RefCell::new(None),
             workspaces: RefCell::new(workspaces),
             calls: RefCell::new(Vec::new()),
             notify_error: Cell::new(false),
             agent_records: RefCell::new(Vec::new()),
             start_results: RefCell::new(VecDeque::new()),
+            prompt_results: RefCell::new(VecDeque::new()),
+            accepted_prompts: RefCell::new(Vec::new()),
             visible_screens: RefCell::new(VecDeque::new()),
             visible_cache: RefCell::new(HashMap::new()),
             read_errors: RefCell::new(HashMap::new()),
@@ -133,6 +140,9 @@ impl Herdr for FakeHerdr {
         self.calls
             .borrow_mut()
             .push(format!("prompt_agent {name} {text} {until_working}"));
+        if let Some(observer) = self.on_prompt.borrow().as_ref() {
+            observer(name);
+        }
         if self
             .agent_records
             .borrow()
@@ -144,7 +154,15 @@ impl Herdr for FakeHerdr {
                 message: "agent is blocked".into(),
             });
         }
-        Ok(())
+        let (accepted, result) = self
+            .prompt_results
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or((true, Ok(())));
+        if accepted {
+            self.accepted_prompts.borrow_mut().push(name.into());
+        }
+        result
     }
     fn send_keys(&self, name: &str, keys: &[String]) -> Result<(), ShepherdError> {
         self.calls

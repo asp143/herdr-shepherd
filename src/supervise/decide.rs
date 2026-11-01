@@ -2,6 +2,7 @@ use crate::{gate::BranchPolicy, harness::Harness, roles::SupervisionSettings, st
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Condition {
+    PromptDeliveryUncertain,
     Blocked { screen: String },
     IdleNoReport { since_s: u64 },
     Stalled { since_min: u64 },
@@ -31,6 +32,14 @@ pub fn decide(
     in_worktree: bool,
     now_s: u64,
 ) -> Decision {
+    if matches!(cond, Condition::PromptDeliveryUncertain) {
+        return Decision::AskLead {
+            text: format!(
+                "{}: {} prompt delivery uncertain; inspect submission before sending input",
+                rec.ticket, rec.name
+            ),
+        };
+    }
     if let Condition::Blocked { screen } = cond {
         if let Some(reason) = policy_violation(screen, rec, policy) {
             return Decision::Deny { reason };

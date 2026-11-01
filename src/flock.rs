@@ -44,6 +44,7 @@ pub fn store_report(
         }
         agent.status = AgentStatus::Reported;
         agent.prompt_pending = false;
+        agent.set_prompt_delivery_uncertain(false);
         agent.report = Some(report.clone());
         let rec = agent.clone();
         if let Some(ticket) = data.tickets.iter_mut().find(|t| t.id == rec.ticket) {
@@ -103,19 +104,23 @@ pub fn reconcile(
             match &live {
                 Some(info) => {
                     current.pane_id = Some(info.pane_id.clone());
-                    current.status = if info.agent_status == "blocked" {
-                        AgentStatus::Blocked
-                    } else if current.prompt_pending
-                        && matches!(
-                            info.agent_status.as_str(),
-                            "unknown" | "starting" | "initializing"
-                        )
-                    {
-                        AgentStatus::Starting
-                    } else {
-                        AgentStatus::Working
-                    };
+                    current.status =
+                        if info.agent_status == "blocked" || current.prompt_delivery_uncertain() {
+                            AgentStatus::Blocked
+                        } else if current.prompt_pending
+                            && matches!(
+                                info.agent_status.as_str(),
+                                "unknown" | "starting" | "initializing"
+                            )
+                        {
+                            AgentStatus::Starting
+                        } else {
+                            AgentStatus::Working
+                        };
                     result.adopted += 1;
+                }
+                None if current.prompt_delivery_uncertain() => {
+                    current.status = AgentStatus::Blocked;
                 }
                 None if current.status == AgentStatus::Starting => {
                     current.status = AgentStatus::LaunchFailed;
@@ -150,7 +155,7 @@ pub fn reconcile(
                 ))
             };
             if let Err(error) = delivery
-                && !error.prompt_was_submitted()
+                && !error.prompt_submission_uncertain()
             {
                 store.update(|data| {
                     if let Some(current) = data.agents.iter_mut().find(|a| a.name == rec.name)
@@ -182,6 +187,17 @@ pub fn ping(h: &dyn crate::herdr::Herdr, store: &crate::store::Store, text: &str
         let Some(lead) = store.read()?.lead else {
             return Ok(false);
         };
+        let Some(_operation) = try_agent_operation(store, &lead.agent_name)? else {
+            return Ok(false);
+        };
+        if store
+            .read()?
+            .agents
+            .iter()
+            .any(|agent| agent.name == lead.agent_name && agent.prompt_delivery_uncertain())
+        {
+            return Ok(false);
+        }
         let Some(live) = h.agent_get(&lead.agent_name)? else {
             return Ok(false);
         };
@@ -329,8 +345,8 @@ pub fn try_agent_operation(
 }
 
 /// Serialize an initial task submission with recovery and pane-event senders.
-/// Keep the durable intent pending until herdr acknowledges submission; a
-/// process crash releases the lock without stranding an unsent task.
+/// Claim before dispatch: a crash or missing acknowledgement must never replay
+/// a possibly accepted task. Only a proven pre-input rejection restores intent.
 pub fn deliver_pending_prompt(
     h: &dyn crate::herdr::Herdr,
     store: &crate::store::Store,
@@ -359,27 +375,52 @@ pub fn deliver_pending_prompt(
     }) else {
         return Ok(false);
     };
-    let delivery = h.prompt_agent(name, &current.task, true);
-    if delivery.is_ok()
-        || delivery
-            .as_ref()
-            .is_err_and(|error| error.prompt_was_submitted())
-    {
-        store.update(|data| {
-            if let Some(current) = data.agents.iter_mut().find(|a| {
-                a.name == name
-                    && a.report.is_none()
-                    && matches!(
-                        a.status,
-                        AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
-                    )
-            }) {
-                current.prompt_pending = false;
-                current.status = AgentStatus::Working;
-            }
-            Ok(())
-        })?;
+    let task = current.task.clone();
+    let claimed = store.update(|data| {
+        let Some(current) = data.agents.iter_mut().find(|a| {
+            a.name == name
+                && a.prompt_pending
+                && a.report.is_none()
+                && matches!(
+                    a.status,
+                    AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
+                )
+        }) else {
+            return Ok(false);
+        };
+        current.prompt_pending = false;
+        current.status = AgentStatus::Blocked;
+        current.set_prompt_delivery_uncertain(true);
+        Ok(true)
+    })?;
+    if !claimed {
+        return Ok(false);
     }
+    let delivery = h
+        .prompt_agent(name, &task, true)
+        .map_err(ShepherdError::into_prompt_error);
+    store.update(|data| {
+        if let Some(current) = data.agents.iter_mut().find(|a| {
+            a.name == name
+                && a.report.is_none()
+                && matches!(
+                    a.status,
+                    AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
+                )
+        }) {
+            let uncertain = delivery
+                .as_ref()
+                .is_err_and(|error| error.prompt_submission_uncertain());
+            current.prompt_pending = delivery.is_err() && !uncertain;
+            current.status = if delivery.is_ok() {
+                AgentStatus::Working
+            } else {
+                AgentStatus::Blocked
+            };
+            current.set_prompt_delivery_uncertain(uncertain);
+        }
+        Ok(())
+    })?;
     delivery.map(|_| true)
 }
 
@@ -576,6 +617,60 @@ mod tests {
         );
         assert!(!store.read().unwrap().agents[0].prompt_pending);
     }
+    #[test]
+    fn retired_delivery_and_mismatched_recovery_never_send_input() {
+        use crate::store::AgentStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("state"), dir.path()).unwrap();
+        let rec = stored_agent(&store);
+        let h = crate::herdr::fake::FakeHerdr::new(vec![]);
+        store
+            .update(|data| {
+                data.agents[0].status = AgentStatus::Retired;
+                data.agents[0].prompt_pending = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!deliver_pending_prompt(&h, &store, &rec.name).unwrap());
+        reconcile(&h, &store).unwrap();
+        assert_eq!(store.read().unwrap().agents[0].status, AgentStatus::Retired);
+        store
+            .update(|data| {
+                data.agents[0].status = AgentStatus::Starting;
+                Ok(())
+            })
+            .unwrap();
+        let outside = dir.path().join("outside");
+        let assigned = dir.path().join("assigned");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(&assigned).unwrap();
+        store
+            .update(|data| {
+                data.agents[0].worktree = assigned.clone();
+                Ok(())
+            })
+            .unwrap();
+        h.agent_records.borrow_mut().push(crate::herdr::AgentInfo {
+            name: Some(rec.name),
+            agent: "omp".into(),
+            agent_status: "idle".into(),
+            cwd: Some(outside),
+            pane_id: "p1".into(),
+            workspace_id: Some("w1".into()),
+        });
+        assert!(matches!(
+            reconcile(&h, &store),
+            Err(ShepherdError::PolicyDenied(_))
+        ));
+        assert!(
+            !h.calls
+                .borrow()
+                .iter()
+                .any(|c| c.starts_with("prompt_agent") || c.starts_with("send_keys"))
+        );
+        assert!(h.accepted_prompts.borrow().is_empty());
+    }
+
     #[test]
     fn concurrent_reports_both_land() {
         let dir = tempfile::tempdir().unwrap();

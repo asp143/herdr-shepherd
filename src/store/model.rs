@@ -130,6 +130,32 @@ pub struct AgentRecord {
     pub prompt_pending: bool,
 }
 
+impl AgentRecord {
+    pub fn prompt_delivery_uncertain(&self) -> bool {
+        self.observed.as_deref().is_some_and(|text| {
+            // Older launchers wrote this literal before supervision observations.
+            text == "prompt_delivery_uncertain"
+                || serde_json::from_str::<serde_json::Value>(text).is_ok_and(|value| {
+                    value
+                        .get("prompt_delivery_uncertain")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                })
+        })
+    }
+
+    pub fn set_prompt_delivery_uncertain(&mut self, uncertain: bool) {
+        let mut observation = self
+            .observed
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        observation["prompt_delivery_uncertain"] = uncertain.into();
+        self.observed = Some(observation.to_string());
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {

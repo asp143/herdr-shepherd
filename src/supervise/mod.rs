@@ -29,12 +29,16 @@ struct Observation {
     session_ref: Option<String>,
     actions: Vec<String>,
     answered_hash: Option<String>,
+    prompt_delivery_uncertain: bool,
 }
 fn prior(rec: &AgentRecord) -> Observation {
-    rec.observed
+    let mut observation: Observation = rec
+        .observed
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    observation.prompt_delivery_uncertain = rec.prompt_delivery_uncertain();
+    observation
 }
 fn remember(rec: &mut AgentRecord, observation: &Observation) {
     rec.observed = Some(serde_json::to_string(observation).expect("observation serializes"));
@@ -81,7 +85,14 @@ fn observe_at(
     now: u64,
 ) -> Result<(Option<Condition>, Option<AgentInfo>), ShepherdError> {
     let Some(info) = h.agent_get(&rec.name)? else {
-        return Ok((Some(Condition::Exited), None));
+        return Ok((
+            Some(if rec.prompt_delivery_uncertain() {
+                Condition::PromptDeliveryUncertain
+            } else {
+                Condition::Exited
+            }),
+            None,
+        ));
     };
     let screen = h.read_visible(&rec.name)?;
     let mut previous = prior(rec);
@@ -127,7 +138,13 @@ fn observe_at(
     previous.hash = hash;
     previous.head = head;
     let elapsed = now.saturating_sub(previous.condition_since);
-    let condition = if status == "blocked" {
+    if status == "working" {
+        previous.prompt_delivery_uncertain = false;
+    }
+    let condition = if previous.prompt_delivery_uncertain {
+        rec.status = AgentStatus::Blocked;
+        Some(Condition::PromptDeliveryUncertain)
+    } else if status == "blocked" {
         rec.status = AgentStatus::Blocked;
         Some(Condition::Blocked { screen })
     } else if decide::provider_failure(rec, &screen, harness) {
@@ -295,6 +312,13 @@ pub fn apply(
     else {
         return Ok(());
     };
+    // Recheck quarantine against the durable record, including stale decisions
+    // computed before an ambiguous delivery. Never mutate that agent's terminal.
+    if current.prompt_delivery_uncertain()
+        && !matches!(decision, Decision::AskLead { .. } | Decision::Nothing)
+    {
+        return Ok(());
+    }
     let live = ctx.h.agent_get(&rec.name)?;
     let in_worktree = live
         .as_ref()
@@ -637,27 +661,29 @@ fn respawn(
         &harness.launch_args(runner),
         &launch_env(ctx.state_dir, &data.project_root),
     )?;
-    let status = if start == AgentStart::Ready {
-        match ctx.h.prompt_agent(&rec.name, &rec.task, true) {
-            Ok(()) => AgentStatus::Working,
-            Err(error) if error.prompt_was_submitted() => AgentStatus::Working,
-            Err(error) if error.herdr_code() == Some("agent_blocked") => AgentStatus::Blocked,
+    if start == AgentStart::Ready {
+        match crate::flock::deliver_pending_prompt(ctx.h, ctx.store, &rec.name) {
+            Ok(_) => {}
+            Err(error)
+                if error.prompt_submission_uncertain()
+                    || matches!(
+                        error.herdr_code(),
+                        Some("agent_blocked" | "agent_not_ready")
+                    ) => {}
             Err(error) => return Err(error),
         }
     } else {
-        AgentStatus::Blocked
-    };
-    ctx.store.update(|d| {
-        if let Some(a) = d
-            .agents
-            .iter_mut()
-            .find(|a| a.name == rec.name && active(a.status))
-        {
-            a.status = status;
-            a.prompt_pending = status != AgentStatus::Working;
-        }
-        Ok(())
-    })?;
+        ctx.store.update(|d| {
+            if let Some(a) = d
+                .agents
+                .iter_mut()
+                .find(|a| a.name == rec.name && active(a.status))
+            {
+                a.status = AgentStatus::Blocked;
+            }
+            Ok(())
+        })?;
+    }
     if ctx.cfg.upkeep.model_badge {
         ctx.h.report_pane_tokens(
             &pane,
@@ -691,7 +717,10 @@ fn deliver_pending(h: &dyn Herdr, store: &Store, rec: &AgentRecord) -> Result<()
     match crate::flock::deliver_pending_prompt(h, store, &rec.name) {
         Ok(_) => Ok(()),
         Err(error)
-            if error.herdr_code() == Some("agent_blocked") || error.prompt_was_submitted() =>
+            if matches!(
+                error.herdr_code(),
+                Some("agent_blocked" | "agent_not_ready")
+            ) || error.prompt_submission_uncertain() =>
         {
             Ok(())
         }
@@ -1363,6 +1392,96 @@ mod tests {
             1
         );
     }
+    #[test]
+    fn provider_fallback_quarantines_unknown_delivery_and_stale_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mut cfg, h) = fixture(dir.path());
+        cfg.raw = "[roles.coder]\nrunners=['codex-sol-high','omp-astra']\n"
+            .parse()
+            .unwrap();
+        h.prompt_results.borrow_mut().push_back((
+            false,
+            Err(ShepherdError::Runtime(crate::proc::DeadlineExceeded.into())),
+        ));
+        let rec = store.read().unwrap().agents[0].clone();
+        let ctx = ApplyContext {
+            h: &h,
+            store: &store,
+            cfg: &cfg,
+            state_dir: &dir.path().join("state"),
+            now_s: 1,
+        };
+        apply(&ctx, &rec, &Decision::Respawn).unwrap();
+        let current = store.read().unwrap().agents[0].clone();
+        assert_eq!(current.runner, "omp-astra");
+        assert_eq!(current.status, AgentStatus::Blocked);
+        assert!(!current.prompt_pending);
+        assert!(current.prompt_delivery_uncertain());
+        let calls = h.calls.borrow().len();
+        // These decisions can have been computed before quarantine was saved.
+        for decision in [
+            Decision::NudgeReport,
+            Decision::NudgeStatus,
+            Decision::Resume,
+            Decision::Respawn,
+            Decision::SendKeys {
+                rule: "trust".into(),
+                keys: vec!["enter".into()],
+            },
+            Decision::Deny {
+                reason: "stale screen".into(),
+            },
+        ] {
+            apply(&ctx, &rec, &decision).unwrap();
+        }
+        assert_eq!(h.calls.borrow().len(), calls);
+        assert_eq!(
+            h.calls
+                .borrow()
+                .iter()
+                .filter(|c| c.starts_with("prompt_agent"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_uncertain_lead_receives_no_notifications_or_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg, h) = fixture(dir.path());
+        store
+            .update(|data| {
+                let a = &mut data.agents[0];
+                a.role = "lead".into();
+                a.observed = Some("prompt_delivery_uncertain".into());
+                data.lead = Some(crate::store::LeadRecord {
+                    agent_name: a.name.clone(),
+                    tab_id: a.tab_id.clone(),
+                    pane_id: a.pane_id.clone(),
+                    workspace_id: Some("w1".into()),
+                    started_at: "0".into(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        h.agent_records.borrow_mut()[0].agent_status = "idle".into();
+        crate::flock::ping(&h, &store, "queued notification");
+        assert_eq!(crate::lead::flush_pings(&h, &store).unwrap(), 0);
+        for now in [1, 1000] {
+            let report =
+                supervise_project(&h, &store, &cfg, &dir.path().join("state"), now).unwrap();
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+        }
+        assert!(
+            !h.calls
+                .borrow()
+                .iter()
+                .any(|c| c.starts_with("prompt_agent") || c.starts_with("send_keys"))
+        );
+        assert!(store.read().unwrap().agents[0].prompt_delivery_uncertain());
+        assert!(!store.read().unwrap().pending_pings.is_empty());
+    }
+
     #[test]
     fn provider_fallback_pins_next_runner_without_resetting_restarts() {
         let dir = tempfile::tempdir().unwrap();

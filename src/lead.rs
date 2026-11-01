@@ -139,6 +139,17 @@ pub fn flush_pings(h: &dyn Herdr, store: &Store) -> Result<usize, ShepherdError>
     let Some(lead) = data.lead else {
         return Ok(0);
     };
+    let Some(_operation) = crate::flock::try_agent_operation(store, &lead.agent_name)? else {
+        return Ok(0);
+    };
+    if store
+        .read()?
+        .agents
+        .iter()
+        .any(|agent| agent.name == lead.agent_name && agent.prompt_delivery_uncertain())
+    {
+        return Ok(0);
+    }
     let Some(live) = h.agent_get(&lead.agent_name)? else {
         return Ok(0);
     };

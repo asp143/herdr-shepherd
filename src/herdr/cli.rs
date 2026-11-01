@@ -378,7 +378,9 @@ impl Herdr for CliHerdr {
         if until_working {
             args.extend(["--wait", "--until", "working", "--timeout", "30000"]);
         }
-        self.request(&args).map(|_| ())
+        self.request(&args)
+            .map(|_| ())
+            .map_err(ShepherdError::into_prompt_error)
     }
 
     fn send_keys(&self, name: &str, keys: &[String]) -> Result<(), ShepherdError> {
@@ -526,9 +528,85 @@ mod tests {
             .unwrap();
             let error = command_error(&output);
             assert_eq!(error.herdr_code(), expected);
-            assert_eq!(error.prompt_was_submitted(), expected == Some("timeout"));
+            assert!(
+                !error.prompt_submission_uncertain(),
+                "generic commands do not imply prompt dispatch"
+            );
         }
     }
+    #[test]
+    fn prompt_cli_preserves_argv_and_quarantines_unacknowledged_delivery() {
+        use std::os::unix::fs::PermissionsExt;
+        for (response, exit, code, uncertain) in [
+            (
+                r#"{"result":{"agent":{"agent_status":"working"}}}"#,
+                0,
+                None,
+                false,
+            ),
+            (
+                r#"{"error":{"code":"timeout","message":"private prompt text"}}"#,
+                1,
+                Some("timeout"),
+                true,
+            ),
+            (
+                r#"{"error":{"code":"agent_prompt_stalled","message":"private prompt text"}}"#,
+                1,
+                Some("agent_prompt_stalled"),
+                true,
+            ),
+            (
+                r#"{"error":{"code":"agent_blocked","message":"private prompt text"}}"#,
+                1,
+                Some("agent_blocked"),
+                false,
+            ),
+            (
+                r#"{"error":{"code":"agent_not_ready","message":"private prompt text"}}"#,
+                1,
+                Some("agent_not_ready"),
+                false,
+            ),
+            ("truncated acknowledgement", 0, None, true),
+            ("connection lost after dispatch", 1, None, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("herdr.sock");
+            let _listener = UnixListener::bind(&socket).unwrap();
+            let h = CliHerdr {
+                bin: dir.path().join("herdr-fake"),
+                socket,
+            };
+            let log = dir.path().join("argv");
+            std::fs::write(
+                &h.bin,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{}'\nexit {exit}\n",
+                    log.display(),
+                    response.replace('\'', "'\\''")
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&h.bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let result = h.prompt_agent("sh-fixture-researcher-1", "task with spaces", true);
+            let diagnostic = format!("{result:?}");
+            if exit == 0 && !uncertain {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.herdr_code(), code);
+                assert_eq!(error.prompt_submission_uncertain(), uncertain);
+                assert!(!error.to_string().contains("private prompt text"));
+                assert!(!error.to_string().contains("task with spaces"));
+            }
+            assert_eq!(
+                std::fs::read_to_string(log).expect(&diagnostic),
+                "agent\nprompt\nsh-fixture-researcher-1\ntask with spaces\n--wait\n--until\nworking\n--timeout\n30000\n"
+            );
+        }
+    }
+
     #[test]
     fn metadata_uses_socket_tokens_and_null_clears() {
         use std::io::{BufRead, BufReader, Write};
