@@ -602,16 +602,9 @@ mod tests {
     }
     #[test]
     fn pane_helpers_use_foreground_and_session_value_schema() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("herdr.sock");
-        let _listener = UnixListener::bind(&socket).unwrap();
-        let bin = dir.path().join("herdr-fake");
-        std::fs::write(&bin,r#"#!/bin/sh
-printf '%s\n' '{"result":{"pane":{"cwd":"/tmp/shell","foreground_cwd":"/tmp/foreground","agent_session":{"source":"integration","agent":"codex","kind":"thread","value":"fixture-session"}}}}'
-"#).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let h = CliHerdr { bin, socket };
+        let (_dir, h, _listener) = output_fixture(
+            r#"{"result":{"pane":{"cwd":"/tmp/shell","foreground_cwd":"/tmp/foreground","agent_session":{"source":"integration","agent":"codex","kind":"thread","value":"fixture-session"}}}}"#,
+        );
         assert_eq!(
             h.pane_cwd("owned:p1").unwrap().as_deref(),
             Some(std::path::Path::new("/tmp/foreground"))
@@ -623,24 +616,10 @@ printf '%s\n' '{"result":{"pane":{"cwd":"/tmp/shell","foreground_cwd":"/tmp/fore
     }
     #[test]
     fn start_agent_accepts_silent_run_and_text_wait() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("herdr.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
-        let bin = dir.path().join("herdr-fake");
-        std::fs::write(
-            &bin,
-            r#"#!/bin/sh
-case "$1 $2" in
-  'pane run') exit 0 ;;
-  'pane wait-output') printf '%s\n' 'matched readiness marker'; exit 0 ;;
-  'agent start') printf '%s\n' '{"result":{"agent":{"agent_status":"idle"}}}'; exit 0 ;;
-  *) exit 9 ;;
-esac
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/herdr-start.sh");
         let h = CliHerdr { bin, socket };
         let values = HashMap::from([(
             "GIT_CONFIG_GLOBAL".into(),
@@ -660,15 +639,38 @@ esac
     }
 
     fn output_fixture(text: &str) -> (tempfile::TempDir, CliHerdr, UnixListener) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("herdr.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let bin = dir.path().join("herdr-fake");
-        let quoted = text.replace('\'', "'\\''");
-        std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s' '{quoted}'\n")).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Never write executable inodes while parallel tests can fork. A child
+        // can inherit a writer before CLOEXEC takes effect and cause ETXTBSY.
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/herdr-output.sh");
+        std::fs::write(dir.path().join("response"), text).unwrap();
         (dir, CliHerdr { bin, socket }, listener)
+    }
+
+    #[test]
+    fn output_fixture_runs_with_retained_writers() {
+        let screen = "Trust 'this folder'?\nTrust and continue\n";
+        let (dir, h, _listener) = output_fixture(screen);
+        // A concurrent fork can retain a fixture writer until exec, even with
+        // CLOEXEC and after the creating thread has closed its own descriptor.
+        // Hold the same writable-inode state deterministically during capture.
+        let writers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(entry.path())
+                    .unwrap()
+            })
+            .collect();
+        assert!(!writers.is_empty());
+        let result = h.read_visible("sh-fixture-coder-1");
+        drop(writers);
+        assert_eq!(result.unwrap(), screen);
     }
 
     #[test]
