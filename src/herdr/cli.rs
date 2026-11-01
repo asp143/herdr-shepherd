@@ -353,9 +353,7 @@ impl Herdr for CliHerdr {
     fn pane_exists(&self, pane: &str) -> Result<bool, ShepherdError> {
         let output = self.capture(&["pane", "get", pane])?;
         if !output.status.success() {
-            if response_error(&output)
-                .is_some_and(|code| matches!(code.as_str(), "pane_not_found" | "not_found"))
-            {
+            if response_error(&output).as_deref() == Some("not_found") {
                 return Ok(false);
             }
             return Err(command_error(&output));
@@ -703,12 +701,15 @@ mod tests {
 
     #[test]
     fn closed_pane_is_proven_by_explicit_not_found_only() {
-        for code in ["pane_not_found", "not_found"] {
-            let (dir, h, _listener) =
-                output_fixture(&format!(r#"{{"error":{{"code":"{code}"}}}}"#));
-            std::fs::write(dir.path().join("exit-code"), "1\n").unwrap();
-            assert!(!h.pane_exists("owned:p1").unwrap());
-        }
+        let (dir, h, _listener) = output_fixture(r#"{"error":{"code":"not_found"}}"#);
+        std::fs::write(dir.path().join("exit-code"), "1\n").unwrap();
+        assert!(!h.pane_exists("owned:p1").unwrap());
+        let (dir, h, _listener) = output_fixture(r#"{"error":{"code":"pane_not_found"}}"#);
+        std::fs::write(dir.path().join("exit-code"), "1\n").unwrap();
+        assert!(h.pane_exists("owned:p1").is_err());
+        let (dir, h, _listener) = output_fixture("pane not found");
+        std::fs::write(dir.path().join("exit-code"), "1\n").unwrap();
+        assert!(h.pane_exists("owned:p1").is_err());
         let (dir, h, _listener) = output_fixture(r#"{"error":{"code":"unavailable"}}"#);
         std::fs::write(dir.path().join("exit-code"), "1\n").unwrap();
         assert!(h.pane_exists("owned:p1").is_err());
