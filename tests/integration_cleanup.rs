@@ -548,7 +548,23 @@ fn retry_refuses_changed_resources_and_unintegrated_commits() {
                 })
                 .unwrap(),
         }
-        assert!(f.run().is_err(), "accepted {change}");
+        let error = f.run().unwrap_err().to_string();
+        match change {
+            "directory" => {
+                assert!(
+                    error.starts_with("git branch --show-current failed:"),
+                    "{change}: {error}"
+                );
+                assert!(error.contains("not a git repository"), "{change}: {error}");
+            }
+            "reassigned-checkout" | "symlink" => {
+                assert_eq!(error, "child worktree ownership changed", "{change}");
+            }
+            "ticket-rewind" => {
+                assert_eq!(error, "child commits are not integrated", "{change}");
+            }
+            _ => assert_eq!(error, "integration cleanup ownership changed", "{change}"),
+        }
         assert!(f.child(2).exists(), "removed sibling for {change}");
         assert!(
             !git(&f.ticket, &["branch", "--list", "feat/t--1"]).is_empty(),
@@ -587,7 +603,15 @@ fn whole_set_preflight_retains_earlier_children() {
             }
             _ => unreachable!(),
         }
-        assert!(f.run().is_err(), "accepted {change}");
+        let error = f.run().unwrap_err().to_string();
+        let expected = match change {
+            "dirty" => "child worktree must be clean before cleanup",
+            "unintegrated" => "child commits are not integrated",
+            "unguarded" => "child worktree ownership changed",
+            "live" => "child still has an unowned or active agent",
+            _ => unreachable!(),
+        };
+        assert_eq!(error, expected, "{change}");
         assert!(f.child(1).exists());
         assert!(f.child(2).exists());
         assert!(f.snapshot().child_cleanup.is_empty());
@@ -627,7 +651,13 @@ fn retirement_retry_refuses_replacement_pane_or_changed_record() {
             }
             _ => unreachable!(),
         }
-        assert!(f.run().is_err(), "accepted {change}");
+        let error = f.run().unwrap_err().to_string();
+        let expected = match change {
+            "pane" | "session" => "child: automatic retirement deferred; child resources kept",
+            "agent-record" => "integration cleanup ownership changed",
+            _ => unreachable!(),
+        };
+        assert_eq!(error, expected, "{change}");
         assert!(f.child(1).exists());
         assert_eq!(f.h.closed_tabs.borrow().len(), 1);
         assert_eq!(f.snapshot().children.len(), 1);
@@ -667,7 +697,10 @@ fn initial_intent_store_failure_has_no_resource_effects() {
 fn changed_record_after_checkout_removal_preserves_ref() {
     let f = Fixture::new(&[true, false]);
     f.h.fault.set(Fault::Record);
-    assert!(f.run().is_err());
+    assert_eq!(
+        f.run().unwrap_err().to_string(),
+        "integration cleanup ownership changed"
+    );
     assert!(!f.child(1).exists());
     assert!(f.child(2).exists());
     assert!(!git(&f.ticket, &["branch", "--list", "feat/t--1"]).is_empty());
@@ -696,7 +729,10 @@ fn retires_multiple_reported_tabs_on_one_child() {
 fn reassigned_legacy_workspace_is_not_closed_after_removal() {
     let f = Fixture::new(&[true, false]);
     f.h.fault.set(Fault::Reassign);
-    assert!(f.run().is_err());
+    assert_eq!(
+        f.run().unwrap_err().to_string(),
+        "integration cleanup ownership changed"
+    );
     assert!(!f.child(1).exists());
     assert!(f.child(2).exists());
     assert_eq!(f.h.workspaces.borrow().len(), 1);

@@ -162,7 +162,8 @@ pub fn integrate(
             &["cherry", "HEAD", &child.branch, &child.base_sha],
         )?
         .lines()
-        .all(|line| line.starts_with("- "));
+        .all(|line| line.starts_with("- "))
+            && child_patch_present(ticket_wt, child, &child.branch, "HEAD")?;
         if !already_contained
             && !already_applied
             && git(ticket_wt, &["rev-list", "--count", &range])? != "0"
@@ -428,6 +429,53 @@ fn preflight_integrated(
     Ok(targets)
 }
 
+// Historical patch IDs also match commits later reverted. Require the net
+// child patch to reverse cleanly from the current ticket tree before treating
+// it as landed. --cached --check only reads the index; no checkout is changed.
+fn child_patch_present(
+    ticket_wt: &Path,
+    child: &ChildWorktree,
+    tip: &str,
+    head: &str,
+) -> Result<bool, ShepherdError> {
+    git(ticket_wt, &["diff", "--cached", "--quiet", head])?;
+    let patch = proc::capture(
+        Command::new("git").current_dir(ticket_wt).args([
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            &child.base_sha,
+            tip,
+            "--",
+        ]),
+        Duration::from_secs(30),
+        None,
+    )?;
+    if !patch.status.success() {
+        return Err(anyhow::anyhow!("cannot inspect child patch: {}", patch.stderr.trim()).into());
+    }
+    if patch.stdout.is_empty() {
+        return Ok(true);
+    }
+    let output = proc::capture(
+        Command::new("git").current_dir(ticket_wt).args([
+            "apply",
+            "--reverse",
+            "--cached",
+            "--check",
+            "--whitespace=nowarn",
+            "-",
+        ]),
+        Duration::from_secs(30),
+        Some(patch.stdout.as_bytes()),
+    )?;
+    // Git only warns about a mode mismatch even under --cached --check.
+    // Any diagnostic leaves the presence proof uncertain, so retain the child.
+    Ok(output.status.success() && output.stderr.is_empty())
+}
+
 fn verify_integrated_tip(
     ticket_wt: &Path,
     child: &ChildWorktree,
@@ -444,7 +492,9 @@ fn verify_integrated_tip(
         &["merge-base", "--is-ancestor", &child.base_sha, tip],
     )?;
     let patches = git(ticket_wt, &["cherry", head, tip, &child.base_sha])?;
-    if patches.lines().any(|line| !line.starts_with("- ")) {
+    if patches.lines().any(|line| !line.starts_with("- "))
+        || !child_patch_present(ticket_wt, child, tip, head)?
+    {
         return Err(ShepherdError::PolicyDenied(
             "child commits are not integrated".into(),
         ));

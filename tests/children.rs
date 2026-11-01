@@ -1101,17 +1101,155 @@ fn native_post_checkout_failure_rolls_back_only_new_resources() {
 
 #[test]
 fn integration_retries_before_integrated_flags_are_persisted() {
+    use herdr_shepherd::store::{Store, Ticket};
     let repo = Repo::new();
-    let mut children = [repo.child(1), repo.child(2)];
+    let mut children = vec![repo.child(1), repo.child(2)];
     Repo::commit(&children[0], "one", "one", "unit one");
-    Repo::commit(&children[1], "two", "two", "unit two");
+    // Preserve trailing whitespace and binary patches in the presence proof.
+    Repo::commit(&children[1], "two", "two  \n", "unit two");
+    Repo::commit(&children[1], "binary", "binary\0data", "binary work");
+    let store = Store::open(&repo.dir.path().join("state"), &repo.main).unwrap();
+    store
+        .update(|data| {
+            data.tickets.push(Ticket {
+                children: children.clone(),
+                ..Ticket::default()
+            });
+            Ok(())
+        })
+        .unwrap();
     let head = integrate(&repo.ticket, &mut children).unwrap().head;
-    // A failed store write leaves both durable records pending even though all
-    // cherry-picks landed. Unit two is patch-equivalent, not an ancestor.
-    for child in &mut children {
-        child.integrated = false;
-    }
+    // Force a real persistence failure after all picks landed. The durable
+    // records remain pending and unit two has new cherry-picked commit SHAs.
+    fs::create_dir(store.root().join("state.json.tmp")).unwrap();
+    assert!(
+        store
+            .update(|data| {
+                data.tickets[0].children = children.clone();
+                Ok(())
+            })
+            .is_err()
+    );
+    fs::remove_dir(store.root().join("state.json.tmp")).unwrap();
+    let mut children = store.read().unwrap().tickets.remove(0).children;
+    assert!(children.iter().all(|child| !child.integrated));
     let retry = integrate(&repo.ticket, &mut children).unwrap();
     assert_eq!(retry.head, head);
     assert!(children.iter().all(|child| child.integrated));
+    assert_eq!(
+        fs::read(repo.ticket.join("binary")).unwrap(),
+        b"binary\0data"
+    );
+}
+
+#[test]
+fn integration_restores_a_reverted_equivalent_patch() {
+    let repo = Repo::new();
+    let child = repo.child(1);
+    Repo::commit(&child, "a", "pending work\n", "child work");
+    fs::write(repo.ticket.join("a"), "pending work\n").unwrap();
+    ok(&repo.ticket, &["add", "a"]);
+    ok(&repo.ticket, &["commit", "-m", "independent equivalent"]);
+    ok(&repo.ticket, &["revert", "--no-edit", "HEAD"]);
+    assert!(!repo.ticket.join("a").exists());
+    assert!(
+        ok(
+            &repo.ticket,
+            &["cherry", "HEAD", &child.branch, &child.base_sha]
+        )
+        .starts_with("- ")
+    );
+    let mut children = [child];
+    integrate(&repo.ticket, &mut children).unwrap();
+    assert_eq!(
+        fs::read_to_string(repo.ticket.join("a")).unwrap(),
+        "pending work\n"
+    );
+    assert!(children[0].integrated);
+}
+
+#[test]
+fn cleanup_preserves_child_when_its_patch_was_reverted() {
+    let repo = Repo::new();
+    let mut child = repo.child(1);
+    child.workspace_id = None;
+    ok(&repo.main, &["config", "extensions.worktreeConfig", "true"]);
+    ok(
+        &child.path,
+        &[
+            "config",
+            "--worktree",
+            "shepherd.ticketBranch",
+            &child.branch,
+        ],
+    );
+    Repo::commit(&child, "a", "pending work\n", "child work");
+    fs::write(repo.ticket.join("a"), "pending work\n").unwrap();
+    ok(&repo.ticket, &["add", "a"]);
+    ok(&repo.ticket, &["commit", "-m", "independent equivalent"]);
+    ok(&repo.ticket, &["revert", "--no-edit", "HEAD"]);
+    child.integrated = true;
+    let error = herdr_shepherd::ticket::children::cleanup_integrated(
+        &LocalHerdr::default(),
+        &repo.ticket,
+        &[child.clone()],
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("child commits are not integrated"),
+        "{error}"
+    );
+    assert!(child.path.exists());
+    assert!(
+        git(
+            &repo.main,
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{}", child.branch)
+            ]
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
+fn cleanup_preserves_child_when_file_mode_was_reverted() {
+    let repo = Repo::new();
+    let mut child = repo.child(1);
+    child.workspace_id = None;
+    ok(&repo.main, &["config", "extensions.worktreeConfig", "true"]);
+    ok(
+        &child.path,
+        &[
+            "config",
+            "--worktree",
+            "shepherd.ticketBranch",
+            &child.branch,
+        ],
+    );
+    ok(&child.path, &["update-index", "--chmod=+x", "shared.txt"]);
+    ok(&child.path, &["commit", "-m", "make executable"]);
+    ok(&child.path, &["reset", "--hard", "HEAD"]);
+    ok(&repo.ticket, &["update-index", "--chmod=+x", "shared.txt"]);
+    ok(&repo.ticket, &["commit", "-m", "independent mode change"]);
+    ok(&repo.ticket, &["reset", "--hard", "HEAD"]);
+    ok(&repo.ticket, &["revert", "--no-edit", "HEAD"]);
+    child.integrated = true;
+    let error = herdr_shepherd::ticket::children::cleanup_integrated(
+        &LocalHerdr::default(),
+        &repo.ticket,
+        &[child.clone()],
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("child commits are not integrated"),
+        "{error}"
+    );
+    assert!(child.path.exists());
 }
