@@ -46,7 +46,8 @@ The binary is `bin/herdr-shepherd`. Add that directory to your PATH to use the s
 | `ticket ack <id> --comment ID [--kind KIND] --body-file FILE` | Describe a pushed revision and its commit SHA. |
 | `init [--project-root PATH]` | Write defaults and snapshot project trust without changing herdr configuration. |
 | `start`, `resume`, `status` | Launch or focus the lead, recover launches, and report ticket state. |
-| `ticket add --id ID --title TITLE --body-file FILE` | Add a queued ticket; optional acceptance, type, and base flags are supported. |
+| `ask <text...>` or `ask --file PATH` | Send a request to this project's lead, starting it if needed; `ask -` reads stdin. |
+| `ticket add [--id ID] --title TITLE --body-file FILE` | Add a queued ticket; optional acceptance, type, and base flags are supported. |
 | `ticket dispatch` | Schedule revisions before queued tickets and launch planners or revision coders. |
 | `ticket transition ID --to STATE [--reason REASON]` | Apply a legal transition with the configured revision cap. |
 | `ticket integrate ID` | Integrate child commits, roll back conflicts, and remove proven integrated children. |
@@ -274,6 +275,31 @@ when either is unprotected, and shows warnings in status and the lead summary.
 Successful protection reads are cached for 24 hours; unknown results are retried.
 Shepherd never changes repository protection settings.
 
+
+## Ad-hoc tasks
+
+Start the lead from the project workspace and give it a plain request in chat:
+
+```sh
+herdr plugin action invoke herdr-shepherd.start
+```
+
+For example, say "fix the typo in the login banner". No ticket ID or prepared
+acceptance criteria are needed. The lead derives a title and testable criteria,
+reports the generated ID and criteria, and dispatches immediately. It asks first
+only when the request is too ambiguous to derive any acceptance criteria.
+Distinct tasks in one message become separate tickets.
+
+You can also send the request from a terminal:
+
+```sh
+herdr-shepherd ask "fix the typo in the login banner"
+```
+
+`ask` starts the project's lead when needed and durably queues the message while
+the lead is busy or blocked. Use `--file PATH` or `-` for file or stdin input,
+and `--project-root PATH` to target an explicit project. Managed flock agent
+panes cannot use `ask`.
 
 ## Ticket orchestration and supervision
 
