@@ -273,6 +273,15 @@ impl Herdr for FakeHerdr {
     fn pane_cwd(&self, pane: &str) -> Result<Option<std::path::PathBuf>, ShepherdError> {
         Ok(self.pane_cwds.borrow().get(pane).cloned())
     }
+    fn pane_exists(&self, pane: &str) -> Result<bool, ShepherdError> {
+        Ok(self.pane_cwds.borrow().contains_key(pane)
+            || self.pane_sessions.borrow().contains_key(pane)
+            || self
+                .agent_records
+                .borrow()
+                .iter()
+                .any(|a| a.pane_id == pane))
+    }
     fn pane_session_ref(&self, pane: &str) -> Result<Option<String>, ShepherdError> {
         Ok(self.pane_sessions.borrow().get(pane).cloned())
     }

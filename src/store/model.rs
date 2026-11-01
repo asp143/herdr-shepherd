@@ -122,6 +122,9 @@ pub struct ChildCleanup {
     pub child: ChildWorktree,
     pub path: PathBuf,
     pub tip: String,
+    /// Exact reported recipients validated before their tabs are closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retiring_agents: Vec<AgentRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

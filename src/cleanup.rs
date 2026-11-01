@@ -1019,6 +1019,7 @@ pub fn run(mut p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, Shepher
                         child: child.clone(),
                         path: target.path.clone(),
                         tip: target.tip.clone(),
+                        retiring_agents: Vec::new(),
                     });
                     save_child_cleanup(&p.proof, &mut p.ticket, next)?;
                 }

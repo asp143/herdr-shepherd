@@ -232,6 +232,39 @@ pub(crate) fn dispatch(
 /// Nonblocking automatic retirement. A deferred retirement is NOT cleanup
 /// success: callers must retain the worktree and retry only after resolution.
 pub fn retire(h: &dyn Herdr, store: &Store, expected: &AgentRecord) -> Result<bool, ShepherdError> {
+    retire_inner(h, store, expected, None)
+}
+
+/// The integration receipt also journals tab closure. A missing terminal is
+/// completion evidence only after its exact owned recipient was persisted.
+pub(crate) fn retire_for_cleanup(
+    h: &dyn Herdr,
+    store: &Store,
+    expected: &AgentRecord,
+    receipt: &crate::store::ChildCleanup,
+) -> Result<bool, ShepherdError> {
+    retire_inner(h, store, expected, Some(receipt))
+}
+
+fn cleanup_current(
+    data: &crate::store::StoreData,
+    rec: &AgentRecord,
+    receipt: &crate::store::ChildCleanup,
+) -> bool {
+    data.agents.contains(rec)
+        && data.tickets.iter().any(|ticket| {
+            ticket.id == rec.ticket
+                && ticket.children.contains(&receipt.child)
+                && ticket.child_cleanup.contains(receipt)
+        })
+}
+
+fn retire_inner(
+    h: &dyn Herdr,
+    store: &Store,
+    expected: &AgentRecord,
+    cleanup: Option<&crate::store::ChildCleanup>,
+) -> Result<bool, ShepherdError> {
     let name = &expected.name;
     let Some(_operation) = super::try_agent_operation(store, name)? else {
         return Ok(false);
@@ -241,6 +274,29 @@ pub fn retire(h: &dyn Herdr, store: &Store, expected: &AgentRecord) -> Result<bo
     };
     if rec.status == AgentStatus::Retired {
         return Ok(true);
+    }
+    let mut cleanup = cleanup.cloned();
+    if let Some(receipt) = &cleanup {
+        if !cleanup_current(&store.read()?, &rec, receipt) {
+            return Ok(false);
+        }
+        if receipt.retiring_agents.contains(&rec)
+            && let Some(pane) = &rec.pane_id
+            && h.agent_get(name)?.is_none()
+            && !h
+                .agents()?
+                .iter()
+                .any(|a| a.pane_id == *pane || a.name.as_deref() == Some(name))
+            && !h.pane_exists(pane)?
+        {
+            return store.update(|data| {
+                if !cleanup_current(data, &rec, receipt) {
+                    return Ok(false);
+                }
+                data.agents.iter_mut().find(|a| **a == rec).unwrap().status = AgentStatus::Retired;
+                Ok(true)
+            });
+        }
     }
     let Some(info) = recipient(h, store, &rec, true)? else {
         return Ok(false);
@@ -253,10 +309,43 @@ pub fn retire(h: &dyn Herdr, store: &Store, expected: &AgentRecord) -> Result<bo
     if recipient(h, store, &rec, true)?.is_none() {
         return Ok(false);
     }
+    if let Some(receipt) = &mut cleanup
+        && !receipt.retiring_agents.contains(&rec)
+    {
+        let saved = store.update(|data| {
+            if !cleanup_current(data, &rec, receipt) {
+                return Ok(false);
+            }
+            data.tickets
+                .iter_mut()
+                .find(|t| t.id == rec.ticket)
+                .unwrap()
+                .child_cleanup
+                .iter_mut()
+                .find(|r| *r == receipt)
+                .unwrap()
+                .retiring_agents
+                .push(rec.clone());
+            Ok(true)
+        })?;
+        if !saved {
+            return Ok(false);
+        }
+        receipt.retiring_agents.push(rec.clone());
+        if recipient(h, store, &rec, true)?.is_none() {
+            return Ok(false);
+        }
+    }
     if let Some(tab) = &rec.tab_id {
         h.close_tab(tab)?;
     }
     store.update(|data| {
+        if cleanup
+            .as_ref()
+            .is_some_and(|receipt| !cleanup_current(data, &rec, receipt))
+        {
+            return Ok(false);
+        }
         let Some(current) = data.agents.iter_mut().find(|a| **a == rec) else {
             return Ok(false);
         };

@@ -11,6 +11,9 @@ use std::{
 
 use serde::Serialize;
 
+mod cleanup;
+pub use cleanup::cleanup_integrated_recorded;
+
 use crate::{
     error::ShepherdError,
     gate::hook,
@@ -152,7 +155,16 @@ pub fn integrate(
             ],
         )
         .is_ok();
+        // A store write can fail after every cherry-pick succeeds. Later unit
+        // picks have new SHAs, so ancestry alone cannot recognize that retry.
+        let already_applied = git(
+            ticket_wt,
+            &["cherry", "HEAD", &child.branch, &child.base_sha],
+        )?
+        .lines()
+        .all(|line| line.starts_with("- "));
         if !already_contained
+            && !already_applied
             && git(ticket_wt, &["rev-list", "--count", &range])? != "0"
             && git(
                 ticket_wt,
@@ -317,6 +329,34 @@ pub fn cleanup_integrated(
     children: &[ChildWorktree],
 ) -> Result<Vec<u32>, ShepherdError> {
     let _lock = integration_lock(ticket_wt)?;
+    let targets = preflight_integrated(h, ticket_wt, children, false)?;
+    let mut removed = Vec::new();
+    for receipt in targets {
+        let child = &receipt.child;
+        verify_workspace_owner(&h.workspaces()?, child, &receipt.path)?;
+        ensure_no_live_agents(h, child)?;
+        verify_child_tip(ticket_wt, child, &receipt.tip, true)?;
+        remove_child_checkout(h, ticket_wt, child)?;
+        git(
+            ticket_wt,
+            &[
+                "update-ref",
+                "-d",
+                &format!("refs/heads/{}", child.branch),
+                &receipt.tip,
+            ],
+        )?;
+        removed.push(child.unit);
+    }
+    Ok(removed)
+}
+
+fn preflight_integrated(
+    h: &dyn Herdr,
+    ticket_wt: &Path,
+    children: &[ChildWorktree],
+    allow_agents: bool,
+) -> Result<Vec<crate::store::ChildCleanup>, ShepherdError> {
     if children.iter().any(|child| !child.integrated) {
         return Err(ShepherdError::Usage(
             "integrate every child before cleanup".into(),
@@ -354,18 +394,20 @@ pub fn cleanup_integrated(
         }
         let child_path = child.path.canonicalize().map_err(anyhow::Error::from)?;
         verify_workspace_owner(&workspaces, child, &child_path)?;
-        if agents.iter().any(|agent| {
-            !matches!(agent.agent_status.as_str(), "exited" | "stopped")
-                && (child
-                    .workspace_id
-                    .as_ref()
-                    .is_some_and(|id| agent.workspace_id.as_ref() == Some(id))
-                    || agent
-                        .cwd
+        if !allow_agents
+            && agents.iter().any(|agent| {
+                !matches!(agent.agent_status.as_str(), "exited" | "stopped")
+                    && (child
+                        .workspace_id
                         .as_ref()
-                        .and_then(|path| path.canonicalize().ok())
-                        .is_some_and(|path| path.starts_with(&child_path)))
-        }) {
+                        .is_some_and(|id| agent.workspace_id.as_ref() == Some(id))
+                        || agent
+                            .cwd
+                            .as_ref()
+                            .and_then(|path| path.canonicalize().ok())
+                            .is_some_and(|path| path.starts_with(&child_path)))
+            })
+        {
             return Err(ShepherdError::Usage("child still has a live agent".into()));
         }
         let tip = git(&child.path, &["rev-parse", "HEAD"])?;
@@ -375,33 +417,39 @@ pub fn cleanup_integrated(
                 "child branch tip changed".into(),
             ));
         }
-        let patches = git(ticket_wt, &["cherry", &ticket_head, &tip, &child.base_sha])?;
-        if patches.lines().any(|line| !line.starts_with("- ")) {
-            return Err(ShepherdError::PolicyDenied(
-                "child commits are not integrated".into(),
-            ));
-        }
-        targets.push((child, reference, tip));
+        verify_integrated_tip(ticket_wt, child, &tip, &ticket_head)?;
+        targets.push(crate::store::ChildCleanup {
+            child: child.clone(),
+            path: child_path,
+            tip,
+            retiring_agents: Vec::new(),
+        });
     }
-    let mut removed = Vec::new();
-    for (child, reference, tip) in targets {
-        // Recheck immediately before each effect; Git itself refuses dirty
-        // worktrees, and the expected-tip deletion preserves advanced refs.
-        if git(&child.path, &["rev-parse", "HEAD"])? != tip
-            || !git(&child.path, &["status", "--porcelain"])?.is_empty()
-        {
-            return Err(ShepherdError::Usage(
-                "child changed after cleanup preflight".into(),
-            ));
-        }
-        verify_workspace_owner(&h.workspaces()?, child, &child.path)?;
-        ensure_no_live_agents(h, child)?;
-        verify_child_tip(ticket_wt, child, &tip, true)?;
-        remove_child_checkout(h, ticket_wt, child)?;
-        git(ticket_wt, &["update-ref", "-d", &reference, &tip])?;
-        removed.push(child.unit);
+    Ok(targets)
+}
+
+fn verify_integrated_tip(
+    ticket_wt: &Path,
+    child: &ChildWorktree,
+    tip: &str,
+    head: &str,
+) -> Result<(), ShepherdError> {
+    if !matches!(child.base_sha.len(), 40 | 64)
+        || !child.base_sha.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(ShepherdError::PolicyDenied("invalid child base".into()));
     }
-    Ok(removed)
+    git(
+        ticket_wt,
+        &["merge-base", "--is-ancestor", &child.base_sha, tip],
+    )?;
+    let patches = git(ticket_wt, &["cherry", head, tip, &child.base_sha])?;
+    if patches.lines().any(|line| !line.starts_with("- ")) {
+        return Err(ShepherdError::PolicyDenied(
+            "child commits are not integrated".into(),
+        ));
+    }
+    Ok(())
 }
 
 // This path only removes a child created by the current call, before agents

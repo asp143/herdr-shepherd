@@ -437,37 +437,7 @@ pub fn integrate(
                 t.integration_ranges = report.ranges.clone();
                 Ok(())
             })?;
-            for child in &ticket.children {
-                for rec in store.read()?.agents.into_iter().filter(|a| {
-                    a.ticket == id
-                        && a.status == AgentStatus::Reported
-                        && a.worktree
-                            .canonicalize()
-                            .ok()
-                            .zip(child.path.canonicalize().ok())
-                            .is_some_and(|(agent, child)| agent == child)
-                }) {
-                    if !herdr_shepherd::flock::retire_automatically(h, store, &rec)? {
-                        return Err(ShepherdError::PolicyDenied(format!(
-                            "{}: automatic retirement deferred; child resources kept",
-                            rec.name
-                        )));
-                    }
-                }
-                children::cleanup_integrated(h, &path, std::slice::from_ref(child))?;
-                store.update(|data| {
-                    if let Some(t) = data.tickets.iter_mut().find(|t| t.id == id) {
-                        t.children.retain(|c| {
-                            c.unit != child.unit
-                                || c.path != child.path
-                                || c.branch != child.branch
-                                || c.base_sha != child.base_sha
-                                || c.workspace_id != child.workspace_id
-                        });
-                    }
-                    Ok(())
-                })?;
-            }
+            children::cleanup_integrated_recorded(h, store, &ticket)?;
             Ok(report)
         }
     }

@@ -1098,3 +1098,20 @@ fn native_post_checkout_failure_rolls_back_only_new_resources() {
     assert!(repo.ticket.exists());
     assert!(repo.main.exists());
 }
+
+#[test]
+fn integration_retries_before_integrated_flags_are_persisted() {
+    let repo = Repo::new();
+    let mut children = [repo.child(1), repo.child(2)];
+    Repo::commit(&children[0], "one", "one", "unit one");
+    Repo::commit(&children[1], "two", "two", "unit two");
+    let head = integrate(&repo.ticket, &mut children).unwrap().head;
+    // A failed store write leaves both durable records pending even though all
+    // cherry-picks landed. Unit two is patch-equivalent, not an ancestor.
+    for child in &mut children {
+        child.integrated = false;
+    }
+    let retry = integrate(&repo.ticket, &mut children).unwrap();
+    assert_eq!(retry.head, head);
+    assert!(children.iter().all(|child| child.integrated));
+}
