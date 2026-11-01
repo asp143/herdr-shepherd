@@ -14,6 +14,16 @@ use crate::{
 pub const LEAD_PR_COMMANDS: &str = r#"
 Use ticket pr <id> --summary-file <p> --changes-file <p> --testing-file <p>
 when ready_for_pr to push and open a ready-for-review PR.
+Inspect ticket show <id> for append-only findings and their zero-based indices.
+Optionally add --finding-dispositions-file <p> with strict JSON:
+{"ticket_id":"<id>","findings":[{"index":0,"status":"open","reason":"Still reproducible"}]}.
+Use open, deferred, or resolved explicitly; reason is optional text.
+Open/deferred findings of every severity stay visible as current issues.
+Resolved and omitted entries stay visible as history; omitted means unclassified.
+Missing or empty metadata never resolves findings. Never remove stored evidence.
+Raw reports remain available through agent status <name>.
+Wrong ticket IDs, duplicate/out-of-range indices, unknown fields/statuses and
+malformed metadata are rejected. Publication and QA gates still apply.
 Use ticket comments <id> --new to inspect comments awaiting triage.
 Check each comment against the actual code and reproduce the issue where possible.
 If a comment is not relevant, use ticket reply <id> --comment <cid> --body-file <p>
@@ -104,6 +114,25 @@ pub fn open(
     testing: &[String],
     now: &str,
 ) -> Result<Ticket, ShepherdError> {
+    open_with_dispositions(
+        store, gh, gate, cfg, id, summary, changes, testing, None, now,
+    )
+}
+
+/// Open a PR with explicit publication dispositions, validated under the dispatch lock.
+#[allow(clippy::too_many_arguments)]
+pub fn open_with_dispositions(
+    store: &Store,
+    gh: &dyn PrBackend,
+    gate: &Gate,
+    cfg: &Config,
+    id: &str,
+    summary: &str,
+    changes: &[String],
+    testing: &[String],
+    dispositions: Option<&super::pr_body::FindingDispositions>,
+    now: &str,
+) -> Result<Ticket, ShepherdError> {
     let _dispatch = super::revise::dispatch_lock(store, id)?;
     let cap = crate::roles::resolve(cfg)?.shepherd.max_revision_rounds;
     let mut snapshot = store.read()?;
@@ -136,7 +165,13 @@ pub fn open(
             return Err(ShepherdError::Usage("PR title must not be empty".into()));
         }
         super::pr_body::check_attribution(&title)?;
-        let body = super::pr_body::build_body(t, summary, changes, testing);
+        let body = super::pr_body::build_body_with_dispositions(
+            t,
+            summary,
+            changes,
+            testing,
+            dispositions,
+        )?;
         validate_body(&body)?;
         authorize(t, gate)?;
         if retry {
@@ -634,7 +669,16 @@ mod tests {
 
     #[test]
     fn lead_pr_commands_has_triage_rules() {
-        for rule in ["ticket reply", "ticket revise", "never resolve"] {
+        for rule in [
+            "ticket reply",
+            "ticket revise",
+            "never resolve",
+            "--finding-dispositions-file",
+            "ticket show",
+            "agent status",
+            "omitted means unclassified",
+            "Never remove stored evidence",
+        ] {
             assert!(LEAD_PR_COMMANDS.contains(rule));
         }
     }

@@ -75,12 +75,53 @@ failure. Blocked tickets can fail; resuming a loop-cap block grants a fresh set
 of revision rounds.
 
 `ticket::pr_body` builds PR titles and the ordered Summary, Changes, Testing,
-optional Not addressed, and optional Ticket sections. The Ticket link uses
-`Ticket.url`; callers remove resolved findings before building, since remaining
-Mid/Low findings are treated as unaddressed. `check_attribution` rejects the
-specified attribution phrases with `attribution` (exit 2) while allowing
-technical references such as "Claude Code hook fix". Future GitHub writers must
-call that check before sending human-facing text.
+optional Open and deferred findings, optional Finding history, and optional
+Ticket sections. The Ticket link uses `Ticket.url`. Stored findings and agent
+reports are append-only evidence, not an unresolved-issue list. Without explicit
+publication dispositions, every finding appears in Finding history as
+"current disposition unclassified". No severity or prose prefix implies resolution.
+
+The existing command remains usable:
+
+```sh
+herdr-shepherd ticket pr T-1 --summary-file summary.txt --changes-file changes.txt --testing-file testing.txt
+```
+
+Summary is text; changes and testing accept JSON string arrays or nonempty lines.
+To classify findings for this PR, inspect `ticket show T-1` and supply optional
+`--finding-dispositions-file dispositions.json` using this strict JSON contract:
+
+```json
+{
+  "ticket_id": "T-1",
+  "findings": [
+    {"index": 0, "status": "resolved", "reason": "Covered by the boundary test"},
+    {"index": 1, "status": "open"},
+    {"index": 2, "status": "deferred", "reason": "Separate follow-up"}
+  ]
+}
+```
+
+`index` is the zero-based position in the append-only `findings` array from
+`ticket show`. Status must be `open`, `deferred`, or `resolved`; `reason` is
+optional text. Open and deferred entries of every severity appear in the current
+section; resolved and unclassified entries appear in history. Each section
+retains finding order, text, severity, and location, with the original index.
+Omitted entries, an empty array, and findings appended after metadata preparation
+remain unclassified and visible. This metadata classifies publication text only;
+it never changes stored evidence. Raw findings remain available through
+`ticket show`, and original reports through `agent status <name>`.
+
+Wrong ticket IDs, duplicate or out-of-range indices, unknown fields/statuses,
+and malformed JSON are rejected before backend calls. References are validated
+again against the publication snapshot under the existing dispatch lock.
+All publication state, QA commit, branch, transport, identity and reviewer gates
+still apply. The final body, including reasons and history, must pass the
+60000-character limit and attribution check.
+
+`check_attribution` rejects specified attribution phrases with `attribution`
+(exit 2) while allowing technical references such as "Claude Code hook fix".
+Future GitHub writers must call that check before sending human-facing text.
 Attribution matching accepts Unicode whitespace between words, including NBSP
 and repeated spaces.
 

@@ -36,7 +36,7 @@ fn body_sections_in_order() {
 }
 
 #[test]
-fn not_addressed_lists_mid_low_only() {
+fn historical_findings_are_unclassified_without_explicit_dispositions() {
     let ticket = Ticket {
         findings: vec![
             Finding {
@@ -63,12 +63,14 @@ fn not_addressed_lists_mid_low_only() {
         ..Ticket::default()
     };
     let body = build_body(&ticket, "Summary", &[], &[]);
-    assert!(body.contains("## Not addressed"));
-    assert!(body.contains("Mid issue"));
-    assert!(body.contains("Low issue"));
-    assert!(!body.contains("High issue"));
-    assert!(!body.contains("Wish issue"));
-    assert!(!build_body(&Ticket::default(), "Summary", &[], &[]).contains("## Not addressed"));
+    assert!(!body.contains("## Not addressed"));
+    assert!(body.contains("## Finding history"));
+    for text in ["High issue", "Mid issue", "Low issue", "Wish issue"] {
+        assert!(body.contains(text));
+    }
+    assert_eq!(body.matches("current disposition unclassified").count(), 4);
+    assert!(body.contains("src/a.rs:5"));
+    assert!(!build_body(&Ticket::default(), "Summary", &[], &[]).contains("## Finding history"));
 }
 
 #[test]
@@ -128,4 +130,105 @@ fn technical_ai_mentions_allowed() {
     ] {
         check_attribution(text).unwrap();
     }
+}
+
+#[test]
+fn explicit_dispositions_classify_indices_without_guessing() {
+    use herdr_shepherd::ticket::pr_body::{FindingDispositions, build_body_with_dispositions};
+    let mut ticket = Ticket {
+        id: "T-1".into(),
+        findings: [Severity::High, Severity::Mid, Severity::Low, Severity::Wish]
+            .into_iter()
+            .map(|severity| Finding {
+                severity,
+                text: "Fixed duplicate".into(),
+                location: Some("src/a.rs:5".into()),
+            })
+            .collect(),
+        ..Ticket::default()
+    };
+    let metadata = FindingDispositions::parse(
+        r#"{"ticket_id":"T-1","findings":[
+        {"index":2,"status":"resolved","reason":"Boundary test covers it"},
+        {"index":0,"status":"open"},
+        {"index":3,"status":"deferred","reason":"Follow-up"}
+    ]}"#,
+    )
+    .unwrap();
+    let before = ticket.clone();
+    let body = build_body_with_dispositions(&ticket, "Summary", &[], &[], Some(&metadata)).unwrap();
+    assert_eq!(
+        body,
+        "## Summary\n\nSummary\n\n## Changes\n\n\n## Testing\n\n\n## Open and deferred findings\n\n- #0 [High (Blocker); open] Fixed duplicate (src/a.rs:5)\n- #3 [Wish; deferred] Fixed duplicate (src/a.rs:5)\n  Reason: Follow-up\n\n## Finding history\n\n- #1 [Mid; current disposition unclassified] Fixed duplicate (src/a.rs:5)\n- #2 [Low; resolved] Fixed duplicate (src/a.rs:5)\n  Reason: Boundary test covers it\n"
+    );
+    assert_eq!(ticket, before);
+    ticket.findings.push(ticket.findings[0].clone());
+    let body = build_body_with_dispositions(&ticket, "Summary", &[], &[], Some(&metadata)).unwrap();
+    assert!(body.contains("#4 [High (Blocker); current disposition unclassified] Fixed duplicate"));
+    let empty = FindingDispositions::parse(r#"{"ticket_id":"T-1","findings":[]}"#).unwrap();
+    assert_eq!(
+        build_body(&ticket, "Summary", &[], &[]),
+        build_body_with_dispositions(&ticket, "Summary", &[], &[], Some(&empty)).unwrap()
+    );
+    for severity in [Severity::High, Severity::Mid, Severity::Low, Severity::Wish] {
+        ticket.findings[0].severity = severity;
+        for status in ["open", "deferred", "resolved"] {
+            let metadata = FindingDispositions::parse(&format!(
+                r#"{{"ticket_id":"T-1","findings":[{{"index":0,"status":"{status}"}}]}}"#
+            ))
+            .unwrap();
+            let body = build_body_with_dispositions(&ticket, "Summary", &[], &[], Some(&metadata))
+                .unwrap();
+            assert!(body.contains(&format!("; {status}] Fixed duplicate")));
+            assert_eq!(
+                body.contains("## Open and deferred findings"),
+                status != "resolved"
+            );
+            assert_eq!(body.matches("Fixed duplicate").count(), 5);
+        }
+    }
+}
+
+#[test]
+fn disposition_metadata_is_strict_and_bound_to_ticket_history() {
+    use herdr_shepherd::ticket::pr_body::{FindingDispositions, build_body_with_dispositions};
+    let ticket = Ticket {
+        id: "T-1".into(),
+        ..Ticket::default()
+    };
+    let empty = FindingDispositions::parse(r#"{"ticket_id":"T-1","findings":[]}"#).unwrap();
+    assert_eq!(
+        build_body(&ticket, "Summary", &[], &[]),
+        build_body_with_dispositions(&ticket, "Summary", &[], &[], Some(&empty)).unwrap()
+    );
+    for text in [
+        "{",
+        "null",
+        r#"{"ticket_id":"T-1"}"#,
+        r#"{"ticket_id":"T-1","findings":[],"extra":true}"#,
+        r#"{"ticket_id":"T-1","findings":[{"index":0,"status":"done"}]}"#,
+        r#"{"ticket_id":"T-1","findings":[{"index":0,"status":"open","extra":true}]}"#,
+        r#"{"ticket_id":"T-1","findings":[{"index":-1,"status":"open"}]}"#,
+    ] {
+        assert!(FindingDispositions::parse(text).is_err(), "{text}");
+    }
+    for text in [
+        r#"{"ticket_id":"T-2","findings":[]}"#,
+        r#"{"ticket_id":"T-1","findings":[{"index":0,"status":"open"}]}"#,
+    ] {
+        let metadata = FindingDispositions::parse(text).unwrap();
+        assert!(
+            build_body_with_dispositions(&ticket, "Summary", &[], &[], Some(&metadata)).is_err()
+        );
+    }
+    let ticket = Ticket {
+        findings: vec![Finding {
+            severity: Severity::Mid,
+            text: "issue".into(),
+            location: None,
+        }],
+        ..ticket
+    };
+    let duplicate = FindingDispositions::parse(r#"{"ticket_id":"T-1","findings":[{"index":0,"status":"open"},{"index":0,"status":"resolved"}]}"#).unwrap();
+    assert!(build_body_with_dispositions(&ticket, "Summary", &[], &[], Some(&duplicate)).is_err());
 }
