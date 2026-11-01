@@ -175,6 +175,16 @@ impl herdr_shepherd::herdr::Herdr for LocalHerdr {
         base: &str,
         path: &Path,
     ) -> Result<herdr_shepherd::herdr::Workspace, ShepherdError> {
+        if ok(repo, &["rev-parse", "--absolute-git-dir"])
+            != ok(
+                repo,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+        {
+            return Err(ShepherdError::HerdrUnavailable(
+                "linked_worktree_source".into(),
+            ));
+        }
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         ok(
             repo,
@@ -604,4 +614,60 @@ fn child_hook_uses_explicit_config_on_first_install() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("push blocked"));
     assert!(ok(&repo.main, &["ls-remote", "origin"]).is_empty());
+}
+
+#[test]
+fn child_uses_primary_source_and_ticket_tip() {
+    let repo = Repo::new();
+    ok(
+        &repo.ticket,
+        &["commit", "--allow-empty", "-m", "ticket progress"],
+    );
+    let tip = ok(&repo.ticket, &["rev-parse", "HEAD"]);
+    assert_ne!(tip, ok(&repo.main, &["rev-parse", "HEAD"]));
+    let state = repo.dir.path().join("state");
+    let config = repo.dir.path().join("selected-config");
+    let h = LocalHerdr::default();
+    let ticket = herdr_shepherd::store::Ticket {
+        id: "TINY".into(),
+        slug: "tiny".into(),
+        branch: "feat/tiny".into(),
+        worktree: Some(repo.ticket.clone()),
+        ..Default::default()
+    };
+    let child = herdr_shepherd::ticket::children::create_child_configured(
+        &h,
+        &ticket,
+        2,
+        &state,
+        Path::new(env!("CARGO_BIN_EXE_herdr-shepherd")),
+        &config,
+    )
+    .unwrap();
+    assert_eq!(child.base_sha, tip);
+    assert_eq!(ok(&child.path, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(child.branch, "feat/tiny--2");
+    assert_eq!(
+        h.workspaces.borrow()[0]
+            .worktree
+            .as_ref()
+            .unwrap()
+            .repo_root
+            .as_ref(),
+        Some(&repo.main)
+    );
+    assert!(
+        child.path.starts_with(
+            state
+                .join("children")
+                .join(herdr_shepherd::store::project_hash(&repo.ticket))
+        )
+    );
+    let hooks = ok(
+        &child.path,
+        &["config", "--worktree", "--get", "core.hooksPath"],
+    );
+    let hook = fs::read_to_string(Path::new(&hooks).join("pre-push")).unwrap();
+    assert!(hook.contains(config.to_str().unwrap()));
+    assert!(hook.contains(state.to_str().unwrap()));
 }

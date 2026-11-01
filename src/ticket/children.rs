@@ -241,8 +241,18 @@ pub fn create_child_configured(
         .join(unit.to_string());
     std::fs::create_dir_all(path.parent().expect("child has parent"))
         .map_err(anyhow::Error::from)?;
+    // Herdr rejects a linked checkout as the source of another worktree.
+    // Git lists the primary checkout first, including separate-git-dir layouts.
+    // Keep the base pinned to the ticket tip rather than the primary branch.
+    let trees = git(ticket_wt, &["worktree", "list", "--porcelain", "-z"])?;
+    let source = trees
+        .split('\0')
+        .next()
+        .and_then(|field| field.strip_prefix("worktree "))
+        .ok_or_else(|| ShepherdError::Usage("repository has no primary worktree".into()))?;
+    let source = Path::new(source);
     let workspace = h.create_worktree(
-        ticket_wt,
+        source,
         &branch,
         &format!("{}-{unit}", ticket.slug),
         &base_sha,
