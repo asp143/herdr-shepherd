@@ -158,6 +158,9 @@ pub struct AgentRecord {
     /// Append-only accepted results, including the current completed assignment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_tasks: Vec<CompletedTask>,
+    /// Admission decision for the current or most recent dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_reason: Option<String>,
 }
 
 /// Exact configured profile inputs, compared structurally rather than by name.

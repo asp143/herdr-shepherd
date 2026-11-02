@@ -1277,6 +1277,7 @@ fn exact_recorded_child_agent_blocks_cleanup_without_live_cwd() {
                 unit: None,
                 launch_profile: None,
                 completed_tasks: vec![],
+                dispatch_reason: None,
             });
             Ok(())
         })

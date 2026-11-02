@@ -728,6 +728,7 @@ mod tests {
                     unit: None,
                     launch_profile: None,
                     completed_tasks: vec![],
+                    dispatch_reason: None,
                 });
                 Ok(())
             })

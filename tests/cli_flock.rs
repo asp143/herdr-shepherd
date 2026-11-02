@@ -123,6 +123,7 @@ fn report_requires_calling_pane_identity() {
                 unit: None,
                 launch_profile: None,
                 completed_tasks: vec![],
+                dispatch_reason: None,
             });
             Ok(())
         })
@@ -161,4 +162,86 @@ fn report_requires_calling_pane_identity() {
         String::from_utf8_lossy(&out.stdout)
     );
     assert!(store.read().unwrap().agents[0].report.is_some());
+}
+
+#[test]
+fn direct_spawn_reuses_reported_agent_with_waited_prompt() {
+    use herdr_shepherd::{
+        flock,
+        store::{Store, Ticket, TicketState},
+    };
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/reuse-cli-fixtures");
+    std::fs::create_dir_all(&base).unwrap();
+    let dir = tempfile::tempdir_in(base).unwrap();
+    let state = dir.path().join("state");
+    let store = Store::open(&state, dir.path()).unwrap();
+    store
+        .update(|data| {
+            data.tickets.push(Ticket {
+                id: "T-1".into(),
+                state: TicketState::Building,
+                worktree: Some(dir.path().into()),
+                workspace_id: Some("w1".into()),
+                branch: "feat/test".into(),
+                ..Default::default()
+            });
+            Ok(())
+        })
+        .unwrap();
+    let fake = dir.path().join("fake.json");
+    std::fs::write(&fake, "{}").unwrap();
+    let task = dir.path().join("task.txt");
+    std::fs::write(&task, "perform current task").unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+            .env("SHEPHERD_FAKE_HERDR", &fake)
+            .args(["--json", "--state-dir"])
+            .arg(&state)
+            .args(["--config-dir"])
+            .arg(dir.path().join("cfg"))
+            .args(["agent", "--project-root"])
+            .arg(dir.path())
+            .args(["spawn", "--ticket", "T-1", "--role", "coder", "--task-file"])
+            .arg(&task)
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+    let old = store.read().unwrap().agents[0].clone();
+    flock::store_report_for_task(&store, &old.name, old.task_id.as_deref(), r#"{"status":"completed","summary":"done","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+    store
+        .update(|data| {
+            let rec = &mut data.agents[0];
+            let mut observation: serde_json::Value =
+                serde_json::from_str(rec.observed.as_deref().unwrap()).unwrap();
+            observation["session_ref"] = "cli-session".into();
+            rec.observed = Some(observation.to_string());
+            Ok(())
+        })
+        .unwrap();
+    std::fs::write(&fake, serde_json::to_vec(&serde_json::json!({
+        "agents": [{"name":old.name,"agent":"codex","agent_status":"idle","cwd":dir.path(),"pane_id":old.pane_id,"workspace_id":"w1"}],
+        "pane_sessions": {old.pane_id.as_deref().unwrap(): "cli-session"}
+    })).unwrap()).unwrap();
+    let second = run();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    let output: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(output["data"]["name"], old.name);
+    assert!(
+        output["data"]["dispatch_reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("reused:")
+    );
+    assert_eq!(store.read().unwrap().agents.len(), 1);
+    assert_ne!(output["data"]["task_id"], old.task_id.unwrap());
 }

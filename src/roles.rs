@@ -18,6 +18,7 @@ pub struct ShepherdSettings {
     pub max_concurrent_tickets: usize,
     pub max_parallel_agents: usize,
     pub max_revision_rounds: u32,
+    pub max_completed_assignments: usize,
     pub pr_poll_seconds: u64,
     pub integration_branch: String,
     pub protected_branches: Vec<String>,
@@ -30,6 +31,7 @@ impl Default for ShepherdSettings {
             max_concurrent_tickets: 2,
             max_parallel_agents: 6,
             max_revision_rounds: 3,
+            max_completed_assignments: 5,
             pr_poll_seconds: 180,
             integration_branch: "auto".into(),
             protected_branches: [

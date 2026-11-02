@@ -510,6 +510,7 @@ fn integration_retires_only_child_tab_with_canonical_cwd() {
                     unit: None,
                     launch_profile: None,
                     completed_tasks: vec![],
+                    dispatch_reason: None,
                 });
             }
             Ok(())

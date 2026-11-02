@@ -12,10 +12,12 @@ use super::{
 };
 
 pub type StartObserver = Box<dyn Fn(&str) + Send>;
+pub type PromptEffect = Box<dyn Fn(&FakeHerdr, &str) + Send>;
 
 pub struct FakeHerdr {
     pub on_start: RefCell<Option<StartObserver>>,
     pub on_prompt: RefCell<Option<StartObserver>>,
+    pub on_prompt_effect: RefCell<Option<PromptEffect>>,
     pub on_send_keys: RefCell<Option<StartObserver>>,
     pub on_get: RefCell<Option<StartObserver>>,
     pub workspaces: RefCell<Vec<Workspace>>,
@@ -46,6 +48,7 @@ impl FakeHerdr {
         Self {
             on_start: RefCell::new(None),
             on_prompt: RefCell::new(None),
+            on_prompt_effect: RefCell::new(None),
             on_send_keys: RefCell::new(None),
             on_get: RefCell::new(None),
             workspaces: RefCell::new(workspaces),
@@ -198,6 +201,9 @@ impl Herdr for FakeHerdr {
             .push(format!("prompt_agent {name} {text} {until_working}"));
         if let Some(observer) = self.on_prompt.borrow().as_ref() {
             observer(name);
+        }
+        if let Some(effect) = self.on_prompt_effect.borrow().as_ref() {
+            effect(self, name);
         }
         if self
             .agent_records

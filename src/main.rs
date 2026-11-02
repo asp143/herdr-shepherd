@@ -896,6 +896,13 @@ fn herdr_client() -> Result<Box<dyn Herdr>, ShepherdError> {
                 .unwrap_or(serde_json::json!([])),
         )
         .map_err(anyhow::Error::from)?;
+        *h.pane_sessions.borrow_mut() = serde_json::from_value(
+            value
+                .get("pane_sessions")
+                .cloned()
+                .unwrap_or(serde_json::json!({})),
+        )
+        .map_err(anyhow::Error::from)?;
         return Ok(Box::new(h));
     }
     Ok(Box::new(CliHerdr::from_env()))

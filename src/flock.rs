@@ -453,6 +453,12 @@ pub struct AgentOperationGuard {
     file: std::fs::File,
 }
 
+impl AgentOperationGuard {
+    pub(crate) fn from_file(file: std::fs::File) -> Self {
+        Self { file }
+    }
+}
+
 impl Drop for AgentOperationGuard {
     fn drop(&mut self) {
         let _ = self.file.unlock();
@@ -549,6 +555,7 @@ mod tests {
             unit: None,
             launch_profile: None,
             completed_tasks: vec![],
+            dispatch_reason: None,
         };
         store
             .update(|data| {

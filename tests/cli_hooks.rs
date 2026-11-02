@@ -271,6 +271,7 @@ fn supervision_cancellation_hook_case(unblock: bool, entry: &str) {
         unit: None,
         launch_profile: None,
         completed_tasks: vec![],
+        dispatch_reason: None,
     };
     store
         .update(|data| {

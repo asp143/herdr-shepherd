@@ -39,6 +39,7 @@ fn fixture(root: &std::path::Path, status: Option<AgentStatus>) -> (Store, FakeH
                     unit: None,
                     launch_profile: None,
                     completed_tasks: vec![],
+                    dispatch_reason: None,
                 });
                 Ok(())
             })

@@ -212,6 +212,7 @@ pub fn run(
                 ticket.branch = child.branch;
                 label = Some(format!("{}-{unit}", role.name));
             }
+            drop(_placement);
             let rec = spawn_task_request(
                 h,
                 &store,
@@ -224,7 +225,6 @@ pub fn run(
                     tab_label: label.as_deref(),
                 },
             )?;
-            drop(_placement);
             drop(_ticket_operation);
             drop(_hooks);
             // A synchronous spawn hook may have reported or retired the agent.
