@@ -497,7 +497,7 @@ starts a fresh cohort; later rounds inside that cohort reuse it. Cleanup
 retires verified idle recipients before its strict physical no-agent check.
 Direct cleanup journals exact retirement recipients before closing tabs;
 retry reconciles confirmed disappearance without losing retirement events.
-Pending cleanup retirement prevents new assignments in those checkouts, and
+Pending cleanup retirement prevents new assignments throughout the ticket, and
 preview remains read-only.
 Successful cleanup closes stored CI and revision dispatch intents as well.
 

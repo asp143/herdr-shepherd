@@ -956,3 +956,27 @@ fn custom_child_writer_request_cannot_bypass_checkout_guard() {
     assert_eq!(h.agent_records.borrow().len(), 1);
     assert_eq!(store.read().unwrap().agents.len(), 1);
 }
+
+#[test]
+fn child_only_cleanup_journal_fences_the_whole_ticket() {
+    let (dir, store, h, cfg, mut old) = fixture("coder");
+    old.worktree = dir.path().join("child");
+    old.unit = Some(1);
+    store
+        .update(|data| {
+            data.agents[0] = old.clone();
+            data.cleanup_retiring_agents.push(old.clone());
+            Ok(())
+        })
+        .unwrap();
+    for role in ["coder", "reviewer", "qa"] {
+        let result = crate::flock::spawn(&h, &store, &cfg, request(dir.path(), role));
+        assert!(
+            result.is_err(),
+            "{role}: parent dispatch bypassed child cleanup intent"
+        );
+        assert!(result.unwrap_err().to_string().contains("cleanup"));
+    }
+    assert_eq!(h.start_args.borrow().len(), 1);
+    assert_eq!(store.read().unwrap().agents.len(), 1);
+}
