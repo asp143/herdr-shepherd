@@ -58,6 +58,21 @@ pub fn agent_name(project_root: &Path, ticket: &str, role: &str, number: usize) 
     format!("sh-{}-{role}{suffix}", &hash[..6])
 }
 
+/// Opaque assignment token, generated once before persisting a launch intent.
+/// Native resume and provider fallback keep the current token.
+pub fn new_task_id(name: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(name.as_bytes());
+    hash.update(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes(),
+    );
+    format!("{:x}", hash.finalize())[..24].to_owned()
+}
+
 pub fn launch_configured(
     h: &dyn Herdr,
     store: &Store,
@@ -144,8 +159,26 @@ pub fn launch_configured(
         if req.role.name == "lead" {
             data.agents.retain(|record| record.name != name);
         }
+        let task_id = new_task_id(&name);
+        let unit = data
+            .tickets
+            .iter()
+            .find(|ticket| ticket.id == req.ticket)
+            .and_then(|ticket| {
+                ticket.children.iter().find(|child| {
+                    child
+                        .path
+                        .canonicalize()
+                        .unwrap_or_else(|_| child.path.clone())
+                        == cwd
+                })
+            })
+            .map(|child| child.unit);
         let record = AgentRecord {
-            task: req.prompt.replace("{{agent_name}}", &name),
+            task: req
+                .prompt
+                .replace("{{agent_name}}", &name)
+                .replace("{{task_id}}", &task_id),
             name,
             ticket: req.ticket.clone(),
             role: req.role.name.clone(),
@@ -165,6 +198,11 @@ pub fn launch_configured(
             nudges: 0,
             restarts: 0,
             prompt_pending: true,
+            attempt_id: Some(format!("{task_id}-1")),
+            task_id: Some(task_id),
+            unit,
+            launch_profile: Some(first.into()),
+            completed_tasks: vec![],
         };
         data.agents.push(record.clone());
         Ok((record, operation))
@@ -194,19 +232,12 @@ fn save(store: &Store, record: &AgentRecord) -> Result<(), ShepherdError> {
             .iter_mut()
             .find(|stored| stored.name == record.name)
             .ok_or_else(|| ShepherdError::Usage("launch record disappeared".into()))?;
-        // An immediately finishing agent may report while launch waits for
-        // its working signal. Keep that report rather than overwriting it.
-        if stored.status == AgentStatus::Retired {
+        // Reports can land after the launch reload. Preserve their immutable
+        // history and resolved claims along with the accepted result.
+        if stored.status == AgentStatus::Retired || stored.report.is_some() {
             return Ok(());
         }
-        let report = stored.report.clone();
-        let status = stored.status;
         *stored = record.clone();
-        if report.is_some() {
-            stored.report = report;
-            stored.status = status;
-            stored.prompt_pending = false;
-        }
         Ok(())
     })
 }
@@ -312,8 +343,10 @@ fn launch_reserved(
         record.task = req
             .prompt
             .replace("{{agent_name}}", &record.name)
+            .replace("{{task_id}}", record.task_id.as_deref().unwrap_or_default())
             .replace("{{subagent_hint}}", harness.subagent_hint());
         record.runner = runner.name.clone();
+        record.launch_profile = Some(runner.into());
         record.status = AgentStatus::Starting;
         record.prompt_pending = true;
         let (tab, pane) = h.create_tab(&req.workspace_id, &req.tab_label, &req.worktree)?;
@@ -770,6 +803,23 @@ mod tests {
                 2
             );
         }
+    }
+
+    #[test]
+    fn launch_save_preserves_completed_assignment_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let store = Store::open(&state, dir.path()).unwrap();
+        let h = FakeHerdr::new(vec![]);
+        let snapshot = launch(&h, &store, req(dir.path(), &state)).unwrap();
+        let completed = crate::flock::store_report(&store, &snapshot.name,
+            r#"{"status":"completed","summary":"done","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+        // The report does not take the launch lock and may land after a reload.
+        save(&store, &snapshot).unwrap();
+        let saved = store.read().unwrap().agents.remove(0);
+        assert_eq!(saved.completed_tasks, completed.completed_tasks);
+        assert_eq!(saved.report, completed.report);
+        assert!(saved.prompt_claim().is_none());
     }
 
     #[test]

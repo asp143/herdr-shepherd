@@ -531,7 +531,7 @@ fn revision_task(ticket: &Ticket, run: &RevisionRun, role: &str) -> String {
         _ => unreachable!(),
     };
     format!(
-        "{}\nTicket {}: {}\n{}\nTask: {}\nAccepted comments:\n{}\nNew diff: {}..HEAD\nAcceptance: {:?}\n{}\nCode changes must be test-first, scoped to this task, and committed on the assigned branch. Use conventional commits, type(scope): imperative subject under 50 characters, with a body explaining why. Do not add AI attribution or Co-Authored-By trailers. Reviewers and QA should inspect and test the complete revision diff and report concrete evidence; delegate code fixes back through the shepherd.\nStay on branch {} in worktree {}. Never switch branches or write outside it. Never read .env files, Credentials/ folders, *.pem, *.key, or other secret files. Never push, open PRs, or call GitHub. Write JSON report in the assigned worktree, run {} agent report --agent {{{{agent_name}}}} --report-file <path>, then remove the report file after success. Never commit report files. Report JSON: {{\"status\":\"completed|blocked|failed\",\"summary\":\"text\",\"tests\":[],\"changed_paths\":[],\"blockers\":[],\"findings\":[],\"commit_sha\":null}}",
+        "{}\nTicket {}: {}\n{}\nTask: {}\nAccepted comments:\n{}\nNew diff: {}..HEAD\nAcceptance: {:?}\n{}\nCode changes must be test-first, scoped to this task, and committed on the assigned branch. Use conventional commits, type(scope): imperative subject under 50 characters, with a body explaining why. Do not add AI attribution or Co-Authored-By trailers. Reviewers and QA should inspect and test the complete revision diff and report concrete evidence; delegate code fixes back through the shepherd.\nStay on branch {} in worktree {}. Never switch branches or write outside it. Never read .env files, Credentials/ folders, *.pem, *.key, or other secret files. Never push, open PRs, or call GitHub. {}",
         run_marker(run),
         ticket.id,
         ticket.title,
@@ -547,9 +547,12 @@ fn revision_task(ticket: &Ticket, run: &RevisionRun, role: &str) -> String {
             .as_deref()
             .unwrap_or(Path::new("."))
             .display(),
-        std::env::current_exe()
-            .unwrap_or_else(|_| "herdr-shepherd".into())
-            .display()
+        crate::prompts::report_instructions(
+            &std::env::current_exe().unwrap_or_else(|_| "herdr-shepherd".into()),
+            ticket.worktree.as_deref().unwrap_or(Path::new(".")),
+            "{{agent_name}}",
+            "{{task_id}}",
+        )
     )
 }
 
@@ -604,4 +607,29 @@ fn validate_gate(ticket: &Ticket, gate: &Gate) -> Result<(), ShepherdError> {
 fn verified_head(gate: &Gate) -> Result<String, ShepherdError> {
     crate::gate::transport::PushTransport::open(&gate.state_dir, &gate.worktree)?
         .verified_ticket_head(&gate.ticket_branch)
+}
+
+#[cfg(test)]
+mod assignment_tests {
+    use super::*;
+
+    #[test]
+    fn revision_prompt_binds_report_to_assignment_file_and_token() {
+        let ticket = Ticket {
+            worktree: Some("/ticket checkout".into()),
+            ..Default::default()
+        };
+        let run = RevisionRun {
+            base_sha: "base".into(),
+            synced_sha: None,
+            stage: RevisionStage::Coder,
+            agent: None,
+            tested_sha: None,
+        };
+        let prompt = revision_task(&ticket, &run, "coder");
+        assert!(prompt.contains("--task-id '{{task_id}}'"));
+        assert!(prompt.contains(".shepherd-report-{{agent_name}}-{{task_id}}.json"));
+        assert!(prompt.contains("\"task_id\":\"{{task_id}}\""));
+        assert!(!prompt.contains("--report-file <path>"));
+    }
 }

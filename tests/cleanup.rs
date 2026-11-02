@@ -1272,6 +1272,11 @@ fn exact_recorded_child_agent_blocks_cleanup_without_live_cwd() {
                 nudges: 0,
                 restarts: 0,
                 prompt_pending: false,
+                task_id: None,
+                attempt_id: None,
+                unit: None,
+                launch_profile: None,
+                completed_tasks: vec![],
             });
             Ok(())
         })

@@ -83,6 +83,8 @@ pub(crate) fn dispatch(
     let (mut claim, nudge_at, queued, initial, recipient_info) = match prompt {
         Prompt::Initial => (
             PromptClaim {
+                task_id: expected.task_id.clone(),
+                attempt_id: expected.attempt_id.clone(),
                 kind: "initial".into(),
                 text: expected.task.clone(),
                 queued_ping: None,
@@ -106,6 +108,8 @@ pub(crate) fn dispatch(
             }
             (
                 PromptClaim {
+                    task_id: expected.task_id.clone(),
+                    attempt_id: expected.attempt_id.clone(),
                     kind: kind.into(),
                     text: text.into(),
                     queued_ping: None,

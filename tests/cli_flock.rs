@@ -66,6 +66,20 @@ fn fake_herdr_spawn_and_list_share_durable_state() {
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["data"]["status"], "working");
+    let rec = &v["data"];
+    let task_id = rec["task_id"]
+        .as_str()
+        .expect("new launches need a task ID");
+    assert!(rec["attempt_id"].as_str().is_some());
+    assert_eq!(rec["launch_profile"]["name"], "codex-sol-high");
+    assert_eq!(rec["launch_profile"]["harness"], "codex");
+    let prompt = rec["task"].as_str().unwrap();
+    assert!(prompt.contains(&format!("--task-id '{task_id}'")));
+    assert!(prompt.contains(&format!(
+        ".shepherd-report-{}-{task_id}.json",
+        rec["name"].as_str().unwrap()
+    )));
+    assert!(!prompt.contains("{{task_id}}"));
     assert_eq!(store.read().unwrap().agents.len(), 1);
     let out = Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
         .args(["--json", "--state-dir"])
@@ -104,6 +118,11 @@ fn report_requires_calling_pane_identity() {
                 nudges: 0,
                 restarts: 0,
                 prompt_pending: false,
+                task_id: None,
+                attempt_id: None,
+                unit: None,
+                launch_profile: None,
+                completed_tasks: vec![],
             });
             Ok(())
         })

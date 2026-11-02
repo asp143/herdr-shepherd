@@ -20,14 +20,79 @@ pub fn store_report(
     name: &str,
     text: &str,
 ) -> Result<crate::store::AgentRecord, ShepherdError> {
-    use crate::store::AgentStatus;
+    store_report_for_task(store, name, None, text)
+}
+
+/// The CLI flag and JSON token must agree when both are supplied.
+pub fn store_report_for_task(
+    store: &crate::store::Store,
+    name: &str,
+    task_id: Option<&str>,
+    text: &str,
+) -> Result<crate::store::AgentRecord, ShepherdError> {
+    accept_report(store, name, task_id, text).map(|(record, _)| record)
+}
+
+fn accept_report(
+    store: &crate::store::Store,
+    name: &str,
+    task_id: Option<&str>,
+    text: &str,
+) -> Result<(crate::store::AgentRecord, bool), ShepherdError> {
+    use crate::store::{AgentStatus, CompletedTask};
     let report = validate_report(text)?;
+    if task_id
+        .zip(report.task_id.as_deref())
+        .is_some_and(|(flag, json)| flag != json)
+    {
+        return Err(ShepherdError::Usage(
+            "report task ID conflicts with --task-id".into(),
+        ));
+    }
+    let task_id = task_id.or(report.task_id.as_deref());
     store.update(|data| {
         let agent = data
             .agents
             .iter_mut()
             .find(|a| a.name == name)
             .ok_or_else(|| ShepherdError::Usage(format!("unknown agent: {name}")))?;
+        // Fence all effects, including clearing uncertain input claims, before
+        // consulting the old payload. An identical earlier result is still stale.
+        match task_id {
+            Some(id) if agent.task_id.as_deref() != Some(id) => {
+                return Err(ShepherdError::Usage("stale report task ID".into()));
+            }
+            None if agent.completed_tasks.iter().any(|completed| {
+                completed.task_id != agent.task_id || completed.attempt_id != agent.attempt_id
+            }) =>
+            {
+                return Err(ShepherdError::Usage(
+                    "--task-id is required after reassignment".into(),
+                ));
+            }
+            _ => {}
+        }
+        // Persist the verified identity even for flag-only/tokenless clients.
+        // Otherwise equal legacy JSON could be relabelled as a later task.
+        let mut report = report.clone();
+        report.task_id = agent.task_id.clone();
+        if let Some(old) = &agent.report {
+            if old.task_id != agent.task_id
+                || agent.completed_tasks.last().is_some_and(|completed| {
+                    completed.task_id != agent.task_id || completed.attempt_id != agent.attempt_id
+                })
+            {
+                return Err(ShepherdError::Usage(
+                    "stored report belongs to an earlier assignment".into(),
+                ));
+            }
+            if old == &report {
+                return Ok((agent.clone(), false));
+            }
+            return Err(ShepherdError::Usage(
+                "agent already submitted a different report".into(),
+            ));
+        }
         if !matches!(
             agent.status,
             AgentStatus::Starting
@@ -37,13 +102,34 @@ pub fn store_report(
         ) {
             return Err(ShepherdError::Usage("agent has been retired".into()));
         }
-        if let Some(old) = &agent.report {
-            if old == &report {
-                return Ok(agent.clone());
-            }
+        if agent.prompt_claim().is_some_and(|claim| {
+            claim.task_id != agent.task_id || claim.attempt_id != agent.attempt_id
+        }) {
             return Err(ShepherdError::Usage(
-                "agent already submitted a different report".into(),
+                "report does not own the current prompt claim".into(),
             ));
+        }
+        let newly_completed = match agent.completed_tasks.iter().find(|completed| {
+            completed.task_id == agent.task_id && completed.attempt_id == agent.attempt_id
+        }) {
+            Some(completed) => {
+                if completed.report != report || completed.task != agent.task {
+                    return Err(ShepherdError::Usage(
+                        "assignment already has a different completed report".into(),
+                    ));
+                }
+                false
+            }
+            None => true,
+        };
+        if newly_completed {
+            agent.completed_tasks.push(CompletedTask {
+                task_id: agent.task_id.clone(),
+                attempt_id: agent.attempt_id.clone(),
+                task: agent.task.clone(),
+                report: report.clone(),
+                completed_at: crate::launch::now(),
+            });
         }
         agent.status = AgentStatus::Reported;
         agent.prompt_pending = false;
@@ -51,7 +137,9 @@ pub fn store_report(
         agent.set_prompt_claim(None);
         agent.report = Some(report.clone());
         let rec = agent.clone();
-        if let Some(ticket) = data.tickets.iter_mut().find(|t| t.id == rec.ticket) {
+        if newly_completed
+            && let Some(ticket) = data.tickets.iter_mut().find(|t| t.id == rec.ticket)
+        {
             ticket.findings.extend(report.findings.clone());
             if rec.role == "planner" {
                 ticket.plan = Some(report.summary.clone());
@@ -65,7 +153,7 @@ pub fn store_report(
                     .flatten();
             }
         }
-        Ok(rec)
+        Ok((rec, newly_completed))
     })
 }
 
@@ -261,7 +349,21 @@ pub fn report(
     name: &str,
     text: &str,
 ) -> Result<crate::store::AgentRecord, ShepherdError> {
-    let rec = store_report(store, name, text)?;
+    report_for_task(h, store, cfg, name, None, text)
+}
+
+pub fn report_for_task(
+    h: &dyn crate::herdr::Herdr,
+    store: &crate::store::Store,
+    cfg: &crate::config::Config,
+    name: &str,
+    task_id: Option<&str>,
+    text: &str,
+) -> Result<crate::store::AgentRecord, ShepherdError> {
+    let (rec, accepted) = accept_report(store, name, task_id, text)?;
+    if !accepted {
+        return Ok(rec);
+    }
     ping_notice(
         h,
         store,
@@ -442,6 +544,11 @@ mod tests {
             nudges: 0,
             restarts: 0,
             prompt_pending: false,
+            task_id: None,
+            attempt_id: None,
+            unit: None,
+            launch_profile: None,
+            completed_tasks: vec![],
         };
         store
             .update(|data| {

@@ -21,6 +21,9 @@ pub enum AgentCommand {
         agent: String,
         #[arg(long)]
         report_file: std::path::PathBuf,
+        /// Assignment token from the task prompt (optional for legacy reports).
+        #[arg(long)]
+        task_id: Option<String>,
     },
     List {
         #[arg(long)]
@@ -65,7 +68,11 @@ pub fn run(
                 .ok_or_else(|| ShepherdError::Usage(format!("unknown agent: {name}")))?,
         )
         .expect("serializable"),
-        AgentCommand::Report { agent, report_file } => {
+        AgentCommand::Report {
+            agent,
+            report_file,
+            task_id,
+        } => {
             let text = crate::cli_pr::read_text(report_file)?;
             flock::validate_report(&text)?;
             if let Ok(caller) = std::env::var("HERDR_PANE_ID") {
@@ -81,8 +88,15 @@ pub fn run(
                     ));
                 }
             }
-            serde_json::to_value(flock::report(h, &store, &cfg, agent, &text)?)
-                .expect("serializable")
+            serde_json::to_value(flock::report_for_task(
+                h,
+                &store,
+                &cfg,
+                agent,
+                task_id.as_deref(),
+                &text,
+            )?)
+            .expect("serializable")
         }
         AgentCommand::Cancel { name, force } => {
             serde_json::to_value(flock::cancel(h, &store, name, *force)?).expect("serializable")

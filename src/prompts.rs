@@ -100,13 +100,7 @@ pub fn role_prompt(
     harness: &dyn crate::harness::Harness,
 ) -> String {
     let worktree = ticket.worktree.as_deref().unwrap_or(Path::new("."));
-    let report = worktree.join(format!(".shepherd-report-{agent_name}.json"));
-    let command = format!(
-        "{} agent report --agent {} --report-file {}",
-        crate::gate::shim::shell_quote(bin),
-        crate::gate::shim::shell_quote(Path::new(agent_name)),
-        crate::gate::shim::shell_quote(&report)
-    );
+    let reporting = report_instructions(bin, worktree, agent_name, "{{task_id}}");
     let acceptance = ticket
         .acceptance
         .iter()
@@ -136,12 +130,7 @@ Assigned task:
 Role instructions:
 {extra}
 
-When finished, write {report_path} inside this worktree using this JSON schema:
-{{"status":"completed|blocked|failed","summary":"what happened and why","tests":["command and result"],"changed_paths":["relative/path"],"blockers":["reason"],"findings":[{{"severity":"high|mid|low|wish","text":"concrete finding","location":"path:line or null"}}],"commit_sha":"full commit SHA or null"}}
-Use actual completed, blocked, or failed as status; use JSON null for absent location or commit_sha. Empty arrays are valid. Include the plan in the planner summary and research findings in the researcher summary. Completed must mean this role's checks passed; failed checks or unresolved blockers must be reported explicitly.
-Submit exactly:
-{command}
-After a successful report, remove only your report file with rm -- {quoted_report}. Never commit report files. Then stop.
+{reporting}
 "#,
         role_name = role.name,
         id = ticket.id,
@@ -157,6 +146,29 @@ After a successful report, remove only your report file with rm -- {quoted_repor
             .prompt
             .as_deref()
             .unwrap_or("Follow the assigned role description and ticket acceptance criteria."),
+    )
+}
+
+/// Shared by initial role tasks and PR revision tasks. Placeholders are bound
+/// by launch before the prompt can reach a harness.
+pub fn report_instructions(bin: &Path, worktree: &Path, agent_name: &str, task_id: &str) -> String {
+    let report = worktree.join(format!(".shepherd-report-{agent_name}-{task_id}.json"));
+    let command = format!(
+        "{} agent report --agent {} --task-id {} --report-file {}",
+        crate::gate::shim::shell_quote(bin),
+        crate::gate::shim::shell_quote(Path::new(agent_name)),
+        crate::gate::shim::shell_quote(Path::new(task_id)),
+        crate::gate::shim::shell_quote(&report)
+    );
+    format!(
+        r#"Assignment task ID: {task_id}
+When finished, write {report_path} inside this worktree using this JSON schema:
+{{"task_id":"{task_id}","status":"completed|blocked|failed","summary":"what happened and why","tests":["command and result"],"changed_paths":["relative/path"],"blockers":["reason"],"findings":[{{"severity":"high|mid|low|wish","text":"concrete finding","location":"path:line or null"}}],"commit_sha":"full commit SHA or null"}}
+Use actual completed, blocked, or failed as status; use JSON null for absent location or commit_sha. Empty arrays are valid. Include the plan in the planner summary and research findings in the researcher summary. Completed must mean this role's checks passed; failed checks or unresolved blockers must be reported explicitly.
+Submit exactly:
+{command}
+After a successful report, remove only your report file with rm -- {quoted_report}. Never commit report files. Then stop.
+"#,
         report_path = report.display(),
         quoted_report = crate::gate::shim::shell_quote(&report)
     )
