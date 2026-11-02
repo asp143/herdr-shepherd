@@ -249,6 +249,52 @@ pub fn retire_with_config(
     retire_inner(h, store, expected, None, Some(cfg))
 }
 
+/// Direct cleanup journals its entire recipient set before any tab closes.
+/// A vanished recipient is reconciled only against that exact persisted intent.
+pub(crate) fn retire_for_ticket_cleanup(
+    h: &dyn Herdr,
+    store: &Store,
+    expected: &AgentRecord,
+    cfg: &crate::config::Config,
+) -> Result<bool, ShepherdError> {
+    let current = |data: &crate::store::StoreData| {
+        data.agents.contains(expected)
+            && data
+                .tickets
+                .iter()
+                .any(|ticket| ticket.id == expected.ticket)
+            && data.cleanup_retiring_agents.contains(expected)
+    };
+    if !current(&store.read()?) {
+        return Ok(false);
+    }
+    if !super::terminal_gone(h, expected)? {
+        return retire_with_config(h, store, expected, cfg);
+    }
+    let _hooks = crate::hooks::defer();
+    let Some(_operation) = super::try_agent_operation(store, &expected.name)? else {
+        return Ok(false);
+    };
+    if !super::terminal_gone(h, expected)? {
+        return Ok(false);
+    }
+    let retired = store.update(|data| {
+        if !current(data) {
+            return Ok(false);
+        }
+        data.agents
+            .iter_mut()
+            .find(|a| *a == expected)
+            .unwrap()
+            .status = AgentStatus::Retired;
+        Ok(true)
+    })?;
+    if retired {
+        super::emit_retired(cfg, expected);
+    }
+    Ok(retired)
+}
+
 /// The integration receipt also journals tab closure. A missing terminal is
 /// completion evidence only after its exact owned recipient was persisted.
 pub(crate) fn retire_for_cleanup(

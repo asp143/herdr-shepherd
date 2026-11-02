@@ -57,6 +57,7 @@ struct LocalHerdr {
     closed_tabs: RefCell<Vec<String>>,
     pane_sessions: RefCell<std::collections::HashMap<String, String>>,
     close_tab_effects: RefCell<bool>,
+    fail_after_tab_close: RefCell<Option<usize>>,
     agent_after_close: RefCell<Option<AgentInfo>>,
     notifications: RefCell<Vec<String>>,
     rewrite_after_remove: RefCell<Option<(String, String)>>,
@@ -80,6 +81,10 @@ impl Herdr for LocalHerdr {
             if let Some(agent) = self.agent_after_close.borrow_mut().take() {
                 self.agents.borrow_mut().push(agent);
             }
+        }
+        if *self.fail_after_tab_close.borrow() == Some(self.closed_tabs.borrow().len()) {
+            self.fail_after_tab_close.replace(None);
+            return Err(ShepherdError::Usage("lost close acknowledgement".into()));
         }
         Ok(())
     }
@@ -250,6 +255,7 @@ impl Repo {
             closed_tabs: RefCell::default(),
             pane_sessions: RefCell::default(),
             close_tab_effects: RefCell::new(true),
+            fail_after_tab_close: RefCell::new(None),
             agent_after_close: RefCell::new(None),
             notifications: RefCell::new(vec![]),
             rewrite_after_remove: RefCell::new(None),
@@ -2052,5 +2058,134 @@ fn cleanup_finishes_pending_ci_and_revision_assignments() {
             assert!(ticket.revision_run.is_none());
             assert_eq!(ticket.history.last().unwrap().to, TicketState::CleanedUp);
         }
+    }
+}
+
+#[test]
+fn cleanup_reconciles_retirement_after_lost_close_acknowledgement() {
+    use herdr_shepherd::store::{AgentStatus, Store};
+    for failed_close in [1, 2] {
+        let mut repo = Repo::new();
+        repo.merge();
+        let events = retirement_hook(&mut repo);
+        reported_cleanup_agent(&repo, "coder", 1);
+        reported_cleanup_agent(&repo, "reviewer", 2);
+        let store = Store::open(&repo.state, &repo.main).unwrap();
+        repo.h.fail_after_tab_close.replace(Some(failed_close));
+        let error = cleanup::run(repo.preflight(false).unwrap(), false).unwrap_err();
+        assert!(error.to_string().contains("lost close acknowledgement"));
+        assert!(repo.ticket.exists());
+        assert_eq!(repo.h.agents.borrow().len(), 2 - failed_close);
+        let state = store.read().unwrap();
+        assert_eq!(state.agents[failed_close - 1].status, AgentStatus::Reported);
+        // The entire set is durable before even the first close.
+        assert_eq!(state.cleanup_retiring_agents.len(), 2);
+        let emitted_before = fs::read_to_string(&events).unwrap_or_default();
+        assert_eq!(emitted_before.lines().count(), failed_close - 1);
+
+        // Previewing the retry must not reconcile state or emit retirement events.
+        let before = fs::read(store.root().join("state.json")).unwrap();
+        cleanup::run(repo.preflight(true).unwrap(), true).unwrap();
+        assert_eq!(fs::read(store.root().join("state.json")).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(&events).unwrap_or_default(),
+            emitted_before
+        );
+
+        cleanup::run(repo.preflight(false).unwrap(), false).unwrap();
+        assert!(!repo.ticket.exists());
+        assert!(repo.h.agents.borrow().is_empty());
+        assert_eq!(repo.h.closed_tabs.borrow().len(), 2);
+        assert!(store.read().unwrap().cleanup_retiring_agents.is_empty());
+        assert!(
+            store
+                .read()
+                .unwrap()
+                .agents
+                .iter()
+                .all(|agent| agent.status == AgentStatus::Retired)
+        );
+        let emitted: Vec<serde_json::Value> = fs::read_to_string(events)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0]["role"], "coder");
+        assert_eq!(emitted[1]["role"], "reviewer");
+    }
+}
+
+#[test]
+fn cleanup_rejects_changed_journaled_recipient() {
+    use herdr_shepherd::store::Store;
+    let repo = Repo::new();
+    repo.merge();
+    reported_cleanup_agent(&repo, "coder", 1);
+    let store = Store::open(&repo.state, &repo.main).unwrap();
+    repo.h.fail_after_tab_close.replace(Some(1));
+    assert!(cleanup::run(repo.preflight(false).unwrap(), false).is_err());
+    store
+        .update(|data| {
+            data.agents[0].task_id = Some("replacement-task".into());
+            Ok(())
+        })
+        .unwrap();
+    let result = repo.preflight(false);
+    assert!(result.is_err());
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("retirement intent changed")
+    );
+    assert!(repo.ticket.exists());
+    assert_eq!(repo.h.closed_tabs.borrow().len(), 1);
+    assert!(repo.h.removals.borrow().is_empty());
+}
+
+#[test]
+fn cleanup_pending_retirement_fences_new_assignments() {
+    use herdr_shepherd::{
+        flock,
+        launch::LaunchRequest,
+        roles,
+        store::{Store, TicketState},
+    };
+    let repo = Repo::new();
+    repo.merge();
+    reported_cleanup_agent(&repo, "coder", 1);
+    let store = Store::open(&repo.state, &repo.main).unwrap();
+    store
+        .update(|data| {
+            data.tickets[0].state = TicketState::Building;
+            Ok(())
+        })
+        .unwrap();
+    repo.h.fail_after_tab_close.replace(Some(1));
+    assert!(cleanup::run(repo.preflight(false).unwrap(), false).is_err());
+    let before = store.read().unwrap();
+    let resolved = roles::resolve(&repo.cfg).unwrap();
+    for role in ["coder", "reviewer", "qa"] {
+        let request = LaunchRequest {
+            ticket: "T".into(),
+            role: resolved
+                .roles
+                .iter()
+                .find(|candidate| candidate.name == role)
+                .unwrap()
+                .clone(),
+            runners: vec![resolved.runners["codex-sol-high"].clone()],
+            worktree: repo.ticket.clone(),
+            workspace_id: "ticket".into(),
+            tab_label: role.into(),
+            prompt: "Do the next assignment".into(),
+            state_dir: repo.state.clone(),
+        };
+        let error = flock::spawn(&repo.h, &store, &repo.cfg, request).unwrap_err();
+        assert!(error.to_string().contains("cleanup"), "{role}: {error}");
+        assert_eq!(store.read().unwrap(), before);
+        assert!(repo.ticket.exists());
     }
 }

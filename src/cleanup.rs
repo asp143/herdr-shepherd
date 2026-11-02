@@ -549,6 +549,35 @@ fn planned_retirements(
     ticket: &crate::store::Ticket,
 ) -> Result<Vec<crate::store::AgentRecord>, ShepherdError> {
     let mut retiring = Vec::new();
+    // Live enumeration cannot recover a close whose acknowledgement was lost.
+    // Only a previously journaled exact recipient may be reconciled as gone.
+    for expected in data
+        .cleanup_retiring_agents
+        .iter()
+        .filter(|rec| rec.ticket == ticket.id)
+    {
+        let mut retired = expected.clone();
+        retired.status = crate::store::AgentStatus::Retired;
+        if data.agents.contains(&retired) {
+            continue;
+        }
+        if !data.agents.contains(expected)
+            || expected.ticket != ticket.id
+            || expected.status != crate::store::AgentStatus::Reported
+            || !targets.iter().any(|target| {
+                expected
+                    .worktree
+                    .canonicalize()
+                    .unwrap_or_else(|_| expected.worktree.clone())
+                    .starts_with(&target.path)
+            })
+        {
+            return Err(ShepherdError::PolicyDenied(
+                "cleanup retirement intent changed; resources kept".into(),
+            ));
+        }
+        retiring.push(expected.clone());
+    }
     for agent in h.agents()? {
         if !related_agent(&agent, targets, &data.agents) {
             continue;
@@ -1043,8 +1072,27 @@ pub fn run(mut p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, Shepher
             ));
         }
         let store = crate::store::Store::open(&p.proof.state_dir, &p.proof.project_root)?;
+        // Persist the whole validated recipient set before the first close. A
+        // successful close followed by a transport error must remain recoverable.
+        store.update(|data| {
+            check_recorded_resources(&p.ticket, data)?;
+            if p.retiring_agents
+                .iter()
+                .any(|rec| !data.agents.contains(rec))
+            {
+                return Err(ShepherdError::PolicyDenied(
+                    "cleanup retirement recipients changed before journaling".into(),
+                ));
+            }
+            for rec in &p.retiring_agents {
+                if !data.cleanup_retiring_agents.contains(rec) {
+                    data.cleanup_retiring_agents.push(rec.clone());
+                }
+            }
+            Ok(())
+        })?;
         for rec in &p.retiring_agents {
-            if !crate::flock::retire_automatically_with_config(p.herdr, &store, rec, p.cfg)? {
+            if !crate::flock::automatic::retire_for_ticket_cleanup(p.herdr, &store, rec, p.cfg)? {
                 return Err(ShepherdError::PolicyDenied(format!(
                     "{}: retirement deferred; cleanup resources kept",
                     rec.name
@@ -1199,6 +1247,8 @@ pub fn run(mut p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, Shepher
             ticket.revision_task = None;
             ticket.revision_run = None;
             ticket.pr_reviewers_pending.clear();
+            data.cleanup_retiring_agents
+                .retain(|rec| rec.ticket != p.ticket.id);
             Ok(())
         })?;
         Ok(report)

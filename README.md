@@ -490,6 +490,10 @@ Retirement still happens at `pr_open` handoff, child integration, cancellation
 and final cleanup. The first CI or PR-comment fix after `pr_open` therefore
 starts a fresh cohort; later rounds inside that cohort reuse it. Cleanup
 retires verified idle recipients before its strict physical no-agent check.
+Direct cleanup journals exact retirement recipients before closing tabs;
+retry reconciles confirmed disappearance without losing retirement events.
+Pending cleanup retirement prevents new assignments in those checkouts, and
+preview remains read-only.
 Successful cleanup closes stored CI and revision dispatch intents as well.
 
 A coder launched with `--unit N` uses a private Git checkout and branch

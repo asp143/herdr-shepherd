@@ -57,6 +57,16 @@ pub(super) fn check_admission(
     cfg: &Config,
 ) -> Result<(), ShepherdError> {
     let cwd = canonical(&req.worktree);
+    if data
+        .cleanup_retiring_agents
+        .iter()
+        .any(|rec| cwd.starts_with(canonical(&rec.worktree)))
+    {
+        return Err(ShepherdError::Usage(
+            "checkout has outstanding cleanup retirement; finish cleanup before launching an agent"
+                .into(),
+        ));
+    }
     if data.tickets.iter().any(|ticket| {
         ticket
             .child_cleanup
