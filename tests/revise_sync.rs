@@ -1359,9 +1359,8 @@ impl herdr_shepherd::github::PrBackend for PushBackend {
 }
 
 #[test]
-fn automatic_revision_retirement_waits_for_owned_reported_recipient() {
-    if !local_transport_enabled("automatic_revision_retirement_waits_for_owned_reported_recipient")
-    {
+fn revision_consumes_report_without_retiring_recipient() {
+    if !local_transport_enabled("revision_consumes_report_without_retiring_recipient") {
         return;
     }
     use herdr_shepherd::{store::AgentStatus, ticket::revise::RevisionOutcome};
@@ -1407,7 +1406,10 @@ fn automatic_revision_retirement_waits_for_owned_reported_recipient() {
         h.calls.borrow_mut().clear();
         assert_eq!(
             resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later").unwrap(),
-            RevisionOutcome::Waiting,
+            RevisionOutcome::Started {
+                agent: store.read().unwrap().agents.last().unwrap().name.clone(),
+                role: "reviewer".into()
+            },
             "{blocked_by}"
         );
         assert_eq!(store.read().unwrap().agents[0], before);
@@ -1416,11 +1418,352 @@ fn automatic_revision_retirement_waits_for_owned_reported_recipient() {
             !h.calls
                 .borrow()
                 .iter()
-                .any(|call| call.starts_with("close_tab ")
-                    || call.starts_with("start_agent ")
-                    || call.starts_with("prompt_agent ")),
+                .any(|call| call.starts_with("close_tab ")),
             "{blocked_by}"
         );
         assert_eq!(gh.pushes.get(), 0);
+    }
+}
+
+fn report_round(
+    store: &Store,
+    h: &herdr_shepherd::herdr::fake::FakeHerdr,
+    name: &str,
+    reject: bool,
+    sha: &str,
+) {
+    let record = store
+        .read()
+        .unwrap()
+        .agents
+        .into_iter()
+        .find(|a| a.name == name)
+        .unwrap();
+    if matches!(record.role.as_str(), "reviewer" | "qa") {
+        let ticket = store.read().unwrap().tickets.remove(0);
+        let run = ticket.revision_run.unwrap();
+        assert!(
+            record
+                .task
+                .contains(&format!("pinned base {}", run.base_sha))
+        );
+        assert!(record.task.contains(&format!("pinned HEAD {sha}")));
+        for rule in [
+            "complete revision diff",
+            "every acceptance criterion",
+            "new commands and evidence",
+            "revalidate earlier findings",
+            "earlier verdicts are context rather than proof",
+        ] {
+            assert!(
+                record.task.contains(rule),
+                "{}: missing {rule}",
+                record.role
+            );
+        }
+        assert!(record.task.contains(&format!(
+            "--task-id '{}'",
+            record.task_id.as_deref().unwrap()
+        )));
+    }
+    let session = format!("session-{name}");
+    h.pane_sessions
+        .borrow_mut()
+        .insert(record.pane_id.clone().unwrap(), session.clone());
+    h.agent_records
+        .borrow_mut()
+        .iter_mut()
+        .find(|a| a.name.as_deref() == Some(name))
+        .unwrap()
+        .agent_status = "idle".into();
+    store
+        .update(|data| {
+            let a = data.agents.iter_mut().find(|a| a.name == name).unwrap();
+            let mut observed: serde_json::Value =
+                serde_json::from_str(a.observed.as_deref().unwrap()).unwrap();
+            observed["session_ref"] = session.into();
+            a.observed = Some(observed.to_string());
+            Ok(())
+        })
+        .unwrap();
+    herdr_shepherd::flock::store_report_for_task(store, name, record.task_id.as_deref(), &serde_json::json!({"status":"completed","summary":"new evidence", "tests":["fixture"],"changed_paths":[],"blockers":if reject {vec!["fix required"]} else {vec![]},"findings":[],"commit_sha":sha}).to_string()).unwrap();
+}
+
+#[test]
+fn revision_rejection_reuses_each_role_and_rejects_stale_reports() {
+    if !local_transport_enabled("revision_rejection_reuses_each_role_and_rejects_stale_reports") {
+        return;
+    }
+    use herdr_shepherd::ticket::revise::RevisionOutcome;
+    for reject_role in ["reviewer", "qa"] {
+        let repo = Repo::new();
+        let store = stored_revision(&repo);
+        let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+        let gh = PushBackend::new(&repo);
+        let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+        let sha = git(&repo.root, &["rev-parse", "HEAD"]);
+        let mut names = std::collections::HashMap::new();
+        for role in ["coder", "reviewer", "qa"]
+            .into_iter()
+            .take(if reject_role == "qa" { 3 } else { 2 })
+        {
+            let RevisionOutcome::Started {
+                agent,
+                role: actual,
+            } = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "now").unwrap()
+            else {
+                panic!("expected {role}")
+            };
+            assert_eq!(actual, role);
+            report_round(&store, &h, &agent, role == reject_role, &sha);
+            names.insert(role, agent);
+        }
+        let old = store.read().unwrap().agents[0].clone();
+        for role in ["coder", "reviewer", "qa"] {
+            let RevisionOutcome::Started {
+                agent,
+                role: actual,
+            } = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "next").unwrap()
+            else {
+                panic!("expected {role}")
+            };
+            assert_eq!(actual, role);
+            if let Some(previous) = names.get(role) {
+                assert_eq!(
+                    &agent, previous,
+                    "must reuse {role} after {reject_role} rejection"
+                );
+            }
+            if role == "coder" {
+                assert!(
+                    herdr_shepherd::flock::store_report_for_task(
+                        &store,
+                        &agent,
+                        old.task_id.as_deref(),
+                        &serde_json::to_string(old.report.as_ref().unwrap()).unwrap()
+                    )
+                    .is_err()
+                );
+                assert_eq!(
+                    resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "stale").unwrap(),
+                    RevisionOutcome::Waiting
+                );
+            }
+            report_round(&store, &h, &agent, false, &sha);
+        }
+        assert_eq!(store.read().unwrap().agents.len(), 3);
+        assert_eq!(h.start_args.borrow().len(), 3);
+        assert!(!h.calls.borrow().iter().any(|c| c.starts_with("close_tab ")));
+    }
+}
+
+#[test]
+fn pr_comment_round_reuses_existing_cohort() {
+    if !local_transport_enabled("pr_comment_round_reuses_existing_cohort") {
+        return;
+    }
+    use herdr_shepherd::ticket::revise::RevisionOutcome;
+    let repo = Repo::new();
+    let store = stored_revision(&repo);
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+    let gh = PushBackend::new(&repo);
+    let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+    let sha = git(&repo.root, &["rev-parse", "HEAD"]);
+    for round in 0..2 {
+        if round == 1 {
+            store
+                .update(|data| {
+                    let t = &mut data.tickets[0];
+                    t.state = TicketState::Revising;
+                    t.revision_task = Some("Address another accepted PR comment".into());
+                    Ok(())
+                })
+                .unwrap();
+        }
+        for role in ["coder", "reviewer", "qa"] {
+            let RevisionOutcome::Started {
+                agent,
+                role: actual,
+            } = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "round").unwrap()
+            else {
+                panic!("expected {role}")
+            };
+            assert_eq!(actual, role);
+            report_round(&store, &h, &agent, false, &sha);
+        }
+        assert!(matches!(
+            resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "finish").unwrap(),
+            RevisionOutcome::Pushed { .. }
+        ));
+    }
+    assert_eq!(store.read().unwrap().agents.len(), 3);
+    assert_eq!(h.start_args.borrow().len(), 3);
+}
+
+#[test]
+fn revision_assignment_mismatch_cannot_consume_current_report() {
+    if !local_transport_enabled("revision_assignment_mismatch_cannot_consume_current_report") {
+        return;
+    }
+    use herdr_shepherd::ticket::revise::RevisionOutcome;
+    for field in ["task_id", "attempt_id"] {
+        let repo = Repo::new();
+        let store = stored_revision(&repo);
+        let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+        let gh = PushBackend::new(&repo);
+        let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+        let RevisionOutcome::Started { agent, .. } =
+            resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "start").unwrap()
+        else {
+            panic!("expected coder")
+        };
+        report_round(
+            &store,
+            &h,
+            &agent,
+            false,
+            &git(&repo.root, &["rev-parse", "HEAD"]),
+        );
+        store
+            .update(|data| {
+                let run = data.tickets[0].revision_run.as_mut().unwrap();
+                if field == "task_id" {
+                    run.task_id = Some("earlier-task".into());
+                } else {
+                    run.attempt_id = Some("earlier-attempt".into());
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "stale").unwrap(),
+            RevisionOutcome::Waiting
+        );
+        assert_eq!(store.read().unwrap().agents.len(), 1);
+        assert_eq!(gh.pushes.get(), 0);
+    }
+}
+
+#[test]
+fn ambiguous_revision_delivery_keeps_exact_assignment_pending() {
+    if !local_transport_enabled("ambiguous_revision_delivery_keeps_exact_assignment_pending") {
+        return;
+    }
+    use herdr_shepherd::ticket::revise::RevisionOutcome;
+    let repo = Repo::new();
+    let store = stored_revision(&repo);
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+    let gh = PushBackend::new(&repo);
+    let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+    let sha = git(&repo.root, &["rev-parse", "HEAD"]);
+    for role in ["coder", "reviewer"] {
+        let RevisionOutcome::Started { agent, .. } =
+            resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "start").unwrap()
+        else {
+            panic!("expected {role}")
+        };
+        report_round(&store, &h, &agent, role == "reviewer", &sha);
+    }
+    h.prompt_results.borrow_mut().push_back((
+        true,
+        Err(herdr_shepherd::error::ShepherdError::HerdrCommand {
+            code: "timeout".into(),
+            message: "accepted but timed out".into(),
+        }),
+    ));
+    assert_eq!(
+        resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "reuse").unwrap(),
+        RevisionOutcome::Blocked
+    );
+    let data = store.read().unwrap();
+    let run = data.tickets[0].revision_run.as_ref().unwrap();
+    let agent = data
+        .agents
+        .iter()
+        .find(|a| run.agent.as_ref() == Some(&a.name))
+        .unwrap();
+    assert_eq!(run.task_id, agent.task_id);
+    assert_eq!(run.attempt_id, agent.attempt_id);
+    assert_eq!(agent.status, herdr_shepherd::store::AgentStatus::Blocked);
+    assert_eq!(
+        resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "retry").unwrap(),
+        RevisionOutcome::Waiting
+    );
+    assert_eq!(store.read().unwrap().agents.len(), 2);
+    assert_eq!(h.start_args.borrow().len(), 2);
+    report_round(&store, &h, &agent.name, false, &sha);
+    assert!(
+        matches!(resume_revision(&h,&gh,&store,&cfg,&repo.gate(),"T-1","report").unwrap(),RevisionOutcome::Started {role,..} if role == "reviewer")
+    );
+}
+
+#[test]
+fn interrupted_revision_delivery_keeps_persisted_assignment() {
+    if !local_transport_enabled("interrupted_revision_delivery_keeps_persisted_assignment") {
+        return;
+    }
+    use herdr_shepherd::ticket::revise::RevisionOutcome;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    for reuse in [false, true] {
+        let repo = Repo::new();
+        let store = stored_revision(&repo);
+        let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+        let gh = PushBackend::new(&repo);
+        let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+        if reuse {
+            for role in ["coder", "reviewer"] {
+                let RevisionOutcome::Started { agent, .. } =
+                    resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "before").unwrap()
+                else {
+                    panic!("expected {role}")
+                };
+                report_round(
+                    &store,
+                    &h,
+                    &agent,
+                    role == "reviewer",
+                    &git(&repo.root, &["rev-parse", "HEAD"]),
+                );
+            }
+        }
+        let saved = store.clone();
+        let observed = Arc::new(AtomicBool::new(false));
+        let seen = observed.clone();
+        *h.on_prompt.borrow_mut() = Some(Box::new(move |name| {
+            let data = saved.read().unwrap();
+            let run = data.tickets[0].revision_run.as_ref().unwrap();
+            let rec = data.agents.iter().find(|a| a.name == name).unwrap();
+            assert_eq!(run.agent.as_deref(), Some(name));
+            assert_eq!(run.task_id, rec.task_id);
+            assert_eq!(run.attempt_id, rec.attempt_id);
+            seen.store(true, Ordering::SeqCst);
+            panic!("fixture interruption after durable reservation");
+        }));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| resume_revision(
+                &h,
+                &gh,
+                &store,
+                &cfg,
+                &repo.gate(),
+                "T-1",
+                "interrupted"
+            )))
+            .is_err()
+        );
+        assert!(observed.load(Ordering::SeqCst));
+        *h.on_prompt.borrow_mut() = None;
+        assert_eq!(
+            resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "retry").unwrap(),
+            RevisionOutcome::Waiting
+        );
+        assert_eq!(
+            store.read().unwrap().agents.len(),
+            if reuse { 2 } else { 1 }
+        );
+        assert_eq!(h.start_args.borrow().len(), if reuse { 2 } else { 1 });
     }
 }

@@ -361,7 +361,14 @@ fn every_ticket_role_opens_in_the_ticket_workspace() {
     let data = f.store.read().unwrap();
     assert_eq!(data.agents.len(), 5);
     assert!(data.tickets[0].children.is_empty());
+    let head = git(&f.ticket_path, &["rev-parse", "HEAD"]);
+    let base = git(&f.root, &["rev-parse", "main"]);
     for agent in data.agents {
+        if matches!(agent.role.as_str(), "reviewer" | "qa") {
+            assert!(agent.task.contains(&format!("pinned base {base}")));
+            assert!(agent.task.contains(&format!("pinned HEAD {head}")));
+            assert!(!agent.task.contains("{{verification_"));
+        }
         assert_eq!(agent.worktree, f.ticket_path);
         assert!(
             agent
@@ -414,6 +421,8 @@ fn revision_roles_open_ticket_tabs_without_creating_workspaces() {
                     synced_sha: Some(head.clone()),
                     stage,
                     agent: None,
+                    task_id: None,
+                    attempt_id: None,
                     tested_sha: None,
                 });
                 Ok(())

@@ -61,6 +61,8 @@ pub struct Ticket {
     pub pr_number: Option<u64>,
     #[serde(default)]
     pub ci_failure_task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_recovery: Option<crate::ticket::revise::CiRecovery>,
     #[serde(default)]
     pub ci_none_since: Option<String>,
     #[serde(default)]

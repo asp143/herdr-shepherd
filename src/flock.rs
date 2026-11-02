@@ -391,6 +391,16 @@ pub fn spawn(
     cfg: &crate::config::Config,
     req: crate::launch::LaunchRequest,
 ) -> Result<crate::store::AgentRecord, ShepherdError> {
+    spawn_with_reservation(h, store, cfg, req, &|_, _| Ok(()))
+}
+
+pub fn spawn_with_reservation(
+    h: &dyn crate::herdr::Herdr,
+    store: &crate::store::Store,
+    cfg: &crate::config::Config,
+    req: crate::launch::LaunchRequest,
+    reserved: &crate::launch::ReservationHook<'_>,
+) -> Result<crate::store::AgentRecord, ShepherdError> {
     let data = store.read()?;
     let ticket = data
         .tickets
@@ -400,7 +410,7 @@ pub fn spawn(
     if !crate::ticket::state::is_active(ticket.state) {
         return Err(ShepherdError::Usage("ticket is not active".into()));
     }
-    crate::launch::launch_configured(h, store, req, cfg)
+    crate::launch::launch_with_reservation(h, store, req, cfg, reserved)
 }
 
 pub fn cancel(

@@ -15,8 +15,42 @@ pub struct RevisionRun {
     pub synced_sha: Option<String>,
     pub stage: RevisionStage,
     pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
     #[serde(default)]
     pub tested_sha: Option<String>,
+}
+
+/// A durable reference to a single dispatch, including fallback attempts.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct AssignmentRef {
+    pub agent: String,
+    pub task_id: Option<String>,
+    pub attempt_id: Option<String>,
+}
+
+impl AssignmentRef {
+    pub fn from_agent(agent: &crate::store::AgentRecord) -> Self {
+        Self {
+            agent: agent.name.clone(),
+            task_id: agent.task_id.clone(),
+            attempt_id: agent.attempt_id.clone(),
+        }
+    }
+
+    pub fn matches(&self, agent: &crate::store::AgentRecord) -> bool {
+        self.agent == agent.name
+            && self.task_id == agent.task_id
+            && self.attempt_id == agent.attempt_id
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct CiRecovery {
+    pub generation: String,
+    pub assignment: AssignmentRef,
 }
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -100,28 +134,6 @@ pub fn resume_revision(
         }
         Ok((base_head, verified_head(gate)?))
     })();
-    // Close a completed stage only under that recipient's operation lock and
-    // outside the state transaction. A report racing this preflight waits for
-    // the next dispatch; it must not bypass ownership checks inside update.
-    if preparation.is_ok()
-        && let Some(run) = &initial.revision_run
-    {
-        let data = store.read()?;
-        let candidate = run
-            .agent
-            .as_deref()
-            .and_then(|name| data.agents.iter().find(|a| a.name == name))
-            .or_else(|| {
-                data.agents.iter().rev().find(|a| {
-                    a.ticket == id && a.task.contains(&run_marker(run)) && a.report.is_some()
-                })
-            });
-        if let Some(agent) = candidate.filter(|a| a.status == AgentStatus::Reported)
-            && !crate::flock::retire_automatically(h, store, agent)?
-        {
-            return Ok(RevisionOutcome::Waiting);
-        }
-    }
     let prepared = store.update(|data| {
         let ticket = data
             .tickets
@@ -151,41 +163,55 @@ pub fn resume_revision(
                 synced_sha: Some(observed_head.clone()),
                 stage: RevisionStage::Coder,
                 agent: None,
+                task_id: None,
+                attempt_id: None,
                 tested_sha: None,
             });
         }
         let run = ticket.revision_run.as_mut().expect("initialized run");
-        // Recover a launch that was persisted before the dispatcher crashed.
-        if run.agent.is_none() {
-            let marker = run_marker(run);
-            run.agent = data
-                .agents
-                .iter()
-                .rev()
-                .find(|agent| {
-                    agent.ticket == id
-                        && agent.task.contains(&marker)
-                        && agent.status != AgentStatus::LaunchFailed
-                        && (agent.status != AgentStatus::Retired || agent.report.is_some())
-                })
-                .map(|agent| agent.name.clone());
-        }
         if let Some(name) = &run.agent {
             let agent = data
                 .agents
                 .iter_mut()
                 .find(|agent| &agent.name == name)
                 .ok_or_else(|| ShepherdError::Usage("revision agent record disappeared".into()))?;
+            // Legacy runs may bind their named, original assignment once. Never
+            // relabel a reused record or recover a launch from prompt prose.
+            if run.task_id.is_none() && run.attempt_id.is_none() && agent.completed_tasks.len() <= 1
+            {
+                run.task_id = agent.task_id.clone();
+                run.attempt_id = agent.attempt_id.clone();
+            }
+            if run.task_id != agent.task_id || run.attempt_id != agent.attempt_id {
+                return Ok(Ok(None));
+            }
             match agent.status {
                 AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked => {
                     return Ok(Ok(None));
                 }
-                AgentStatus::Reported => return Ok(Ok(None)),
-                AgentStatus::Retired if agent.report.is_some() => {
+                AgentStatus::Reported | AgentStatus::Retired if agent.report.is_some() => {
                     let report = agent.report.as_ref().ok_or_else(|| {
                         ShepherdError::Usage("revision agent has no report".into())
                     })?;
+                    if report.task_id != run.task_id
+                        || !agent.completed_tasks.iter().any(|completed| {
+                            completed.task_id == run.task_id
+                                && completed.attempt_id == run.attempt_id
+                                && &completed.report == report
+                        })
+                    {
+                        // Legacy records have no task tokens/history; their original
+                        // named assignment remains valid, but cannot be reused.
+                        if run.task_id.is_some()
+                            || run.attempt_id.is_some()
+                            || !agent.completed_tasks.is_empty()
+                        {
+                            return Ok(Ok(None));
+                        }
+                    }
                     run.agent = None;
+                    run.task_id = None;
+                    run.attempt_id = None;
                     let rejected = report.status != "completed"
                         || !report.blockers.is_empty()
                         || report
@@ -255,7 +281,12 @@ pub fn resume_revision(
                         };
                     }
                 }
-                AgentStatus::Retired | AgentStatus::LaunchFailed => run.agent = None,
+                AgentStatus::Reported => return Ok(Ok(None)),
+                AgentStatus::Retired | AgentStatus::LaunchFailed => {
+                    run.agent = None;
+                    run.task_id = None;
+                    run.attempt_id = None;
+                }
             }
         }
         if data.agents.iter().any(|agent| {
@@ -293,7 +324,7 @@ pub fn resume_revision(
         RevisionStage::Qa => "qa",
         RevisionStage::Push => unreachable!(),
     };
-    let marker = run_marker(run);
+    let expected_run = run.clone();
     let task = revision_task(&ticket, run, role);
     let resolved = crate::roles::resolve(cfg)?;
     let role_config = resolved
@@ -307,7 +338,7 @@ pub fn resume_revision(
         .iter()
         .map(|name| resolved.runners[name].clone())
         .collect();
-    let agent = crate::flock::spawn(
+    let agent = crate::flock::spawn_with_reservation(
         h,
         store,
         cfg,
@@ -324,19 +355,32 @@ pub fn resume_revision(
             prompt: task,
             state_dir: gate.state_dir.clone(),
         },
-    )?;
-    store.update(|data| {
-        if let Some(ticket) = data
-            .tickets
-            .iter_mut()
-            .find(|ticket| ticket.id == id && ticket.state == TicketState::Revising)
-            && let Some(run) = &mut ticket.revision_run
-            && run_marker(run) == marker
-        {
+        &|data, agent| {
+            let ticket = data
+                .tickets
+                .iter_mut()
+                .find(|ticket| ticket.id == id && ticket.state == TicketState::Revising)
+                .ok_or_else(|| ShepherdError::Usage("revision changed before dispatch".into()))?;
+            let run = ticket
+                .revision_run
+                .as_mut()
+                .ok_or_else(|| ShepherdError::Usage("revision disappeared".into()))?;
+            // The callback can run again when proven rejection transfers this
+            // same task to a replacement attempt.
+            if run != &expected_run
+                && (run.task_id != agent.task_id || run.stage != expected_run.stage)
+            {
+                return Err(ShepherdError::Usage("revision assignment changed".into()));
+            }
             run.agent = Some(agent.name.clone());
-        }
-        Ok(())
-    })?;
+            run.task_id = agent.task_id.clone();
+            run.attempt_id = agent.attempt_id.clone();
+            Ok(())
+        },
+    )?;
+    if agent.status == AgentStatus::Blocked && agent.report.is_none() {
+        return Ok(RevisionOutcome::Blocked);
+    }
     Ok(RevisionOutcome::Started {
         agent: agent.name,
         role: role.into(),
@@ -540,7 +584,14 @@ fn revision_task(ticket: &Ticket, run: &RevisionRun, role: &str) -> String {
         comments,
         run.base_sha,
         ticket.acceptance,
-        action,
+        format_args!(
+            "{action}\n{}",
+            crate::prompts::verification_instructions(
+                role,
+                &run.base_sha,
+                run.tested_sha.as_deref().unwrap_or(&run.base_sha)
+            )
+        ),
         ticket.branch,
         ticket
             .worktree
@@ -624,6 +675,8 @@ mod assignment_tests {
             synced_sha: None,
             stage: RevisionStage::Coder,
             agent: None,
+            task_id: None,
+            attempt_id: None,
             tested_sha: None,
         };
         let prompt = revision_task(&ticket, &run, "coder");

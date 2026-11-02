@@ -101,6 +101,8 @@ pub fn role_prompt(
 ) -> String {
     let worktree = ticket.worktree.as_deref().unwrap_or(Path::new("."));
     let reporting = report_instructions(bin, worktree, agent_name, "{{task_id}}");
+    let verification =
+        verification_instructions(&role.name, "{{verification_base}}", "{{verification_head}}");
     let acceptance = ticket
         .acceptance
         .iter()
@@ -129,6 +131,7 @@ Assigned task:
 {task}
 Role instructions:
 {extra}
+{verification}
 
 {reporting}
 "#,
@@ -146,6 +149,16 @@ Role instructions:
             .prompt
             .as_deref()
             .unwrap_or("Follow the assigned role description and ticket acceptance criteria."),
+    )
+}
+
+/// Every verification task is self-contained even when the harness is reused.
+pub fn verification_instructions(role: &str, base: &str, head: &str) -> String {
+    if !matches!(role, "reviewer" | "qa") {
+        return String::new();
+    }
+    format!(
+        "Fresh verification for this assignment: pinned base {base}; pinned HEAD {head}. Inspect and test the complete ticket diff or complete revision diff {base}..{head}, and every acceptance criterion supplied in this task. Run checks again and report new commands and evidence for this round; record exact commands, results and the checked SHA. Explicitly revalidate earlier findings against the current code; earlier verdicts are context rather than proof. Delegate code fixes through the shepherd. If the checkout HEAD differs from the pinned HEAD, report a blocker. Ordinary revision verification reuses this role; a requested blind second opinion requires a fresh reviewer."
     )
 }
 
@@ -301,6 +314,37 @@ mod tests {
         assert!(
             prompt.contains("never resolve threads. Never request changes, approve, or merge.")
         );
+    }
+
+    #[test]
+    fn verification_prompts_require_fresh_complete_evidence() {
+        let ticket = crate::store::Ticket {
+            base: "main".into(),
+            ..Default::default()
+        };
+        let harness = crate::harness::harness_for("codex").unwrap();
+        for role in ["reviewer", "qa"] {
+            let prompt = role_prompt(
+                Path::new("shepherd"),
+                &ticket,
+                &crate::roles::Role {
+                    name: role.into(),
+                    ..Default::default()
+                },
+                "Check",
+                "agent",
+                harness.as_ref(),
+            );
+            for rule in [
+                "complete ticket diff",
+                "every acceptance criterion",
+                "new commands and evidence",
+                "revalidate earlier findings",
+                "earlier verdicts are context rather than proof",
+            ] {
+                assert!(prompt.contains(rule), "{role}: missing {rule}");
+            }
+        }
     }
 
     #[test]

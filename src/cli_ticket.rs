@@ -8,7 +8,7 @@ use herdr_shepherd::{
 };
 use std::path::Path;
 
-fn ci_retry_marker(ticket: &herdr_shepherd::store::Ticket) -> String {
+fn ci_retry_generation(ticket: &herdr_shepherd::store::Ticket) -> String {
     use sha2::{Digest, Sha256};
     let identity = format!(
         "{}\0{}\0{}",
@@ -163,7 +163,15 @@ pub fn dispatch_with_backend(
                             "all configured runners failed to launch"
                         )));
                     }
-                    started.push(serde_json::json!({"ticket":id,"revision":outcome}));
+                    if matches!(
+                        outcome,
+                        herdr_shepherd::ticket::revise::RevisionOutcome::Waiting
+                            | herdr_shepherd::ticket::revise::RevisionOutcome::Blocked
+                    ) {
+                        deferred.push(serde_json::json!({"ticket":id,"revision":outcome}));
+                    } else {
+                        started.push(serde_json::json!({"ticket":id,"revision":outcome}));
+                    }
                     return Ok(None);
                 }
                 scheduler::Action::ResumeCiBuild(id) => {
@@ -177,16 +185,23 @@ pub fn dispatch_with_backend(
                     if ticket.ci_failure_task.is_none() {
                         return Ok(None);
                     }
-                    let marker = ci_retry_marker(&ticket);
-                    if data.agents.iter().any(|agent| {
-                        agent.ticket == id
-                            && agent.status != AgentStatus::LaunchFailed
-                            && agent.task.contains(&marker)
-                    }) {
+                    let generation = ci_retry_generation(&ticket);
+                    if let Some(recovery) = &ticket.ci_recovery
+                        && recovery.generation == generation
+                        && let Some(agent) = data
+                            .agents
+                            .iter()
+                            .find(|agent| recovery.assignment.matches(agent))
+                        && agent.status != AgentStatus::LaunchFailed
+                        && (agent.status != AgentStatus::Retired || agent.report.is_some())
+                    {
+                        if agent.status == AgentStatus::Blocked && agent.report.is_none() {
+                            return Ok(None);
+                        }
                         store.update(|data| {
-                            if let Some(current) =
-                                data.tickets.iter_mut().find(|current| current.id == id)
-                            {
+                            if let Some(current) = data.tickets.iter_mut().find(|current| {
+                                current.id == id && current.ci_recovery == ticket.ci_recovery
+                            }) {
                                 current.ci_failure_task = None;
                             }
                             Ok(())
@@ -198,15 +213,52 @@ pub fn dispatch_with_backend(
                 }
             };
             let task = if ci_build {
-                format!(
-                    "{}\n{}",
-                    ci_retry_marker(&ticket),
-                    ticket.ci_failure_task.as_deref().unwrap_or(task)
-                )
+                ticket.ci_failure_task.as_deref().unwrap_or(task).to_owned()
             } else {
                 task.to_owned()
             };
-            let rec = crate::cli_flock::spawn_task(h, store, cfg, state, &ticket, role, &task)?;
+            let generation = ci_retry_generation(&ticket);
+            let rec = crate::cli_flock::spawn_task_with_reservation(
+                h,
+                store,
+                cfg,
+                crate::cli_flock::TaskRequest {
+                    state,
+                    ticket: &ticket,
+                    role_name: role,
+                    task: &task,
+                    tab_label: None,
+                },
+                &|data, agent| {
+                    if ci_build {
+                        let current = data
+                            .tickets
+                            .iter_mut()
+                            .find(|current| {
+                                current.id == id && current.state == TicketState::Building
+                            })
+                            .ok_or_else(|| {
+                                ShepherdError::Usage("CI recovery changed before dispatch".into())
+                            })?;
+                        if ci_retry_generation(current) != generation {
+                            return Err(ShepherdError::Usage(
+                                "CI generation changed before dispatch".into(),
+                            ));
+                        }
+                        current.ci_recovery = Some(herdr_shepherd::ticket::revise::CiRecovery {
+                            generation: generation.clone(),
+                            assignment: herdr_shepherd::ticket::revise::AssignmentRef::from_agent(
+                                agent,
+                            ),
+                        });
+                    }
+                    Ok(())
+                },
+            )?;
+            if rec.status == AgentStatus::Blocked && rec.report.is_none() {
+                deferred.push(serde_json::json!({"ticket":id,"status":"blocked","reason":rec.dispatch_reason}));
+                return Ok(None);
+            }
             if rec.status == AgentStatus::LaunchFailed {
                 return Err(ShepherdError::Runtime(anyhow::anyhow!(
                     "all configured runners failed to launch"
@@ -570,6 +622,8 @@ mod dispatch_tests {
                                 base_sha: head,
                                 stage: herdr_shepherd::ticket::revise::RevisionStage::Coder,
                                 agent: None,
+                                task_id: None,
+                                attempt_id: None,
                                 tested_sha: None,
                             },
                         ),
@@ -671,6 +725,153 @@ mod dispatch_tests {
             .unwrap();
         f.dispatch();
         assert_eq!(f.store.read().unwrap().agents.len(), 2);
+    }
+
+    #[test]
+    fn cancelled_ci_reservation_does_not_consume_pending_task() {
+        let f = Fixture::new(2);
+        f.ticket("ci", TicketState::Building);
+        f.store
+            .update(|data| {
+                data.tickets[0].ci_failure_task = Some("Fix CI".into());
+                Ok(())
+            })
+            .unwrap();
+        f.dispatch();
+        let rec = f.store.read().unwrap().agents[0].clone();
+        // Simulate interruption after launch reservation but before the caller
+        // cleared its intent, followed by explicit cancellation.
+        f.store
+            .update(|data| {
+                data.tickets[0].ci_failure_task = Some("Fix CI".into());
+                Ok(())
+            })
+            .unwrap();
+        herdr_shepherd::flock::cancel(&f.h, &f.store, &rec.name, false).unwrap();
+        f.dispatch();
+        let data = f.store.read().unwrap();
+        assert_eq!(
+            data.agents.len(),
+            2,
+            "cancelled assignment did not accept the pending task"
+        );
+        assert_eq!(data.agents[1].status, AgentStatus::Working);
+        let recovery = data.tickets[0].ci_recovery.as_ref().unwrap();
+        assert!(recovery.assignment.matches(&data.agents[1]));
+    }
+
+    #[test]
+    fn waiting_revision_is_deferred_not_started() {
+        let f = Fixture::new(2);
+        f.ticket("revision", TicketState::Revising);
+        f.dispatch();
+        let rec = f.store.read().unwrap().agents[0].clone();
+        herdr_shepherd::flock::store_report_for_task(&f.store, &rec.name, rec.task_id.as_deref(), r#"{"status":"completed","summary":"done","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+        f.store
+            .update(|data| {
+                data.tickets[0].revision_run.as_mut().unwrap().task_id =
+                    Some("stale-dispatch".into());
+                Ok(())
+            })
+            .unwrap();
+        let result = f.dispatch();
+        assert!(
+            result["started"].as_array().unwrap().is_empty(),
+            "waiting revision was not accepted"
+        );
+        assert_eq!(result["deferred"].as_array().unwrap().len(), 1);
+        assert_eq!(f.store.read().unwrap().agents.len(), 1);
+    }
+
+    #[test]
+    fn ci_ambiguous_reuse_keeps_pending_task() {
+        let f = Fixture::new(2);
+        f.ticket("ci", TicketState::Building);
+        f.store
+            .update(|d| {
+                d.tickets[0].ci_failure_task = Some("Fix CI".into());
+                Ok(())
+            })
+            .unwrap();
+        f.dispatch();
+        let rec = f.store.read().unwrap().agents[0].clone();
+        f.h.pane_sessions
+            .borrow_mut()
+            .insert(rec.pane_id.clone().unwrap(), "session".into());
+        f.h.agent_records.borrow_mut()[0].agent_status = "idle".into();
+        f.store
+            .update(|d| {
+                let mut observed: serde_json::Value =
+                    serde_json::from_str(d.agents[0].observed.as_deref().unwrap()).unwrap();
+                observed["session_ref"] = "session".into();
+                d.agents[0].observed = Some(observed.to_string());
+                d.tickets[0].revision_round += 1;
+                d.tickets[0].ci_failure_task = Some("Fix CI again".into());
+                Ok(())
+            })
+            .unwrap();
+        herdr_shepherd::flock::store_report_for_task(&f.store,&rec.name,rec.task_id.as_deref(),r#"{"status":"completed","summary":"done","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+        f.h.prompt_results.borrow_mut().push_back((
+            true,
+            Err(ShepherdError::HerdrCommand {
+                code: "timeout".into(),
+                message: "accepted but timed out".into(),
+            }),
+        ));
+        let result = f.dispatch();
+        let data = f.store.read().unwrap();
+        assert!(
+            data.tickets[0].ci_failure_task.is_some(),
+            "ambiguous delivery is still pending"
+        );
+        assert_eq!(data.agents.len(), 1);
+        assert_eq!(data.agents[0].status, AgentStatus::Blocked);
+        assert!(
+            result["started"].as_array().unwrap().is_empty(),
+            "ambiguous is not accepted"
+        );
+        f.dispatch();
+        assert_eq!(f.store.read().unwrap().agents.len(), 1);
+    }
+
+    #[test]
+    fn repeated_ci_failures_reuse_coder_with_fresh_assignment() {
+        let f = Fixture::new(2);
+        f.ticket("ci", TicketState::Building);
+        let mut prior = None;
+        for round in 0..3 {
+            f.store
+                .update(|data| {
+                    data.tickets[0].revision_round = round;
+                    data.tickets[0].ci_failure_task = Some("Fix repeated failure".into());
+                    Ok(())
+                })
+                .unwrap();
+            f.dispatch();
+            let rec = f.store.read().unwrap().agents.last().unwrap().clone();
+            if let Some((name, task)) = prior {
+                assert_eq!(rec.name, name, "CI must reuse the same cohort coder");
+                assert_ne!(rec.task_id, task);
+            }
+            f.h.pane_sessions
+                .borrow_mut()
+                .insert(rec.pane_id.clone().unwrap(), "ci-session".into());
+            f.h.agent_records.borrow_mut()[0].agent_status = "idle".into();
+            f.store
+                .update(|data| {
+                    let agent = data.agents.iter_mut().find(|a| a.name == rec.name).unwrap();
+                    let mut observed: serde_json::Value =
+                        serde_json::from_str(agent.observed.as_deref().unwrap()).unwrap();
+                    observed["session_ref"] = "ci-session".into();
+                    agent.observed = Some(observed.to_string());
+                    Ok(())
+                })
+                .unwrap();
+            herdr_shepherd::flock::store_report_for_task(&f.store, &rec.name, rec.task_id.as_deref(), r#"{"status":"completed","summary":"done","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+            prior = Some((rec.name, rec.task_id));
+        }
+        assert_eq!(f.store.read().unwrap().agents.len(), 1);
+        assert_eq!(f.h.start_args.borrow().len(), 1);
     }
 
     #[test]

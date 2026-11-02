@@ -200,6 +200,7 @@ pub(super) fn admit(
     store: &Store,
     req: &LaunchRequest,
     cfg: &Config,
+    on_reserved: &super::ReservationHook<'_>,
 ) -> Result<Admission, ShepherdError> {
     let data = store.read()?;
     check_admission(&data, req, cfg)?;
@@ -333,7 +334,9 @@ pub(super) fn admit(
                 text: rec.task.clone(),
                 queued_ping: None,
             }));
-            Ok(rec.clone())
+            let rec = rec.clone();
+            on_reserved(data, &rec)?;
+            Ok(rec)
         })?;
         let recipient = TaskRecipient {
             name: reserved.name.clone(),

@@ -83,6 +83,21 @@ pub fn launch_configured(
     req: LaunchRequest,
     cfg: &Config,
 ) -> Result<AgentRecord, ShepherdError> {
+    launch_with_reservation(h, store, req, cfg, &|_, _| Ok(()))
+}
+
+/// Persist the caller's assignment reference in the same transaction as the
+/// launch/reuse intent, before any input can reach the recipient.
+pub type ReservationHook<'a> =
+    dyn Fn(&mut crate::store::StoreData, &AgentRecord) -> Result<(), ShepherdError> + 'a;
+
+pub fn launch_with_reservation(
+    h: &dyn Herdr,
+    store: &Store,
+    req: LaunchRequest,
+    cfg: &Config,
+    reserved: &ReservationHook<'_>,
+) -> Result<AgentRecord, ShepherdError> {
     let _hooks = crate::hooks::defer();
     let _ticket_operation = crate::ticket::operation::shared(store, &req.ticket)?;
     let first = req
@@ -97,7 +112,7 @@ pub fn launch_configured(
     // runs again under placement and in the reservation transaction.
     reuse::check_admission(&store.read()?, &req, cfg)?;
     let _placement = reuse::placement(store)?;
-    let admission = reuse::admit(h, store, &req, cfg)?;
+    let admission = reuse::admit(h, store, &req, cfg, reserved)?;
     let (reason, transfer) = match admission {
         reuse::Admission::Reused(record) => return Ok(*record),
         reuse::Admission::Fresh { reason, transfer } => (reason, transfer),
@@ -211,6 +226,7 @@ pub fn launch_configured(
             dispatch_reason: Some(reason.clone()),
         };
         data.agents.push(record.clone());
+        reserved(data, &record)?;
         Ok((record, Some(operation), true))
     })?;
     if !needs_launch {
