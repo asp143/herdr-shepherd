@@ -1172,6 +1172,35 @@ pub fn run(mut p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, Shepher
         if p.cfg.upkeep.regroup {
             regroup::apply(p.herdr, &regroup::plan_regroup(&p.herdr.workspaces()?))?;
         }
+        // Direct cleanup can precede the watcher's merged observation. Its
+        // verified merge proof and completed physical removal authorize the
+        // terminal receipt here, so no pending assignment targets a gone tree.
+        store.update(|data| {
+            check_recorded_resources(&p.ticket, data)?;
+            let ticket = data
+                .tickets
+                .iter_mut()
+                .find(|t| t.id == p.ticket.id)
+                .expect("checked ticket");
+            if ticket.state != crate::store::TicketState::CleanedUp {
+                let now = crate::launch::now();
+                ticket.history.push(crate::store::Transition {
+                    from: ticket.state,
+                    to: crate::store::TicketState::CleanedUp,
+                    reason: None,
+                    at: now.clone(),
+                });
+                ticket.state = crate::store::TicketState::CleanedUp;
+                ticket.blocked_reason = None;
+                ticket.updated_at = now;
+            }
+            ticket.ci_failure_task = None;
+            ticket.ci_recovery = None;
+            ticket.revision_task = None;
+            ticket.revision_run = None;
+            ticket.pr_reviewers_pending.clear();
+            Ok(())
+        })?;
         Ok(report)
     })();
     if !dry_run {

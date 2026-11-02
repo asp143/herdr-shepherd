@@ -1983,3 +1983,74 @@ fn cleanup_keeps_actual_no_agents_check_after_reported_retirement() {
         AgentStatus::Retired
     );
 }
+
+#[test]
+fn cleanup_finishes_pending_ci_and_revision_assignments() {
+    use herdr_shepherd::{
+        store::{Store, TicketState},
+        ticket::{
+            revise::{AssignmentRef, CiRecovery, RevisionRun, RevisionStage},
+            scheduler,
+        },
+    };
+    for state in [TicketState::Building, TicketState::Revising] {
+        for outcome in ["success", "dry-run", "shutdown-failed"] {
+            let repo = Repo::new();
+            repo.merge();
+            reported_cleanup_agent(&repo, "coder", 1);
+            let store = Store::open(&repo.state, &repo.main).unwrap();
+            store
+                .update(|data| {
+                    let assignment = AssignmentRef::from_agent(&data.agents[0]);
+                    let ticket = &mut data.tickets[0];
+                    ticket.state = state;
+                    ticket.ci_failure_task = Some("fix CI".into());
+                    ticket.ci_recovery = Some(CiRecovery {
+                        generation: "generation".into(),
+                        assignment: assignment.clone(),
+                    });
+                    ticket.revision_task = Some("fix review".into());
+                    ticket.revision_run = Some(RevisionRun {
+                        base_sha: "base".into(),
+                        synced_sha: None,
+                        stage: RevisionStage::Coder,
+                        agent: Some(assignment.agent),
+                        task_id: assignment.task_id,
+                        attempt_id: assignment.attempt_id,
+                        tested_sha: None,
+                    });
+                    Ok(())
+                })
+                .unwrap();
+            let before = store.read().unwrap().tickets[0].clone();
+            let dry_run = outcome == "dry-run";
+            let preflight = repo.preflight(dry_run).unwrap();
+            if outcome == "shutdown-failed" {
+                *repo.h.close_tab_effects.borrow_mut() = false;
+                assert!(cleanup::run(preflight, false).is_err());
+            } else {
+                cleanup::run(preflight, dry_run).unwrap();
+            }
+            let data = store.read().unwrap();
+            let ticket = &data.tickets[0];
+            if outcome != "success" {
+                assert_eq!(
+                    *ticket, before,
+                    "{state:?} {outcome} must preserve dispatch intent"
+                );
+                continue;
+            }
+            let settings = herdr_shepherd::roles::resolve(&repo.cfg).unwrap().shepherd;
+            assert!(
+                scheduler::next_actions(&data, &settings).is_empty(),
+                "removed checkout must never receive another CI/revision assignment"
+            );
+            assert_eq!(ticket.state, TicketState::CleanedUp);
+            assert!(ticket.ci_failure_task.is_none());
+            assert!(ticket.ci_recovery.is_none());
+            assert!(ticket.revision_task.is_none());
+            assert!(ticket.revision_run.is_none());
+            assert_eq!(ticket.history.last().unwrap().to, TicketState::CleanedUp);
+        }
+    }
+}

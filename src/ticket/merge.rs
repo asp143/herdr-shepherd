@@ -462,7 +462,6 @@ fn handle_with_context(
     })();
     match cleanup {
         Ok(_) => {
-            transition(store, id, TicketState::CleanedUp, None, now)?;
             notifier.send(&format!("{id}: merged and cleaned up"), &status.url);
             Ok(MergeOutcome::CleanedUp)
         }
