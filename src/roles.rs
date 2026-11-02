@@ -432,6 +432,10 @@ pub fn resolve(cfg: &Config) -> Result<Resolved, ShepherdError> {
             "max_revision_rounds",
             resolved.shepherd.max_revision_rounds == 0,
         ),
+        (
+            "max_completed_assignments",
+            resolved.shepherd.max_completed_assignments == 0,
+        ),
     ] {
         if zero {
             return Err(invalid(cfg, format!("shepherd.{name} must be at least 1")));
@@ -720,6 +724,7 @@ mod tests {
             "max_concurrent_tickets",
             "max_parallel_agents",
             "max_revision_rounds",
+            "max_completed_assignments",
         ] {
             let error = resolve(&config(&format!("[shepherd]\n{name} = 0"))).unwrap_err();
             assert_eq!(error.code(), "config_invalid");
