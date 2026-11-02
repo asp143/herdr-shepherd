@@ -53,7 +53,7 @@ The binary is `bin/herdr-shepherd`. Add that directory to your PATH to use the s
 | `ticket integrate ID` | Integrate child commits, roll back conflicts, and remove proven integrated children. |
 | `ticket cancel ID` | Close a ticket while preserving its worktree and commits. |
 | `agent spawn --ticket ID --role ROLE --task-file FILE [--unit N]` | Launch a ticket tab; `--unit N` gives a coder a private child checkout. |
-| `agent report --agent NAME --report-file FILE` | Validate and store the report; an inherited caller pane must own that agent. |
+| `agent report --agent NAME --report-file FILE [--task-id ID]` | Validate and store the assignment's report; an inherited caller pane must own that agent. |
 | `agent list`, `agent status NAME`, `agent cancel NAME [--force]` | Inspect or retire owned flock agents. |
 | `config trust [--project-root PATH]` | Explicitly replace the project trust snapshot and print its diff. |
 
@@ -160,7 +160,9 @@ built-ins in catalog order. The library uses `IndexMap<String, Runner>` for
 configuration errors; each role must have at least one runner.
 
 Shepherd defaults are two concurrent tickets, six parallel agents, three
-revision rounds, and PR polling every 180 seconds. Supervision defaults are a
+revision rounds, five completed assignments per agent, and PR polling every
+180 seconds. Set `[shepherd] max_completed_assignments` to a positive integer
+to change the per-agent reuse cap. Supervision defaults are a
 30-second sweep, 120-second report grace, 20-minute stall threshold, and
 15-minute escalation threshold. User regex rules run before built-in
 `codex-trust`, `press-enter`, `codex-update-notice`, `claude-trust`, and
@@ -279,7 +281,13 @@ command = ["/path/to/your-handler"]
 timeout_seconds = 10
 ```
 
-Each matching argv receives `SHEPHERD_EVENT`, serialized `SHEPHERD_EVENT_JSON`, and the same JSON on stdin. Hooks default to a ten-second timeout. A timeout kills the hook's process group; failures are logged and do not fail the caller. Unknown configured events produce a validate-config warning. Supported events are `ticket.queued`, `ticket.started`, `ticket.stage_changed`, `ticket.blocked`, `ticket.pr_opened`, `ticket.pr_comment`, `ticket.revised`, `ticket.merged`, `ticket.cleaned_up`, `ticket.closed`, `agent.spawned`, `agent.retired`, `agent.unblocked`, and `agent.escalated`.
+Each matching argv receives `SHEPHERD_EVENT`, serialized `SHEPHERD_EVENT_JSON`, and the same JSON on stdin. Hooks default to a ten-second timeout. A timeout kills the hook's process group; failures are logged and do not fail the caller. Unknown configured events produce a validate-config warning. Supported events are `ticket.queued`, `ticket.started`, `ticket.stage_changed`, `ticket.blocked`, `ticket.pr_opened`, `ticket.pr_comment`, `ticket.revised`, `ticket.merged`, `ticket.cleaned_up`, `ticket.closed`, `agent.spawned`, `agent.reported`, `agent.retired`, `agent.unblocked`, and `agent.escalated`.
+
+`agent.reported` now signals an accepted assignment report. Previously that
+completion emitted `agent.retired`; update completion hooks to use
+`agent.reported`. `agent.retired` now fires only after actual retirement is
+persisted and the owned pane/process is confirmed gone. Reusing an agent does
+not emit another `agent.spawned` event, and duplicate reports emit no new event.
 
 ## Migrate existing upkeep scripts
 
@@ -329,7 +337,7 @@ follow-up cannot, because Working may describe an earlier turn. Uncertain nudges
 retain their clock and payload in the agent's `observed.prompt_claim`; queued
 notifications move there before input while later enqueues remain ordered.
 Only a proven rejection before input restores a notification to the queue.
-A real report resolves its recipient's claim. Automatic retirement uses
+A real report resolves only its matching assignment's claim. Automatic retirement uses
 nonblocking operation ownership and fresh pane/session/worktree/project checks;
 deferred retirement keeps resources and stops CI handoff or cleanup. Explicit
 `agent cancel` remains available to the operator after inspecting uncertainty.
@@ -427,6 +435,57 @@ with the ticket slug, and groups it immediately after the repo workspace when
 `[upkeep] regroup` is enabled. Planner, researcher, coder, reviewer, QA, and
 revision agents all open as tabs in that ticket workspace.
 
+### Reusing flock agents
+
+Later tasks reuse a reported, live idle agent for the same ticket and role,
+including coder, reviewer and QA revision rounds. Reuse keeps its agent record,
+name, tab, pane and harness process. The effective runner name, harness and
+arguments must still match a configured profile; an unchanged configured
+fallback runner can also be reused. Ownership, checkout and harness session
+are verified before a waited task submission. Codex, OMP, Claude and Pi use
+the same delivery contract. Only one assignment runs on an agent at a time.
+
+The optional `dispatch_reason` field explains the decision. `reused:` records
+successful reuse or an ambiguous delivery still pending. `fresh:` explains a
+new launch, such as a dead or unresponsive agent, cancellation or retirement,
+changed profile, unit or checkout, missing ownership/session evidence, a legacy
+record without assignment identity, or the completed-assignment cap.
+`unavailable:` marks a predecessor whose rejected task was transferred to a
+fresh agent. A proven pre-input rejection can transfer the task; an ambiguous
+submission keeps its durable claim until a matching report or confirmed
+termination resolves it. A possibly accepted writable task is never replayed
+into another coder. Busy writers keep their checkout reserved.
+
+A verified near-limit or exhausted context signal prevents reuse. No supported
+harness currently exposes a verified context gauge, so health is unknown and
+reuse is bounded by `shepherd.max_completed_assignments` (default 5). Shepherd
+does not estimate a context percentage. A unit coder can be reused only for its
+own unintegrated unit and checkout, never for the parent checkout.
+
+Each new assignment gets a new task ID and report file:
+`<worktree>/.shepherd-report-<agent_name>-<task_id>.json`. Follow the inherited
+`agent report --agent NAME --task-id ID --report-file FILE` command; a JSON
+`task_id`, when provided, must agree with the flag. Old files, late reports and
+old stored reports cannot complete a new assignment. Exact duplicates of the
+current assignment are idempotent. The optional flag preserves compatibility
+for original unreused assignments; tokenless reports are rejected after reuse.
+Existing stored agents still load, but unverifiable legacy identities start
+fresh.
+
+Reviewer and QA tasks pin base and HEAD, cover the complete current diff and
+every acceptance criterion, and require new commands and evidence. Earlier
+verdicts are context rather than proof; earlier findings must be revalidated.
+Reuse retains prior conversation context. A blind second opinion requires an
+explicitly fresh reviewer.
+
+Reported agents remain idle without supervision nudges, escalation or respawn,
+and do not consume active capacity or block stage transitions or `ticket pr`.
+Retirement still happens at `pr_open` handoff, child integration, cancellation
+and final cleanup. The first CI or PR-comment fix after `pr_open` therefore
+starts a fresh cohort; later rounds inside that cohort reuse it. Cleanup
+retires verified idle recipients before its strict physical no-agent check.
+Successful cleanup closes stored CI and revision dispatch intents as well.
+
 A coder launched with `--unit N` uses a private Git checkout and branch
 `<ticket-branch>--<N>`, including the first unit coder. Its tab stays in the ticket
 workspace while its cwd points to that private checkout. Each writable coder
@@ -458,8 +517,8 @@ be reused by another agent; finish cleanup first.
 
 Pane events and periodic sweeps supervise owned agents. Safe fixed-key dialog
 rules run only after policy and foreground-cwd checks, and revalidate the screen
-before input. Unknown dialogs go to the lead. Idle or stalled agents receive one
-nudge before escalation; crashed agents resume once with the pinned profile and
+before input. Unknown dialogs go to the lead. Unreported idle or stalled agents
+receive one nudge before escalation; crashed agents resume once with the pinned profile and
 session; provider failures use the role's next runner. Startup prompts and lead
 pings remain durable while blocked. A corrupt project or failed screen read does
 not stop healthy agents. PR polling runs in a separate bounded worker so it
