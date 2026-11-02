@@ -320,7 +320,7 @@ pub struct StoreData {
     pub lead: Option<LeadRecord>,
     pub tickets: Vec<Ticket>,
     pub agents: Vec<AgentRecord>,
-    /// Exact recipients journaled before direct cleanup closes their tabs.
+    /// Exact recipients journaled before ticket handoff or cleanup closes tabs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cleanup_retiring_agents: Vec<AgentRecord>,
     #[serde(default)]

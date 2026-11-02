@@ -547,6 +547,28 @@ mod tests {
                 .borrow_mut()
                 .insert("w1:p2".into(), self.store.read().unwrap().project_root);
         }
+        fn retirement_events(&mut self) -> PathBuf {
+            let events = self._dir.path().join("retirement-events.jsonl");
+            let command = vec![
+                "sh".to_owned(),
+                "-c".into(),
+                "cat >> \"$1\"; printf '\\n' >> \"$1\"".into(),
+                "hook".into(),
+                events.display().to_string(),
+            ];
+            let text = format!(
+                "[[hooks]]\non = 'agent.retired'\ncommand = {}\n",
+                toml::Value::from(command)
+            );
+            self.cfg.raw = toml::from_str(&text).unwrap();
+            self.store
+                .update(|data| {
+                    data.trust.as_mut().unwrap().config_text = Some(text);
+                    Ok(())
+                })
+                .unwrap();
+            events
+        }
     }
 
     struct CommentFailureBackend {
@@ -1084,6 +1106,108 @@ mod tests {
                 .any(|call| call == "close_tab w1:t2")
         );
         assert!(fixture.store.read().unwrap().project_root.exists());
+    }
+
+    #[test]
+    fn ci_handoff_retries_lost_close_acknowledgement() {
+        for checks in [Checks::Passing, Checks::None] {
+            let mut fixture = Fixture::new(TicketState::CiWait);
+            fixture.reported_agent();
+            let events = fixture.retirement_events();
+            fixture
+                .store
+                .update(|data| {
+                    data.tickets[0].ci_none_since = Some("0".into());
+                    Ok(())
+                })
+                .unwrap();
+            fixture
+                .h
+                .close_tab_results
+                .borrow_mut()
+                .push_back(Err(ShepherdError::Usage(
+                    "lost close acknowledgement".into(),
+                )));
+            let gh = FakeBackend::new(vec![Ok(Some(Fixture::status(checks)))]);
+            let first = fixture.tick(&gh, 1000);
+            assert!(
+                first
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("lost close acknowledgement"))
+            );
+            assert!(!fixture.h.pane_exists("w1:p2").unwrap());
+            assert_eq!(fixture.ticket().state, TicketState::CiWait);
+            assert_eq!(
+                fixture.store.read().unwrap().agents[0].status,
+                crate::store::AgentStatus::Reported
+            );
+            assert!(!events.exists());
+            assert_eq!(
+                fixture.store.read().unwrap().cleanup_retiring_agents.len(),
+                1
+            );
+
+            let gh = FakeBackend::new(vec![Ok(Some(Fixture::status(checks)))]);
+            let retry = fixture.tick(&gh, 1001);
+            assert!(retry.errors.is_empty(), "{:?}", retry.errors);
+            assert_eq!(fixture.ticket().state, TicketState::PrOpen);
+            assert_eq!(
+                fixture.store.read().unwrap().agents[0].status,
+                crate::store::AgentStatus::Retired
+            );
+            assert!(
+                fixture
+                    .store
+                    .read()
+                    .unwrap()
+                    .cleanup_retiring_agents
+                    .is_empty()
+            );
+            let gh = FakeBackend::new(vec![Ok(Some(Fixture::status(checks)))]);
+            assert!(fixture.tick(&gh, 1002).errors.is_empty());
+            let emitted: Vec<serde_json::Value> = std::fs::read_to_string(events)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(emitted.len(), 1);
+            assert_eq!(emitted[0]["agent"], "qa");
+            assert_eq!(
+                fixture
+                    .h
+                    .calls
+                    .borrow()
+                    .iter()
+                    .filter(|call| call.starts_with("close_tab "))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn ci_handoff_defers_while_close_leaves_pane_present() {
+        let mut fixture = Fixture::new(TicketState::CiWait);
+        fixture.reported_agent();
+        let events = fixture.retirement_events();
+        for now in [100, 101] {
+            fixture.h.close_tab_effects.borrow_mut().push_back(false);
+            fixture
+                .h
+                .close_tab_results
+                .borrow_mut()
+                .push_back(Err(ShepherdError::Usage("close failed".into())));
+            let gh = FakeBackend::new(vec![Ok(Some(Fixture::status(Checks::Passing)))]);
+            assert!(!fixture.tick(&gh, now).errors.is_empty());
+            assert!(fixture.h.pane_exists("w1:p2").unwrap());
+            assert_eq!(fixture.ticket().state, TicketState::CiWait);
+            assert_eq!(
+                fixture.store.read().unwrap().agents[0].status,
+                crate::store::AgentStatus::Reported
+            );
+            assert!(!events.exists());
+        }
     }
 
     #[test]

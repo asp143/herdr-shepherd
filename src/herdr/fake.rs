@@ -29,6 +29,8 @@ pub struct FakeHerdr {
     pub start_results: RefCell<VecDeque<AgentStart>>,
     /// False acknowledges tab closure without removing its pane or process.
     pub close_tab_effects: RefCell<VecDeque<bool>>,
+    /// A close may take effect before its acknowledgement is lost.
+    pub close_tab_results: RefCell<VecDeque<Result<(), ShepherdError>>>,
     /// Script transport outcomes independently of application acceptance.
     pub prompt_results: RefCell<VecDeque<(bool, Result<(), ShepherdError>)>>,
     pub accepted_prompts: RefCell<Vec<String>>,
@@ -62,6 +64,7 @@ impl FakeHerdr {
             agent_get_errors: RefCell::new(HashMap::new()),
             start_results: RefCell::new(VecDeque::new()),
             close_tab_effects: RefCell::new(VecDeque::new()),
+            close_tab_results: RefCell::new(VecDeque::new()),
             prompt_results: RefCell::new(VecDeque::new()),
             accepted_prompts: RefCell::new(Vec::new()),
             visible_screens: RefCell::new(VecDeque::new()),
@@ -269,7 +272,11 @@ impl Herdr for FakeHerdr {
             .pop_front()
             .unwrap_or(true)
         {
-            return Ok(());
+            return self
+                .close_tab_results
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Ok(()));
         }
         let panes: Vec<String> = self
             .pane_cwds
@@ -288,7 +295,10 @@ impl Herdr for FakeHerdr {
             self.pane_workspaces.borrow_mut().remove(&pane);
             self.pane_sessions.borrow_mut().remove(&pane);
         }
-        Ok(())
+        self.close_tab_results
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(Ok(()))
     }
     fn focus_agent(&self, name: &str) -> Result<(), ShepherdError> {
         self.calls.borrow_mut().push(format!("focus_agent {name}"));

@@ -108,6 +108,22 @@ fn retire_flock_inner(
     cfg: Option<&Config>,
 ) -> Result<(), ShepherdError> {
     let _hooks = crate::hooks::defer();
+    // A pending close belongs to its exact assignment, even if the process has
+    // vanished. Never silently skip a changed recipient on a handoff retry.
+    let data = store.read()?;
+    for expected in data
+        .cleanup_retiring_agents
+        .iter()
+        .filter(|a| a.ticket == id)
+    {
+        let mut retired = expected.clone();
+        retired.status = AgentStatus::Retired;
+        if !data.agents.contains(expected) && !data.agents.contains(&retired) {
+            return Err(ShepherdError::PolicyDenied(
+                "handoff retirement intent changed; resources kept".into(),
+            ));
+        }
+    }
     for agent in store.read()?.agents.into_iter().filter(|agent| {
         agent.ticket == id
             && matches!(
@@ -118,11 +134,7 @@ fn retire_flock_inner(
                     | AgentStatus::Reported
             )
     }) {
-        let retired = if let Some(cfg) = cfg {
-            crate::flock::retire_automatically_with_config(h, store, &agent, cfg)?
-        } else {
-            crate::flock::retire_automatically(h, store, &agent)?
-        };
+        let retired = crate::flock::automatic::retire_for_ticket_handoff(h, store, &agent, cfg)?;
         if !retired {
             return Err(ShepherdError::PolicyDenied(format!(
                 "{}: automatic retirement deferred; resources kept",
@@ -130,6 +142,25 @@ fn retire_flock_inner(
             )));
         }
     }
+    // Successful handoff releases the admission fence so a later CI or PR
+    // revision can start its fresh cohort. Failed closes retain their intent.
+    store.update(|data| {
+        for expected in data
+            .cleanup_retiring_agents
+            .iter()
+            .filter(|a| a.ticket == id)
+        {
+            let mut retired = expected.clone();
+            retired.status = AgentStatus::Retired;
+            if !data.agents.contains(&retired) {
+                return Err(ShepherdError::PolicyDenied(
+                    "handoff retirement incomplete; resources kept".into(),
+                ));
+            }
+        }
+        data.cleanup_retiring_agents.retain(|a| a.ticket != id);
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -575,6 +606,12 @@ mod tests {
         fn pane_exists(&self, pane: &str) -> Result<bool, ShepherdError> {
             self.fake.pane_exists(pane)
         }
+        fn pane_cwd(&self, pane: &str) -> Result<Option<PathBuf>, ShepherdError> {
+            self.fake.pane_cwd(pane)
+        }
+        fn pane_session_ref(&self, pane: &str) -> Result<Option<String>, ShepherdError> {
+            self.fake.pane_session_ref(pane)
+        }
         fn close_tab(&self, tab: &str) -> Result<(), ShepherdError> {
             self.fake.close_tab(tab)
         }
@@ -807,7 +844,240 @@ mod tests {
                     workspace_id: Some("w1".into()),
                 });
         }
+        fn reported_flock(&self) {
+            self.agent();
+            let template = self.store.read().unwrap().agents[0].clone();
+            self.store
+                .update(|data| {
+                    data.agents.clear();
+                    for (index, role) in ["coder", "reviewer", "qa"].into_iter().enumerate() {
+                        let mut rec = template.clone();
+                        rec.name = role.into();
+                        rec.role = role.into();
+                        rec.status = AgentStatus::Reported;
+                        rec.pane_id = Some(format!("w1:p{}", index + 1));
+                        rec.tab_id = Some(format!("w1:t{}", index + 1));
+                        rec.task_id = Some(format!("task-{role}"));
+                        rec.observed = Some(
+                            serde_json::json!({"session_ref":format!("session-{role}")})
+                                .to_string(),
+                        );
+                        data.agents.push(rec);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            self.h.fake.agent_records.borrow_mut().clear();
+            for rec in self.store.read().unwrap().agents {
+                let pane = rec.pane_id.unwrap();
+                self.h
+                    .fake
+                    .pane_sessions
+                    .borrow_mut()
+                    .insert(pane.clone(), format!("session-{}", rec.role));
+                self.h
+                    .fake
+                    .agent_records
+                    .borrow_mut()
+                    .push(crate::herdr::AgentInfo {
+                        name: Some(rec.name),
+                        agent: "fake".into(),
+                        agent_status: "idle".into(),
+                        cwd: Some(self.path.clone()),
+                        pane_id: pane,
+                        workspace_id: Some("w1".into()),
+                    });
+            }
+        }
+        fn retirement_events(&mut self) -> PathBuf {
+            let events = self._dir.path().join("retirement-events.jsonl");
+            let command = vec![
+                "sh".to_owned(),
+                "-c".into(),
+                "cat >> \"$1\"; printf '\\n' >> \"$1\"".into(),
+                "hook".into(),
+                events.display().to_string(),
+            ];
+            let text = format!(
+                "[[hooks]]\non = 'agent.retired'\ncommand = {}\n",
+                toml::Value::from(command)
+            );
+            self.cfg.raw = toml::from_str(&text).unwrap();
+            self.store
+                .update(|data| {
+                    data.trust.as_mut().unwrap().config_text = Some(text);
+                    Ok(())
+                })
+                .unwrap();
+            events
+        }
     }
+
+    #[test]
+    fn ticket_handoff_retries_lost_close_acknowledgement() {
+        for entry in ["direct", "merge"] {
+            for failed_close in 1..=3 {
+                let mut fixture = Fixture::new(TicketState::PrOpen);
+                fixture.reported_flock();
+                let events = fixture.retirement_events();
+                for _ in 1..failed_close {
+                    fixture
+                        .h
+                        .fake
+                        .close_tab_results
+                        .borrow_mut()
+                        .push_back(Ok(()));
+                }
+                fixture
+                    .h
+                    .fake
+                    .close_tab_results
+                    .borrow_mut()
+                    .push_back(Err(ShepherdError::Usage(
+                        "lost close acknowledgement".into(),
+                    )));
+                let retire =
+                    || retire_flock_with_config(&fixture.store, &fixture.h, "T1", &fixture.cfg);
+                if entry == "direct" {
+                    assert!(
+                        retire()
+                            .unwrap_err()
+                            .to_string()
+                            .contains("lost close acknowledgement")
+                    );
+                } else {
+                    assert_eq!(fixture.run().unwrap(), MergeOutcome::Escalated);
+                }
+                assert_eq!(
+                    fixture.h.fake.agent_records.borrow().len(),
+                    3 - failed_close
+                );
+                assert_eq!(
+                    fixture.store.read().unwrap().agents[failed_close - 1].status,
+                    AgentStatus::Reported
+                );
+                assert!(
+                    !fixture
+                        .h
+                        .pane_exists(&format!("w1:p{failed_close}"))
+                        .unwrap()
+                );
+                assert_eq!(
+                    fs::read_to_string(&events)
+                        .unwrap_or_default()
+                        .lines()
+                        .count(),
+                    failed_close - 1
+                );
+
+                for _ in 0..2 {
+                    if entry == "direct" {
+                        retire().unwrap();
+                    } else {
+                        assert_eq!(fixture.run().unwrap(), MergeOutcome::Unchanged);
+                        assert_eq!(fixture.ticket().state, TicketState::Blocked);
+                    }
+                }
+                let data = fixture.store.read().unwrap();
+                assert!(data.agents.iter().all(|a| a.status == AgentStatus::Retired));
+                assert!(data.cleanup_retiring_agents.is_empty());
+                assert!(fixture.h.fake.agent_records.borrow().is_empty());
+                assert_eq!(
+                    fixture
+                        .h
+                        .fake
+                        .calls
+                        .borrow()
+                        .iter()
+                        .filter(|call| call.starts_with("close_tab "))
+                        .count(),
+                    3
+                );
+                let emitted: Vec<serde_json::Value> = fs::read_to_string(events)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(emitted.len(), 3);
+                for (event, role) in emitted.iter().zip(["coder", "reviewer", "qa"]) {
+                    assert_eq!(event["agent"], role);
+                    assert_eq!(event["task_id"], format!("task-{role}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ticket_handoff_keeps_live_or_changed_recipients() {
+        for blocked_by in ["close-error", "close-no-effect", "task", "session"] {
+            let mut fixture = Fixture::new(TicketState::PrOpen);
+            fixture.reported_flock();
+            let events = fixture.retirement_events();
+            fixture
+                .h
+                .fake
+                .close_tab_effects
+                .borrow_mut()
+                .push_back(false);
+            fixture
+                .h
+                .fake
+                .close_tab_results
+                .borrow_mut()
+                .push_back(Err(ShepherdError::Usage("close failed".into())));
+            assert!(
+                retire_flock_with_config(&fixture.store, &fixture.h, "T1", &fixture.cfg).is_err()
+            );
+            match blocked_by {
+                "task" => fixture
+                    .store
+                    .update(|data| {
+                        data.agents[0].task_id = Some("replacement-task".into());
+                        Ok(())
+                    })
+                    .unwrap(),
+                "session" => {
+                    fixture
+                        .h
+                        .fake
+                        .pane_sessions
+                        .borrow_mut()
+                        .insert("w1:p1".into(), "replacement-session".into());
+                }
+                _ => {
+                    fixture
+                        .h
+                        .fake
+                        .close_tab_effects
+                        .borrow_mut()
+                        .push_back(false);
+                    if blocked_by == "close-error" {
+                        fixture
+                            .h
+                            .fake
+                            .close_tab_results
+                            .borrow_mut()
+                            .push_back(Err(ShepherdError::Usage("close failed again".into())));
+                    }
+                }
+            }
+            assert!(
+                retire_flock_with_config(&fixture.store, &fixture.h, "T1", &fixture.cfg).is_err()
+            );
+            assert!(fixture.h.pane_exists("w1:p1").unwrap());
+            assert!(
+                fixture
+                    .store
+                    .read()
+                    .unwrap()
+                    .agents
+                    .iter()
+                    .all(|a| a.status == AgentStatus::Reported)
+            );
+            assert!(!events.exists());
+        }
+    }
+
     #[test]
     fn automatic_terminal_retirement_keeps_unknown_or_busy_resources() {
         for state in [TicketState::PrOpen, TicketState::Closed] {

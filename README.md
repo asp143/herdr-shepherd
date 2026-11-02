@@ -497,8 +497,11 @@ starts a fresh cohort; later rounds inside that cohort reuse it. Cleanup
 retires verified idle recipients before its strict physical no-agent check.
 Direct cleanup journals exact retirement recipients before closing tabs;
 retry reconciles confirmed disappearance without losing retirement events.
-Pending cleanup retirement prevents new assignments throughout the ticket, and
-preview remains read-only.
+CI handoff and merge retirement share this journal, so a lost close
+acknowledgement can be retried without closing a replacement session or
+emitting duplicate retirement events. Pending retirement prevents new
+assignments throughout the ticket until handoff or cleanup completes.
+Cleanup preview remains read-only.
 Successful cleanup closes stored CI and revision dispatch intents as well.
 
 A coder launched with `--unit N` uses a private Git checkout and branch
