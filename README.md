@@ -477,15 +477,21 @@ old stored reports cannot complete a new assignment. Exact duplicates of the
 current assignment are idempotent. The optional flag preserves compatibility
 for original unreused assignments; tokenless reports are rejected after reuse.
 Existing stored agents still load, but unverifiable legacy identities start
-fresh. A saved pre-upgrade report automatically advances its original revision
-or CI workflow when its task marker, role, checkout and pending task match.
-Unrelated reported or retired history does not block a fresh task. The CI marker
-also pins the revision round; block/resume transition clocks do not invalidate
-that saved task.
+fresh. A saved pre-upgrade report can automatically advance its original
+revision or CI workflow when its task marker, role, checkout and pending task
+match and its round is verifiable. Unbound reviewer and QA reports must name
+the run's `tested_sha`, which must still equal current HEAD; a null or different
+`commit_sha` requires reconciliation. Unbound coder revision reports also
+require reconciliation: the baseline stored only input SHAs, which cannot prove
+which round produced the report. Unrelated reported or retired history does not
+block a fresh task. The CI marker verifies the generation as well as the
+revision round, even for a null-SHA report; block/resume transition clocks do
+not invalidate that saved task.
 
-Multiple matching legacy reports, or an older quarantined CI task whose
-original clock cannot be verified, block dispatch without repeating completed
-work. Inspect the reports with `ticket show ID` and `agent list`, then run either
+Multiple matching legacy reports, unverified revision reports, or an older
+quarantined CI task whose original clock cannot be verified block dispatch
+without repeating completed work. Inspect the reports with `ticket show ID`
+and `agent list`, then run either
 `ticket reconcile ID --accept-report AGENT` to bind a saved report, or
 `ticket reconcile ID --discard-reports` to preserve the reports as evidence and
 allow a fresh task. Both commands validate the exact pending quarantine and
@@ -495,8 +501,9 @@ refuses unrelated tickets, changed workflows, unknown reports and active tasks.
 
 For a legacy quarantine saved by an older release, use
 `ticket transition ID --to revising` (or `--to building` for CI), followed by
-`ticket dispatch`. A uniquely matching report recovers automatically, including
-a report whose agent was cancelled. Ambiguous evidence produces the exact
+`ticket dispatch`. A uniquely matching report with the required SHA or
+generation evidence recovers automatically, including a report whose agent
+was cancelled. Ambiguous or unverified evidence produces the exact
 `ticket reconcile` commands to run. Saved reports are never edited or deleted
 by recovery.
 

@@ -1769,6 +1769,127 @@ fn interrupted_revision_delivery_keeps_persisted_assignment() {
 }
 
 #[test]
+fn repeated_revision_text_cannot_bind_old_report() {
+    if !local_transport_enabled("repeated_revision_text_cannot_bind_old_report") {
+        return;
+    }
+    use herdr_shepherd::{herdr::fake::FakeHerdr, ticket::revise::RevisionStage};
+    for stage in [RevisionStage::Reviewer, RevisionStage::Qa] {
+        for status in ["reported", "retired"] {
+            for evidence in ["null_report_sha", "old_report_sha", "missing_tested_sha"] {
+                let repo = Repo::new();
+                let base = git(&repo.root, &["rev-parse", "HEAD"]);
+                let task = format!(
+                    "Revision {base} {stage:?}\nTask: Fix the reviewed edge case\nAccepted comments:\n\nNew diff: {base}..HEAD"
+                );
+                let store = legacy_revision_fixture(&repo, stage, status, &task);
+                fs::write(repo.root.join("new-revision.txt"), "unreviewed change\n").unwrap();
+                git(&repo.root, &["add", "new-revision.txt"]);
+                git(&repo.root, &["commit", "-m", "new revision"]);
+                let head = git(&repo.root, &["rev-parse", "HEAD"]);
+                store
+                    .update(|data| {
+                        let ticket = &mut data.tickets[0];
+                        ticket.revision_round += 1;
+                        let run = ticket.revision_run.as_mut().unwrap();
+                        run.tested_sha = Some(head.clone());
+                        run.synced_sha = Some(head.clone());
+                        if evidence == "null_report_sha" {
+                            data.agents[0].report.as_mut().unwrap().commit_sha = None;
+                        } else if evidence == "missing_tested_sha" {
+                            run.tested_sha = None;
+                            data.agents[0].report.as_mut().unwrap().commit_sha = Some(head.clone());
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                let saved_report = store.read().unwrap().agents[0].report.clone();
+                let h = FakeHerdr::new(vec![]);
+                let gh = PushBackend::new(&repo);
+                let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+                let result =
+                    resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "next-round");
+                let error = result.expect_err(&format!(
+                    "{status} {stage:?} {evidence} needs reconciliation"
+                ));
+                assert!(error.to_string().contains("ticket reconcile T-1"));
+                let data = store.read().unwrap();
+                assert_eq!(data.tickets[0].state, TicketState::Blocked);
+                let run = data.tickets[0].revision_run.as_ref().unwrap();
+                assert_eq!(run.stage, stage);
+                assert!(run.agent.is_none());
+                assert!(data.tickets[0].legacy_dispatch.is_some());
+                assert_eq!(data.agents.len(), 1);
+                assert_eq!(data.agents[0].report, saved_report);
+                assert!(h.start_args.borrow().is_empty());
+                assert_eq!(gh.pushes.get(), 0);
+                // The existing operator path can explicitly discard the
+                // uncertain report and launch a fresh check of this stage.
+                herdr_shepherd::ticket::revise::reconcile_legacy_reports(
+                    &store, &cfg, "T-1", None, true, "decision",
+                )
+                .unwrap();
+                let next =
+                    resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "fresh-check")
+                        .unwrap();
+                let expected_role = if stage == RevisionStage::Reviewer {
+                    "reviewer"
+                } else {
+                    "qa"
+                };
+                assert!(matches!(next,
+                    herdr_shepherd::ticket::revise::RevisionOutcome::Started { role, .. }
+                    if role == expected_role));
+                assert_eq!(store.read().unwrap().agents.len(), 2);
+                assert_eq!(h.start_args.borrow().len(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn unbound_legacy_coder_requires_round_evidence() {
+    if !local_transport_enabled("unbound_legacy_coder_requires_round_evidence") {
+        return;
+    }
+    use herdr_shepherd::{herdr::fake::FakeHerdr, ticket::revise::RevisionStage};
+    for missing_sha in [true, false] {
+        let repo = Repo::new();
+        let head = git(&repo.root, &["rev-parse", "HEAD"]);
+        let task = format!(
+            "Revision {head} Coder\nTask: Fix the reviewed edge case\nAccepted comments:\n\nNew diff:"
+        );
+        let store = legacy_revision_fixture(&repo, RevisionStage::Coder, "retired", &task);
+        if missing_sha {
+            store
+                .update(|data| {
+                    data.agents[0].report.as_mut().unwrap().commit_sha = None;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let h = FakeHerdr::new(vec![]);
+        let gh = PushBackend::new(&repo);
+        let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+        let error = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later")
+            .expect_err("a coder input SHA does not identify this round's output");
+        assert!(error.to_string().contains("ticket reconcile T-1"));
+        let data = store.read().unwrap();
+        assert_eq!(data.tickets[0].state, TicketState::Blocked);
+        assert!(
+            data.tickets[0]
+                .revision_run
+                .as_ref()
+                .unwrap()
+                .agent
+                .is_none()
+        );
+        assert_eq!(data.agents.len(), 1);
+        assert!(h.start_args.borrow().is_empty());
+    }
+}
+
+#[test]
 fn interrupted_legacy_revision_never_repeats_completed_role() {
     if !local_transport_enabled("interrupted_legacy_revision_never_repeats_completed_role") {
         return;
@@ -1792,8 +1913,25 @@ fn interrupted_legacy_revision_never_repeats_completed_role() {
             let h = FakeHerdr::new(vec![]);
             let gh = PushBackend::new(&repo);
             let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
-            let outcome = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later")
-                .expect("matching pre-upgrade task must bind automatically");
+            let result = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later");
+            let outcome = if stage == RevisionStage::Coder {
+                let error = result.expect_err("unbound coder needs an explicit round decision");
+                assert!(error.to_string().contains("ticket reconcile T-1"));
+                assert!(h.start_args.borrow().is_empty());
+                herdr_shepherd::ticket::revise::reconcile_legacy_reports(
+                    &store,
+                    &cfg,
+                    "T-1",
+                    Some("legacy-role"),
+                    false,
+                    "decision",
+                )
+                .unwrap();
+                resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "after-decision")
+                    .unwrap()
+            } else {
+                result.expect("matching pre-upgrade tested SHA must bind automatically")
+            };
             let data = store.read().unwrap();
             assert_eq!(
                 data.agents
@@ -2149,7 +2287,22 @@ fn cancelled_old_legacy_quarantine_resumes_through_public_cli() {
                 if ci { "building" } else { "revising" },
             ],
         );
-        let next = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+        let mut next = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+        if !ci {
+            assert!(
+                next["errors"][0]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("ticket reconcile T-1")
+            );
+            assert_eq!(store.read().unwrap().agents.len(), 1);
+            legacy_cli_success(
+                &repo,
+                "ticket",
+                &["reconcile", "T-1", "--accept-report", "legacy-role"],
+            );
+            next = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+        }
         assert!(next["errors"].as_array().unwrap().is_empty(), "{next}");
         let data = store.read().unwrap();
         if ci {
@@ -2167,36 +2320,23 @@ fn cancelled_old_legacy_quarantine_resumes_through_public_cli() {
 }
 
 #[test]
-fn same_ci_text_in_new_generation_starts_fresh() {
-    if !local_transport_enabled("same_ci_text_in_new_generation_starts_fresh") {
+fn matching_ci_generation_binds_null_sha_report() {
+    if !local_transport_enabled("matching_ci_generation_binds_null_sha_report") {
         return;
     }
     let repo = Repo::new();
     let store = legacy_ci_fixture(&repo, false);
-    // A fresh CI failure may repeat a task/round after a loop-cap reset. Its
-    // baseline digest must distinguish the new generation from old evidence.
     store
         .update(|data| {
-            let ticket = &mut data.tickets[0];
-            ticket.updated_at = "new-ci-failure".into();
-            ticket.history.push(herdr_shepherd::store::Transition {
-                from: TicketState::CiWait,
-                to: TicketState::Building,
-                reason: None,
-                at: "new-ci-failure".into(),
-            });
-            data.agents[0].status = herdr_shepherd::store::AgentStatus::Retired;
+            data.agents[0].report.as_mut().unwrap().commit_sha = None;
             Ok(())
         })
         .unwrap();
     let next = legacy_cli_success(&repo, "ticket", &["dispatch"]);
     assert!(next["errors"].as_array().unwrap().is_empty(), "{next}");
     let data = store.read().unwrap();
-    assert_eq!(
-        data.agents.len(),
-        2,
-        "a different CI generation needs its own task"
-    );
+    assert!(data.tickets[0].ci_failure_task.is_none());
+    assert_eq!(data.agents.len(), 1);
     assert_eq!(
         data.tickets[0]
             .ci_recovery
@@ -2204,8 +2344,55 @@ fn same_ci_text_in_new_generation_starts_fresh() {
             .unwrap()
             .assignment
             .agent,
-        data.agents[1].name
+        "legacy-role"
     );
+}
+
+#[test]
+fn same_ci_text_in_new_generation_starts_fresh() {
+    if !local_transport_enabled("same_ci_text_in_new_generation_starts_fresh") {
+        return;
+    }
+    for missing_sha in [true, false] {
+        let repo = Repo::new();
+        let store = legacy_ci_fixture(&repo, false);
+        // A fresh CI failure may repeat a task/round after a loop-cap reset. Its
+        // baseline digest must distinguish the new generation from old evidence.
+        store
+            .update(|data| {
+                let ticket = &mut data.tickets[0];
+                ticket.updated_at = "new-ci-failure".into();
+                ticket.history.push(herdr_shepherd::store::Transition {
+                    from: TicketState::CiWait,
+                    to: TicketState::Building,
+                    reason: None,
+                    at: "new-ci-failure".into(),
+                });
+                data.agents[0].status = herdr_shepherd::store::AgentStatus::Retired;
+                if missing_sha {
+                    data.agents[0].report.as_mut().unwrap().commit_sha = None;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let next = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+        assert!(next["errors"].as_array().unwrap().is_empty(), "{next}");
+        let data = store.read().unwrap();
+        assert_eq!(
+            data.agents.len(),
+            2,
+            "a different CI generation needs its own task"
+        );
+        assert_eq!(
+            data.tickets[0]
+                .ci_recovery
+                .as_ref()
+                .unwrap()
+                .assignment
+                .agent,
+            data.agents[1].name
+        );
+    }
 }
 
 #[test]

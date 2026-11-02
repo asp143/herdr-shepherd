@@ -176,6 +176,22 @@ fn legacy_ci_verified(ticket: &Ticket, agent: &crate::store::AgentRecord, marker
     saved == marker || legacy_ci_markers(ticket).iter().any(|known| known == saved)
 }
 
+fn legacy_revision_verified(ticket: &Ticket, agent: &crate::store::AgentRecord) -> bool {
+    let Some(run) = &ticket.revision_run else {
+        return false;
+    };
+    // The baseline only recorded input SHAs for an unbound coder. Neither
+    // those SHAs nor repeated task text prove which round produced its report.
+    // Reviewer/QA runs retain the output SHA they were asked to verify; the
+    // normal stage-consumption check also requires it to equal observed HEAD.
+    matches!(run.stage, RevisionStage::Reviewer | RevisionStage::Qa)
+        && agent
+            .report
+            .as_ref()
+            .and_then(|report| report.commit_sha.as_ref())
+            .is_some_and(|sha| run.tested_sha.as_ref() == Some(sha))
+}
+
 fn legacy_candidates<'a>(
     ticket: &Ticket,
     agents: &'a [crate::store::AgentRecord],
@@ -268,8 +284,8 @@ fn bind_legacy_report(
 }
 
 /// Recover the baseline's separate launch/reference writes using its exact
-/// task marker. One matching completion binds automatically; multiple matches
-/// retain a validated receipt for a public operator decision.
+/// task marker and verifiable generation or tested SHA. Ambiguous or unproven
+/// matches retain a validated receipt for a public operator decision.
 pub fn reconcile_unbound_legacy_dispatch(
     ticket: &mut Ticket,
     agents: &mut [crate::store::AgentRecord],
@@ -302,7 +318,11 @@ pub fn reconcile_unbound_legacy_dispatch(
         return Ok(None);
     }
     if let [agent] = recipients.as_slice()
-        && (workflow != "CI recovery" || legacy_ci_verified(ticket, agent, &marker))
+        && if workflow == "CI recovery" {
+            legacy_ci_verified(ticket, agent, &marker)
+        } else {
+            legacy_revision_verified(ticket, agent)
+        }
     {
         let assignment = AssignmentRef::from_agent(agent);
         bind_legacy_report(ticket, workflow, &marker, assignment);
