@@ -1796,6 +1796,7 @@ fn interrupted_legacy_revision_never_repeats_completed_role() {
         // Old binaries saved the agent before the separate run.agent write.
         store
             .update(|d| {
+                let task = d.tickets[0].revision_task.clone().unwrap();
                 let run = d.tickets[0].revision_run.as_mut().unwrap();
                 run.stage = stage;
                 run.agent = None;
@@ -1803,6 +1804,10 @@ fn interrupted_legacy_revision_never_repeats_completed_role() {
                 run.attempt_id = None;
                 let rec = &mut d.agents[0];
                 rec.role = role.into();
+                rec.task = format!(
+                    "Revision {} {:?}\nTask: {}\nAccepted comments:\n",
+                    run.base_sha, stage, task
+                );
                 rec.task_id = None;
                 rec.attempt_id = None;
                 rec.launch_profile = None;
@@ -1864,6 +1869,88 @@ fn interrupted_legacy_revision_never_repeats_completed_role() {
                 resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "bound").unwrap(),
                 RevisionOutcome::Started { role, .. } if role == "reviewer"
             ));
+        }
+    }
+}
+
+fn legacy_revision_fixture(
+    repo: &Repo,
+    stage: herdr_shepherd::ticket::revise::RevisionStage,
+    status: &str,
+    task: &str,
+) -> Store {
+    let store = stored_revision(repo);
+    let head = git(&repo.root, &["rev-parse", "HEAD"]);
+    let role = match stage {
+        herdr_shepherd::ticket::revise::RevisionStage::Coder => "coder",
+        herdr_shepherd::ticket::revise::RevisionStage::Reviewer => "reviewer",
+        herdr_shepherd::ticket::revise::RevisionStage::Qa => "qa",
+        _ => unreachable!(),
+    };
+    // Pre-upgrade disk fixture: the separate workflow-reference write never
+    // happened. No new assignment fields or completed-task history existed.
+    let record = serde_json::from_value(serde_json::json!({
+        "name":"legacy-role", "ticket":"T-1", "role":role,
+        "runner":"codex-sol-high", "status":status,
+        "pane_id":null, "tab_id":null, "worktree":repo.root,
+        "task":task, "report": {
+            "status":"completed", "summary":"saved legacy completion",
+            "tests":["fixture"], "changed_paths":[], "blockers":[],
+            "findings":[], "commit_sha":head
+        },
+        "observed":null, "last_progress_at":"0", "nudges":0,"restarts":0
+    }))
+    .unwrap();
+    store
+        .update(|data| {
+            data.tickets[0].revision_run = Some(herdr_shepherd::ticket::revise::RevisionRun {
+                base_sha: head.clone(),
+                synced_sha: Some(head.clone()),
+                stage,
+                agent: None,
+                task_id: None,
+                attempt_id: None,
+                tested_sha: Some(head),
+            });
+            data.agents.push(record);
+            Ok(())
+        })
+        .unwrap();
+    store
+}
+
+#[test]
+fn unrelated_legacy_history_does_not_quarantine_revision() {
+    if !local_transport_enabled("unrelated_legacy_history_does_not_quarantine_revision") {
+        return;
+    }
+    use herdr_shepherd::{
+        herdr::fake::FakeHerdr,
+        ticket::revise::{RevisionOutcome, RevisionStage},
+    };
+    for stage in [
+        RevisionStage::Coder,
+        RevisionStage::Reviewer,
+        RevisionStage::Qa,
+    ] {
+        for status in ["reported", "retired"] {
+            let repo = Repo::new();
+            let store = legacy_revision_fixture(
+                &repo,
+                stage,
+                status,
+                "Original implementation completed before this revision was requested",
+            );
+            let h = FakeHerdr::new(vec![]);
+            let gh = PushBackend::new(&repo);
+            let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+            let result = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later");
+            assert!(
+                matches!(result, Ok(RevisionOutcome::Started { .. })),
+                "unrelated {status} {stage:?} must permit a fresh task: {result:?}"
+            );
+            assert_eq!(store.read().unwrap().agents.len(), 2);
+            assert_eq!(h.start_args.borrow().len(), 1);
         }
     }
 }

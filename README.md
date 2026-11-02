@@ -477,7 +477,9 @@ old stored reports cannot complete a new assignment. Exact duplicates of the
 current assignment are idempotent. The optional flag preserves compatibility
 for original unreused assignments; tokenless reports are rejected after reuse.
 Existing stored agents still load, but unverifiable legacy identities start
-fresh. An interrupted legacy revision or CI dispatch with an unbound completed
+fresh. Only a saved legacy task with the pending workflow marker (and matching
+revision task) counts as an interrupted dispatch. Unrelated reported or retired
+history does not block a fresh revision or CI task. A matching unbound completed
 role blocks for reconciliation instead of repeating work. The error and the
 agent's `dispatch_reason` identify saved reports that need review; pending
 revision and CI intent remain intact. Already-bound legacy reports still

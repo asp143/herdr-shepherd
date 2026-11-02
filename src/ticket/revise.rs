@@ -71,10 +71,26 @@ pub enum RevisionOutcome {
     Blocked,
 }
 
-/// An old launcher saved agents before binding its workflow reference. There
-/// is no reliable generation token in those records, so never infer completion
-/// from prompt prose or silently launch the same role again after an upgrade.
-/// Keep the report and pending workflow intact for explicit reconciliation.
+pub fn ci_retry_generation(ticket: &Ticket) -> String {
+    use sha2::{Digest, Sha256};
+    let identity = format!(
+        "{}\0{}\0{}",
+        ticket.ci_failure_task.as_deref().unwrap_or_default(),
+        ticket.updated_at,
+        ticket.history.len(),
+    );
+    format!(
+        "CI retry {} round {} task {:x}",
+        ticket.id,
+        ticket.revision_round,
+        Sha256::digest(identity.as_bytes()),
+    )
+}
+
+/// An old launcher saved agents before binding its workflow reference. Only
+/// its exact generated marker and pending task can tie an unbound report to
+/// this workflow. Unrelated completed history must not quarantine a new task.
+/// Keep matching evidence intact until the workflow is reconciled.
 pub fn block_unbound_legacy_dispatch(
     ticket: &mut Ticket,
     agents: &mut [crate::store::AgentRecord],
@@ -83,6 +99,14 @@ pub fn block_unbound_legacy_dispatch(
     now: &str,
     max_revision_rounds: u32,
 ) -> Result<Option<String>, ShepherdError> {
+    let marker = match workflow {
+        "revision" => match &ticket.revision_run {
+            Some(run) => run_marker(run),
+            None => return Ok(None),
+        },
+        "CI recovery" => ci_retry_generation(ticket),
+        _ => return Err(ShepherdError::Usage("unknown legacy workflow".into())),
+    };
     let checkout = ticket
         .worktree
         .as_ref()
@@ -96,6 +120,16 @@ pub fn block_unbound_legacy_dispatch(
                 && agent.task_id.is_none()
                 && agent.attempt_id.is_none()
                 && agent.report.is_some()
+                && matches!(
+                    agent.status,
+                    crate::store::AgentStatus::Reported | crate::store::AgentStatus::Retired
+                )
+                && agent.task.lines().any(|line| line == marker)
+                && (workflow != "revision"
+                    || agent.task.contains(&format!(
+                        "\nTask: {}\nAccepted comments:\n",
+                        ticket.revision_task.as_deref().unwrap_or_default()
+                    )))
                 && checkout.as_ref().is_some_and(|path| {
                     agent
                         .worktree

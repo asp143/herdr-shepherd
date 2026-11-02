@@ -8,21 +8,7 @@ use herdr_shepherd::{
 };
 use std::path::Path;
 
-fn ci_retry_generation(ticket: &herdr_shepherd::store::Ticket) -> String {
-    use sha2::{Digest, Sha256};
-    let identity = format!(
-        "{}\0{}\0{}",
-        ticket.ci_failure_task.as_deref().unwrap_or_default(),
-        ticket.updated_at,
-        ticket.history.len(),
-    );
-    format!(
-        "CI retry {} round {} task {:x}",
-        ticket.id,
-        ticket.revision_round,
-        Sha256::digest(identity.as_bytes()),
-    )
-}
+use herdr_shepherd::ticket::revise::ci_retry_generation;
 
 #[cfg(test)]
 pub fn dispatch(
@@ -758,6 +744,41 @@ mod dispatch_tests {
     }
 
     #[test]
+    fn unrelated_legacy_history_does_not_quarantine_ci() {
+        for status in [AgentStatus::Reported, AgentStatus::Retired] {
+            let f = Fixture::new(2);
+            f.ticket("ci", TicketState::Building);
+            // Pre-upgrade completed implementation, before the first CI task.
+            f.occupy_agent_slot();
+            f.store
+                .update(|data| {
+                    let checkout = data.tickets[0].worktree.clone().unwrap();
+                    data.tickets[0].ci_failure_task = Some("Fix new CI failure".into());
+                    data.tickets.retain(|ticket| ticket.id == "ci");
+                    let agent = &mut data.agents[0];
+                    agent.ticket = "ci".into();
+                    agent.worktree = checkout;
+                    agent.status = status;
+                    agent.task = "Original implementation".into();
+                    agent.report = Some(
+                        serde_json::from_value(serde_json::json!({
+                            "status":"completed", "summary":"old work", "tests":[],
+                            "changed_paths":[], "blockers":[], "findings":[], "commit_sha":null
+                        }))
+                        .unwrap(),
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            let result = f.dispatch();
+            assert!(result["errors"].as_array().unwrap().is_empty(), "{result}");
+            assert_eq!(f.store.read().unwrap().agents.len(), 2);
+            assert_eq!(f.h.start_args.borrow().len(), 1);
+            assert_eq!(f.state("ci"), TicketState::Building);
+        }
+    }
+
+    #[test]
     fn interrupted_legacy_ci_never_repeats_completed_coder() {
         let f = Fixture::new(2);
         f.ticket("ci", TicketState::Building);
@@ -774,7 +795,9 @@ mod dispatch_tests {
             .update(|data| {
                 data.tickets[0].ci_failure_task = Some(task.into());
                 data.tickets[0].ci_recovery = None;
+                let marker = ci_retry_generation(&data.tickets[0]);
                 let agent = &mut data.agents[0];
+                agent.task = format!("{marker}\n{task}");
                 agent.task_id = None;
                 agent.attempt_id = None;
                 agent.launch_profile = None;
