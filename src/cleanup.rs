@@ -556,16 +556,22 @@ fn planned_retirements(
         .iter()
         .filter(|rec| rec.ticket == ticket.id)
     {
-        let mut retired = expected.clone();
-        retired.status = crate::store::AgentStatus::Retired;
-        if data.agents.contains(&retired) {
+        let current = data
+            .agents
+            .iter()
+            .find(|current| crate::flock::automatic::same_retirement_identity(expected, current));
+        let Some(current) = current else {
+            return Err(ShepherdError::PolicyDenied(
+                "cleanup retirement intent changed; resources kept".into(),
+            ));
+        };
+        if current.status == crate::store::AgentStatus::Retired {
             continue;
         }
-        if !data.agents.contains(expected)
-            || expected.ticket != ticket.id
-            || expected.status != crate::store::AgentStatus::Reported
+        if current.ticket != ticket.id
+            || current.status != crate::store::AgentStatus::Reported
             || !targets.iter().any(|target| {
-                expected
+                current
                     .worktree
                     .canonicalize()
                     .unwrap_or_else(|_| expected.worktree.clone())
@@ -576,7 +582,7 @@ fn planned_retirements(
                 "cleanup retirement intent changed; resources kept".into(),
             ));
         }
-        retiring.push(expected.clone());
+        retiring.push(current.clone());
     }
     for agent in h.agents()? {
         if !related_agent(&agent, targets, &data.agents) {
@@ -1085,7 +1091,9 @@ pub fn run(mut p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, Shepher
                 ));
             }
             for rec in &p.retiring_agents {
-                if !data.cleanup_retiring_agents.contains(rec) {
+                if !data.cleanup_retiring_agents.iter().any(|expected| {
+                    crate::flock::automatic::same_retirement_identity(expected, rec)
+                }) {
                     data.cleanup_retiring_agents.push(rec.clone());
                 }
             }

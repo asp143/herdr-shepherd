@@ -277,7 +277,35 @@ pub(crate) fn retire_for_ticket_cleanup(
 fn ticket_retirement_current(data: &crate::store::StoreData, rec: &AgentRecord) -> bool {
     data.agents.contains(rec)
         && data.tickets.iter().any(|ticket| ticket.id == rec.ticket)
-        && data.cleanup_retiring_agents.contains(rec)
+        && data
+            .cleanup_retiring_agents
+            .iter()
+            .any(|expected| same_retirement_identity(expected, rec))
+}
+
+/// A report can arrive while a failed close is awaiting retry. Completion and
+/// observation fields may change, but the journal still owns only this exact
+/// assignment and terminal, including its saved harness session.
+pub(crate) fn same_retirement_identity(left: &AgentRecord, right: &AgentRecord) -> bool {
+    let session = |rec: &AgentRecord| {
+        rec.observed
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .and_then(|value| value.get("session_ref").cloned())
+    };
+    left.name == right.name
+        && left.ticket == right.ticket
+        && left.role == right.role
+        && left.runner == right.runner
+        && left.worktree == right.worktree
+        && left.task == right.task
+        && left.task_id == right.task_id
+        && left.attempt_id == right.attempt_id
+        && left.unit == right.unit
+        && left.launch_profile == right.launch_profile
+        && left.pane_id == right.pane_id
+        && left.tab_id == right.tab_id
+        && session(left) == session(right)
 }
 
 /// The integration receipt also journals tab closure. A missing terminal is
@@ -415,7 +443,11 @@ fn retire_inner(
             {
                 return Ok(false);
             }
-            if !data.cleanup_retiring_agents.contains(&rec) {
+            if !data
+                .cleanup_retiring_agents
+                .iter()
+                .any(|expected| same_retirement_identity(expected, &rec))
+            {
                 data.cleanup_retiring_agents.push(rec.clone());
             }
             Ok(true)

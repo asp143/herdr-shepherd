@@ -2119,30 +2119,42 @@ fn cleanup_reconciles_retirement_after_lost_close_acknowledgement() {
 #[test]
 fn cleanup_rejects_changed_journaled_recipient() {
     use herdr_shepherd::store::Store;
-    let repo = Repo::new();
-    repo.merge();
-    reported_cleanup_agent(&repo, "coder", 1);
-    let store = Store::open(&repo.state, &repo.main).unwrap();
-    repo.h.fail_after_tab_close.replace(Some(1));
-    assert!(cleanup::run(repo.preflight(false).unwrap(), false).is_err());
-    store
-        .update(|data| {
-            data.agents[0].task_id = Some("replacement-task".into());
-            Ok(())
-        })
-        .unwrap();
-    let result = repo.preflight(false);
-    assert!(result.is_err());
-    assert!(
-        result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("retirement intent changed")
-    );
-    assert!(repo.ticket.exists());
-    assert_eq!(repo.h.closed_tabs.borrow().len(), 1);
-    assert!(repo.h.removals.borrow().is_empty());
+    for changed in ["task", "attempt", "pane", "tab", "session"] {
+        let repo = Repo::new();
+        repo.merge();
+        reported_cleanup_agent(&repo, "coder", 1);
+        let store = Store::open(&repo.state, &repo.main).unwrap();
+        repo.h.fail_after_tab_close.replace(Some(1));
+        assert!(cleanup::run(repo.preflight(false).unwrap(), false).is_err());
+        store
+            .update(|data| {
+                let rec = &mut data.agents[0];
+                match changed {
+                    "task" => rec.task_id = Some("replacement-task".into()),
+                    "attempt" => rec.attempt_id = Some("replacement-attempt".into()),
+                    "pane" => rec.pane_id = Some("ticket:replacement-pane".into()),
+                    "tab" => rec.tab_id = Some("ticket:replacement-tab".into()),
+                    "session" => {
+                        rec.observed = Some(r#"{"session_ref":"replacement-session"}"#.into());
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })
+            .unwrap();
+        let result = repo.preflight(false);
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("retirement intent changed")
+        );
+        assert!(repo.ticket.exists());
+        assert_eq!(repo.h.closed_tabs.borrow().len(), 1);
+        assert!(repo.h.removals.borrow().is_empty());
+    }
 }
 
 #[test]

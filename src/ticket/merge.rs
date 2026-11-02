@@ -116,9 +116,11 @@ fn retire_flock_inner(
         .iter()
         .filter(|a| a.ticket == id)
     {
-        let mut retired = expected.clone();
-        retired.status = AgentStatus::Retired;
-        if !data.agents.contains(expected) && !data.agents.contains(&retired) {
+        if !data
+            .agents
+            .iter()
+            .any(|current| crate::flock::automatic::same_retirement_identity(expected, current))
+        {
             return Err(ShepherdError::PolicyDenied(
                 "handoff retirement intent changed; resources kept".into(),
             ));
@@ -150,9 +152,10 @@ fn retire_flock_inner(
             .iter()
             .filter(|a| a.ticket == id)
         {
-            let mut retired = expected.clone();
-            retired.status = AgentStatus::Retired;
-            if !data.agents.contains(&retired) {
+            if !data.agents.iter().any(|current| {
+                current.status == AgentStatus::Retired
+                    && crate::flock::automatic::same_retirement_identity(expected, current)
+            }) {
                 return Err(ShepherdError::PolicyDenied(
                     "handoff retirement incomplete; resources kept".into(),
                 ));
@@ -845,6 +848,9 @@ mod tests {
                 });
         }
         fn reported_flock(&self) {
+            self.flock(AgentStatus::Reported);
+        }
+        fn flock(&self, coder_status: AgentStatus) {
             self.agent();
             let template = self.store.read().unwrap().agents[0].clone();
             self.store
@@ -854,7 +860,11 @@ mod tests {
                         let mut rec = template.clone();
                         rec.name = role.into();
                         rec.role = role.into();
-                        rec.status = AgentStatus::Reported;
+                        rec.status = if role == "coder" {
+                            coder_status
+                        } else {
+                            AgentStatus::Reported
+                        };
                         rec.pane_id = Some(format!("w1:p{}", index + 1));
                         rec.tab_id = Some(format!("w1:t{}", index + 1));
                         rec.task_id = Some(format!("task-{role}"));
@@ -882,7 +892,12 @@ mod tests {
                     .push(crate::herdr::AgentInfo {
                         name: Some(rec.name),
                         agent: "fake".into(),
-                        agent_status: "idle".into(),
+                        agent_status: if rec.status == AgentStatus::Working {
+                            "working"
+                        } else {
+                            "idle"
+                        }
+                        .into(),
                         cwd: Some(self.path.clone()),
                         pane_id: pane,
                         workspace_id: Some("w1".into()),
@@ -911,6 +926,88 @@ mod tests {
                 .unwrap();
             events
         }
+    }
+
+    #[test]
+    fn same_assignment_report_during_pending_handoff_can_retry() {
+        same_assignment_report_during_pending_retirement("handoff");
+    }
+
+    #[test]
+    fn same_assignment_report_during_pending_cleanup_can_retry() {
+        same_assignment_report_during_pending_retirement("cleanup");
+    }
+
+    fn same_assignment_report_during_pending_retirement(retry: &str) {
+        let fixture = Fixture::new(TicketState::PrOpen);
+        fixture.flock(AgentStatus::Working);
+        fixture
+            .h
+            .fake
+            .close_tab_effects
+            .borrow_mut()
+            .push_back(false);
+        fixture
+            .h
+            .fake
+            .close_tab_results
+            .borrow_mut()
+            .push_back(Err(ShepherdError::Usage("close failed".into())));
+        assert!(
+            retire_flock_with_config(&fixture.store, &fixture.h, "T1", &fixture.cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("close failed")
+        );
+        assert_eq!(
+            fixture.store.read().unwrap().cleanup_retiring_agents.len(),
+            1
+        );
+        crate::flock::store_report_for_task(
+                &fixture.store,
+                "coder",
+                Some("task-coder"),
+                r#"{"status":"completed","summary":"finished same task","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#,
+            )
+            .unwrap();
+        fixture.h.fake.agent_records.borrow_mut()[0].agent_status = "idle".into();
+
+        if retry == "handoff" {
+            retire_flock_with_config(&fixture.store, &fixture.h, "T1", &fixture.cfg)
+                .expect("same-assignment report must preserve handoff intent");
+        } else {
+            let backend = FakeBackend::new(vec![Ok(Some(fixture.status.clone()))]);
+            let state = fixture._dir.path().join("state");
+            let transport = PushTransport::open_with_options(
+                &state,
+                &fixture.path,
+                TransportOptions {
+                    allow_local_for_tests: true,
+                },
+            )
+            .unwrap();
+            let preflight = crate::cleanup::preflight_with_transport(
+                &fixture.h,
+                &backend,
+                &fixture.cfg,
+                &fixture.path,
+                false,
+                false,
+                transport,
+            )
+            .expect("same-assignment report must preserve cleanup intent");
+            crate::cleanup::run(preflight, false).unwrap();
+            assert!(!fixture.path.exists());
+        }
+        let data = fixture.store.read().unwrap();
+        assert!(data.cleanup_retiring_agents.is_empty());
+        assert!(data.agents.iter().all(|a| a.status == AgentStatus::Retired));
+        assert_eq!(data.agents[0].completed_tasks.len(), 1);
+        assert_eq!(
+            data.agents[0].report.as_ref().unwrap().summary,
+            "finished same task"
+        );
+        assert!(fixture.h.fake.agent_records.borrow().is_empty());
     }
 
     #[test]
@@ -1009,7 +1106,16 @@ mod tests {
 
     #[test]
     fn ticket_handoff_keeps_live_or_changed_recipients() {
-        for blocked_by in ["close-error", "close-no-effect", "task", "session"] {
+        for blocked_by in [
+            "close-error",
+            "close-no-effect",
+            "task",
+            "attempt",
+            "pane",
+            "tab",
+            "saved-session",
+            "session",
+        ] {
             let mut fixture = Fixture::new(TicketState::PrOpen);
             fixture.reported_flock();
             let events = fixture.retirement_events();
@@ -1029,10 +1135,21 @@ mod tests {
                 retire_flock_with_config(&fixture.store, &fixture.h, "T1", &fixture.cfg).is_err()
             );
             match blocked_by {
-                "task" => fixture
+                "task" | "attempt" | "pane" | "tab" | "saved-session" => fixture
                     .store
                     .update(|data| {
-                        data.agents[0].task_id = Some("replacement-task".into());
+                        let rec = &mut data.agents[0];
+                        match blocked_by {
+                            "task" => rec.task_id = Some("replacement-task".into()),
+                            "attempt" => rec.attempt_id = Some("replacement-attempt".into()),
+                            "pane" => rec.pane_id = Some("w1:replacement-pane".into()),
+                            "tab" => rec.tab_id = Some("w1:replacement-tab".into()),
+                            "saved-session" => {
+                                rec.observed =
+                                    Some(r#"{"session_ref":"replacement-session"}"#.into());
+                            }
+                            _ => unreachable!(),
+                        }
                         Ok(())
                     })
                     .unwrap(),
