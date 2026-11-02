@@ -896,3 +896,63 @@ fn reconcile_cannot_retire_a_missing_name_with_live_process() {
     assert_eq!(store.read().unwrap().agents[0], before);
     assert_eq!(h.agent_records.borrow()[0].name.as_ref(), Some(&old.name));
 }
+
+#[test]
+fn custom_child_writer_survives_role_config_drift() {
+    for configuration in [
+        "",
+        "[roles.unit-coder]\nworktree='ticket'\nrunners=['codex-sol-high']",
+    ] {
+        for status in [AgentStatus::Working, AgentStatus::Reported] {
+            let (dir, store, h, mut cfg, old) = fixture("unit-coder");
+            // Stored child identity survives removal or reclassification of its
+            // original custom role; the physical writer is still in its pane.
+            store
+                .update(|data| {
+                    let record = &mut data.agents[0];
+                    record.unit = Some(1);
+                    record.status = status;
+                    data.tickets[0].children.push(crate::store::ChildWorktree {
+                        unit: 1,
+                        branch: "feat/unit-1".into(),
+                        path: dir.path().into(),
+                        workspace_id: None,
+                        base_sha: "fixture-base".into(),
+                        integrated: false,
+                    });
+                    Ok(())
+                })
+                .unwrap();
+            h.agent_records.borrow_mut()[0].agent_status = "working".into();
+            cfg.raw = configuration.parse().unwrap();
+            let result = crate::flock::spawn(&h, &store, &cfg, request(dir.path(), "coder"));
+            assert!(
+                result.is_err(),
+                "{configuration:?}, {status:?}: bypassed saved child writer {}",
+                old.name
+            );
+            assert_eq!(h.start_args.borrow().len(), 1);
+            assert_eq!(h.agent_records.borrow().len(), 1);
+            assert_eq!(store.read().unwrap().agents.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn custom_child_writer_request_cannot_bypass_checkout_guard() {
+    let (dir, store, h, cfg, old) = fixture("coder");
+    h.agent_records.borrow_mut()[0].agent_status = "working".into();
+    let mut next = request(dir.path(), "custom-child-writer");
+    // The request itself identifies a writable child role even if it is not in
+    // the current configuration passed through this public dispatch entry point.
+    next.role.worktree = crate::roles::WorktreeMode::Child;
+    let result = crate::flock::spawn(&h, &store, &cfg, next);
+    assert!(
+        result.is_err(),
+        "custom child request bypassed existing writer {}",
+        old.name
+    );
+    assert_eq!(h.start_args.borrow().len(), 1);
+    assert_eq!(h.agent_records.borrow().len(), 1);
+    assert_eq!(store.read().unwrap().agents.len(), 1);
+}

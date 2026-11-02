@@ -466,7 +466,8 @@ A verified near-limit or exhausted context signal prevents reuse. No supported
 harness currently exposes a verified context gauge, so health is unknown and
 reuse is bounded by `shepherd.max_completed_assignments` (default 5). Shepherd
 does not estimate a context percentage. A unit coder can be reused only for its
-own unintegrated unit and checkout, never for the parent checkout.
+own unintegrated unit and checkout, never for the parent checkout. Saved unit
+writers retain checkout ownership even when their role configuration changes.
 
 Each new assignment gets a new task ID and report file:
 `<worktree>/.shepherd-report-<agent_name>-<task_id>.json`. Follow the inherited

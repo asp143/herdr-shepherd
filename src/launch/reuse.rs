@@ -51,6 +51,24 @@ pub(super) fn unit(data: &StoreData, req: &LaunchRequest) -> Option<u32> {
         .map(|c| c.unit)
 }
 
+fn writer_role(role: &str, resolved: &crate::roles::Resolved) -> bool {
+    role == "coder"
+        || resolved
+            .roles
+            .iter()
+            .any(|r| r.name == role && r.worktree == crate::roles::WorktreeMode::Child)
+}
+
+fn writer_request(req: &LaunchRequest, resolved: &crate::roles::Resolved) -> bool {
+    req.role.worktree == crate::roles::WorktreeMode::Child || writer_role(&req.role.name, resolved)
+}
+
+fn writer_record(rec: &AgentRecord, resolved: &crate::roles::Resolved) -> bool {
+    // A saved child writer keeps its checkout reservation when configuration
+    // removes or reclassifies its role. Runtime ownership outlives config.
+    rec.unit.is_some() || writer_role(&rec.role, resolved)
+}
+
 pub(super) fn check_admission(
     data: &StoreData,
     req: &LaunchRequest,
@@ -88,13 +106,6 @@ pub(super) fn check_admission(
         return Err(ShepherdError::Usage("ticket is not active".into()));
     }
     let resolved = crate::roles::resolve(cfg)?;
-    let writer = |role: &str| {
-        role == "coder"
-            || resolved
-                .roles
-                .iter()
-                .any(|r| r.name == role && r.worktree == crate::roles::WorktreeMode::Child)
-    };
     if req.role.name != "lead"
         && data
             .agents
@@ -111,9 +122,9 @@ pub(super) fn check_admission(
     {
         return Err(ShepherdError::Capacity);
     }
-    if writer(&req.role.name)
+    if writer_request(req, &resolved)
         && data.agents.iter().any(|a| {
-            writer(&a.role)
+            writer_record(a, &resolved)
                 && canonical(&a.worktree) == cwd
                 && (matches!(
                     a.status,
@@ -221,17 +232,10 @@ pub(super) fn admit(
         });
     }
     let resolved = crate::roles::resolve(cfg)?;
-    let writer = |role: &str| {
-        role == "coder"
-            || resolved
-                .roles
-                .iter()
-                .any(|r| r.name == role && r.worktree == crate::roles::WorktreeMode::Child)
-    };
-    if writer(&req.role.name) {
+    if writer_request(req, &resolved) {
         for old in data.agents.iter().filter(|a| {
             a.status == AgentStatus::Reported
-                && writer(&a.role)
+                && writer_record(a, &resolved)
                 && canonical(&a.worktree) == canonical(&req.worktree)
         }) {
             match h.agent_get(&old.name) {
@@ -442,7 +446,7 @@ pub(super) fn admit(
             }
         };
         let mut original = old.clone();
-        if writer(&req.role.name) {
+        if writer_request(req, &resolved) {
             // Even a pre-input rejection or a 'dead' name response cannot prove
             // the old process stopped. Preserve the task until physical evidence
             // permits replacement, or close only the exact owned recipient.
@@ -505,19 +509,12 @@ pub(super) fn retire_predecessor_writers(
     transfer_name: Option<&str>,
 ) -> Result<(), ShepherdError> {
     let resolved = crate::roles::resolve(cfg)?;
-    let writer = |role: &str| {
-        role == "coder"
-            || resolved
-                .roles
-                .iter()
-                .any(|r| r.name == role && r.worktree == crate::roles::WorktreeMode::Child)
-    };
-    if !writer(&req.role.name) {
+    if !writer_request(req, &resolved) {
         return Ok(());
     }
     let data = store.read()?;
     for old in data.agents.iter().filter(|a| {
-        writer(&a.role)
+        writer_record(a, &resolved)
             && Some(a.name.as_str()) != transfer_name
             && canonical(&a.worktree) == canonical(&req.worktree)
     }) {
