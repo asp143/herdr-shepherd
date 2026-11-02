@@ -322,7 +322,7 @@ fn rejected_or_dead_delivery_transfers_reserved_task() {
         let previous = store.read().unwrap().agents[0].clone();
         assert_eq!(previous.completed_tasks, old.completed_tasks);
         assert_eq!(previous.report, old.report);
-        assert_eq!(previous.status, AgentStatus::Reported);
+        assert_eq!(previous.status, AgentStatus::Retired);
         assert!(reason(&previous).starts_with("unavailable:"));
     }
 }
@@ -761,4 +761,138 @@ fn late_launch_save_cannot_restore_an_earlier_assignment() {
         save(&store, &old).unwrap();
         assert_eq!(store.read().unwrap().agents[0], current, "{changed}");
     }
+}
+
+#[test]
+fn writer_lookup_uncertainty_never_proves_death() {
+    for failure in ["missing", "error"] {
+        for capped in [false, true] {
+            let (dir, store, h, cfg, old) = fixture("coder");
+            h.agent_records.borrow_mut()[0].agent_status = "working".into();
+            if capped {
+                store
+                    .update(|data| {
+                        let rec = &mut data.agents[0];
+                        rec.completed_tasks = vec![rec.completed_tasks[0].clone(); 5];
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            if failure == "missing" {
+                h.agent_get_results.borrow_mut().extend([None, None]);
+            } else {
+                h.agent_get_errors
+                    .borrow_mut()
+                    .insert(old.name.clone(), "lookup unavailable".into());
+            }
+            let result = crate::flock::spawn(&h, &store, &cfg, request(dir.path(), "coder"));
+            assert!(
+                result.is_err(),
+                "{failure}, capped={capped}: admitted a second writer"
+            );
+            assert!(result.unwrap_err().to_string().contains("writer"));
+            assert_eq!(h.start_args.borrow().len(), 1);
+            assert_eq!(h.agent_records.borrow().len(), 1);
+            assert_eq!(store.read().unwrap().agents.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn rejected_writer_delivery_keeps_task_when_lookup_disappears() {
+    for failure in ["missing", "error"] {
+        let (dir, store, h, cfg, old) = fixture("coder");
+        let mode = failure.to_owned();
+        *h.on_prompt_effect.borrow_mut() = Some(Box::new(move |h, name| {
+            h.agent_records.borrow_mut()[0].agent_status = "working".into();
+            if mode == "missing" {
+                h.agent_records.borrow_mut()[0].name = None;
+            } else {
+                h.agent_get_errors
+                    .borrow_mut()
+                    .insert(name.into(), "lookup unavailable".into());
+            }
+        }));
+        h.prompt_results.borrow_mut().push_back((
+            false,
+            Err(ShepherdError::HerdrCommand {
+                code: "agent_not_found".into(),
+                message: "lost name".into(),
+            }),
+        ));
+        let next = crate::flock::spawn(&h, &store, &cfg, request(dir.path(), "coder")).unwrap();
+        assert_eq!(
+            next.name, old.name,
+            "{failure}: replaced an unverified writer"
+        );
+        assert_eq!(next.status, AgentStatus::Blocked);
+        assert!(next.prompt_delivery_uncertain());
+        assert_eq!(next.prompt_claim().unwrap().task_id, next.task_id);
+        assert!(reason(&next).contains("confirmed stopped"));
+        assert_eq!(h.start_args.borrow().len(), 1);
+        assert_eq!(h.agent_records.borrow().len(), 1);
+    }
+}
+
+#[test]
+fn fresh_writer_retires_ineligible_predecessor_before_launch() {
+    let (dir, store, h, mut cfg, old) = fixture("coder");
+    cfg.raw = "[shepherd]\nmax_completed_assignments=1".parse().unwrap();
+    let next = crate::flock::spawn(&h, &store, &cfg, request(dir.path(), "coder")).unwrap();
+    assert_ne!(next.name, old.name);
+    assert_eq!(h.agent_records.borrow().len(), 1);
+    assert!(!h.pane_exists(old.pane_id.as_deref().unwrap()).unwrap());
+    assert_eq!(store.read().unwrap().agents[0].status, AgentStatus::Retired);
+}
+
+#[test]
+fn initial_provider_fallback_requires_physical_shutdown() {
+    let (dir, store, h, cfg, old) = fixture("reviewer");
+    store
+        .update(|data| {
+            data.agents[0].status = AgentStatus::Retired;
+            Ok(())
+        })
+        .unwrap();
+    let mut req = request(dir.path(), "coder");
+    req.runners
+        .push(crate::roles::resolve(&cfg).unwrap().runners["omp-astra"].clone());
+    h.start_results.borrow_mut().push_back(AgentStart::NotReady);
+    h.visible_screens
+        .borrow_mut()
+        .push_back("insufficient credits".into());
+    h.close_tab_effects.borrow_mut().push_back(false);
+    let starts = h.start_args.borrow().len();
+    let result = crate::flock::spawn(&h, &store, &cfg, req);
+    assert!(
+        result.is_err(),
+        "provider fallback started without confirmed shutdown of {}",
+        old.name
+    );
+    assert_eq!(h.start_args.borrow().len(), starts + 1);
+}
+
+#[test]
+fn reconcile_cannot_retire_a_missing_name_with_live_process() {
+    let (_dir, store, h, _cfg, old) = fixture("coder");
+    store
+        .update(|data| {
+            let rec = &mut data.agents[0];
+            rec.status = AgentStatus::Working;
+            rec.report = None;
+            rec.task_id = None;
+            rec.attempt_id = None;
+            rec.completed_tasks.clear();
+            Ok(())
+        })
+        .unwrap();
+    h.agent_get_results.borrow_mut().push_back(None);
+    let before = store.read().unwrap().agents[0].clone();
+    let result = crate::flock::reconcile(&h, &store);
+    assert!(
+        result.is_err(),
+        "reconciled a live process as vanished: {result:?}"
+    );
+    assert_eq!(store.read().unwrap().agents[0], before);
+    assert_eq!(h.agent_records.borrow()[0].name.as_ref(), Some(&old.name));
 }

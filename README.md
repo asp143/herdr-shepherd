@@ -454,7 +454,13 @@ record without assignment identity, or the completed-assignment cap.
 fresh agent. A proven pre-input rejection can transfer the task; an ambiguous
 submission keeps its durable claim until a matching report or confirmed
 termination resolves it. A possibly accepted writable task is never replayed
-into another coder. Busy writers keep their checkout reserved.
+into another coder. Busy writers keep their checkout reserved. A missing name
+or failed lookup is not proof of death: a replacement writer requires confirmed
+physical shutdown of its predecessor. Shepherd closes an exact owned idle
+predecessor when a fresh writer is needed; uncertain ownership or shutdown
+blocks dispatch with an explicit error. Default reviewer and QA lookups can fall back
+to fresh recipients because those roles do not own writable checkout work;
+the old assignment remains completed and cannot satisfy the new one.
 
 A verified near-limit or exhausted context signal prevents reuse. No supported
 harness currently exposes a verified context gauge, so health is unknown and

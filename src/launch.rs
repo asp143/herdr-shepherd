@@ -117,6 +117,13 @@ pub fn launch_with_reservation(
         reuse::Admission::Reused(record) => return Ok(*record),
         reuse::Admission::Fresh { reason, transfer } => (reason, transfer),
     };
+    reuse::retire_predecessor_writers(
+        h,
+        store,
+        &req,
+        cfg,
+        transfer.as_ref().map(|t| t.reserved.name.as_str()),
+    )?;
     let (mut record, _operation, needs_launch) = store.update(|data| {
         if let Some(transfer) = &transfer {
             let current = data
@@ -423,6 +430,12 @@ fn launch_reserved(
                 h.close_tab(&tab)?;
                 if !current_launch(store, record)? {
                     return Ok(());
+                }
+                if !crate::flock::terminal_gone(h, record)? {
+                    return Err(ShepherdError::Usage(
+                        "provider fallback deferred: predecessor terminal is not confirmed stopped"
+                            .into(),
+                    ));
                 }
                 record.status = AgentStatus::LaunchFailed;
                 record.observed = Some(

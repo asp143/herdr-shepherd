@@ -185,6 +185,16 @@ fn observe_at(
         return Ok((None, None));
     }
     let Some(info) = h.agent_get(&rec.name)? else {
+        if h.agents()?.iter().any(|info| {
+            !matches!(info.agent_status.as_str(), "exited" | "stopped")
+                && (info.name.as_deref() == Some(rec.name.as_str())
+                    || rec.pane_id.as_deref() == Some(info.pane_id.as_str()))
+        }) {
+            return Err(ShepherdError::Usage(
+                "agent name missing but predecessor process is still present; recovery deferred"
+                    .into(),
+            ));
+        }
         return Ok((
             Some(if rec.prompt_delivery_uncertain() {
                 Condition::PromptDeliveryUncertain
@@ -803,7 +813,11 @@ fn resume(ctx: &ApplyContext<'_>, rec: &AgentRecord) -> Result<(), ShepherdError
     };
     if !owned(&data, rec, &own_info)
         || !same_session(rec, ctx.h.pane_session_ref(pane)?.as_deref())
-        || ctx.h.agents()?.iter().any(|a| a.pane_id == pane)
+        || ctx
+            .h
+            .agents()?
+            .iter()
+            .any(|a| a.pane_id == pane || a.name.as_deref() == Some(rec.name.as_str()))
     {
         return block(
             ctx,
@@ -4109,6 +4123,21 @@ mod tests {
             assert_eq!(store.read().unwrap().agents[0], before);
             assert_no_terminal_mutation(&h, &before);
         }
+    }
+
+    #[test]
+    fn missing_name_with_live_process_is_not_an_exit() {
+        let dir = unit5_dir();
+        let (store, _cfg, h) = fixture(dir.path());
+        let rec = reused_assignment(&store);
+        h.agent_records.borrow_mut()[0].agent_status = "working".into();
+        h.agent_get_results.borrow_mut().push_back(None);
+        let result = observe(&h, &rec, &*harness_for("codex").unwrap());
+        assert!(
+            result.is_err(),
+            "a missing name was treated as an exited process: {result:?}"
+        );
+        assert_no_terminal_mutation(&h, &rec);
     }
 
     #[test]

@@ -196,6 +196,18 @@ pub fn reconcile(
             continue;
         };
         let live = h.agent_get(&rec.name)?;
+        if live.is_none()
+            && h.agents()?.iter().any(|info| {
+                !matches!(info.agent_status.as_str(), "exited" | "stopped")
+                    && (info.name.as_deref() == Some(rec.name.as_str())
+                        || rec.pane_id.as_deref() == Some(info.pane_id.as_str()))
+            })
+        {
+            return Err(ShepherdError::PolicyDenied(
+                "agent lookup missing but predecessor process is still present; recovery deferred"
+                    .into(),
+            ));
+        }
         let session = live
             .as_ref()
             .map(|info| h.pane_session_ref(&info.pane_id))

@@ -224,16 +224,30 @@ pub(super) fn admit(
                 && writer(&a.role)
                 && canonical(&a.worktree) == canonical(&req.worktree)
         }) {
-            if h.agent_get(&old.name).ok().flatten().is_some_and(|info| {
-                crate::supervise::owned_terminal(old, &info)
-                    && !matches!(
+            match h.agent_get(&old.name) {
+                Ok(Some(info)) if crate::supervise::owned_terminal(old, &info) => {
+                    if !matches!(
                         info.agent_status.as_str(),
                         "idle" | "done" | "exited" | "stopped"
-                    )
-            }) {
-                return Err(ShepherdError::Usage(
-                    "reported writer is still busy; wait for idle before dispatch".into(),
-                ));
+                    ) {
+                        return Err(ShepherdError::Usage(
+                            "reported writer is still busy; wait for idle before dispatch".into(),
+                        ));
+                    }
+                }
+                lookup => {
+                    if !crate::flock::terminal_gone(h, old).unwrap_or(false) {
+                        let reason = if lookup.is_err() {
+                            "lookup failed"
+                        } else {
+                            "name or ownership missing"
+                        };
+                        return Err(ShepherdError::Usage(format!(
+                            "writer {} {reason}; predecessor is not confirmed stopped; verify or cancel its exact terminal before dispatch",
+                            old.name
+                        )));
+                    }
+                }
             }
         }
     }
@@ -418,46 +432,38 @@ pub(super) fn admit(
             }
         };
         let mut original = old.clone();
-        if writer(&req.role.name)
-            && let Some(live) = h.agent_get(&reserved.name).ok().flatten()
-            && !matches!(
-                live.agent_status.as_str(),
-                "idle" | "done" | "exited" | "stopped"
-            )
-        {
-            // A pre-input rejection may mean the old reported turn resumed
-            // before delivery. Stop only our exact owned busy recipient before
-            // starting another writer in its checkout. Unverified termination
-            // leaves the durable task quarantined instead of duplicating it.
-            let fresh = store.read()?;
-            let can_stop = fresh.agents.contains(&reserved)
-                && crate::supervise::owned(&fresh, &reserved, &live)
-                && live.agent == recipient.harness
-                && h.pane_session_ref(&recipient.pane_id)
-                    .ok()
-                    .flatten()
-                    .as_deref()
-                    == Some(recipient.session_ref.as_str());
-            let stopped = can_stop
-                && h.close_tab(reserved.tab_id.as_deref().expect("verified tab"))
-                    .is_ok()
-                && h.pane_exists(&recipient.pane_id)
-                    .is_ok_and(|exists| !exists)
-                && h.agents()
-                    .is_ok_and(|agents| !agents.iter().any(|a| a.pane_id == recipient.pane_id));
+        if writer(&req.role.name) {
+            // Even a pre-input rejection or a 'dead' name response cannot prove
+            // the old process stopped. Preserve the task until physical evidence
+            // permits replacement, or close only the exact owned recipient.
+            let mut stopped = crate::flock::terminal_gone(h, &reserved).unwrap_or(false);
+            if !stopped && let Ok(Some(live)) = h.agent_get(&reserved.name) {
+                let fresh = store.read()?;
+                let can_stop = fresh.agents.contains(&reserved)
+                    && crate::supervise::owned(&fresh, &reserved, &live)
+                    && live.agent == recipient.harness
+                    && h.pane_session_ref(&recipient.pane_id)
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some(recipient.session_ref.as_str());
+                if can_stop {
+                    // A lost acknowledgement is harmless only if disappearance
+                    // can independently be confirmed after the close attempt.
+                    let _ = h.close_tab(reserved.tab_id.as_deref().expect("verified tab"));
+                    stopped = crate::flock::terminal_gone(h, &reserved).unwrap_or(false);
+                }
+            }
             if !stopped {
                 let current = store.update(|data| {
                     let rec = data.agents.iter_mut().find(|a| a.name == reserved.name).expect("record retained");
                     if rec.task_id == reserved.task_id && rec.attempt_id == reserved.attempt_id && rec.report.is_none() && rec.status != AgentStatus::Retired {
-                        rec.dispatch_reason = Some("reused: rejected delivery; task pending until busy predecessor is confirmed stopped".into());
+                        rec.dispatch_reason = Some("reused: rejected delivery; task pending until predecessor is confirmed stopped".into());
                     }
                     Ok(rec.clone())
                 })?;
                 return Ok(Admission::Reused(Box::new(current)));
             }
-            // Transfer restores this retired predecessor in the same store
-            // transaction that reserves its replacement. That transaction's
-            // caller emits agent.retired only after the retirement is durable.
             original.status = AgentStatus::Retired;
         }
         return Ok(Admission::Fresh {
@@ -477,4 +483,66 @@ pub(super) fn admit(
         },
         transfer: None,
     })
+}
+
+/// Ineligibility is not permission to leave a writer running in the checkout.
+/// Placement is held by the caller; automatic retirement also owns the agent.
+pub(super) fn retire_predecessor_writers(
+    h: &dyn Herdr,
+    store: &Store,
+    req: &LaunchRequest,
+    cfg: &Config,
+    transfer_name: Option<&str>,
+) -> Result<(), ShepherdError> {
+    let resolved = crate::roles::resolve(cfg)?;
+    let writer = |role: &str| {
+        role == "coder"
+            || resolved
+                .roles
+                .iter()
+                .any(|r| r.name == role && r.worktree == crate::roles::WorktreeMode::Child)
+    };
+    if !writer(&req.role.name) {
+        return Ok(());
+    }
+    let data = store.read()?;
+    for old in data.agents.iter().filter(|a| {
+        writer(&a.role)
+            && Some(a.name.as_str()) != transfer_name
+            && canonical(&a.worktree) == canonical(&req.worktree)
+    }) {
+        if crate::flock::terminal_gone(h, old).unwrap_or(false) {
+            if old.status == AgentStatus::Reported {
+                let _operation =
+                    crate::flock::try_agent_operation(store, &old.name)?.ok_or_else(|| {
+                        ShepherdError::Usage("predecessor writer operation busy".into())
+                    })?;
+                let retired = store.update(|data| {
+                    let Some(rec) = data.agents.iter_mut().find(|a| *a == old) else {
+                        return Ok(false);
+                    };
+                    rec.status = AgentStatus::Retired;
+                    Ok(true)
+                })?;
+                if retired {
+                    crate::flock::emit_retired(cfg, old);
+                } else {
+                    return Err(ShepherdError::Usage(
+                        "predecessor writer changed; retry dispatch".into(),
+                    ));
+                }
+            }
+            continue;
+        }
+        if old.status != AgentStatus::Reported
+            || !crate::flock::automatic::retire_with_config(h, store, old, cfg)?
+            || !crate::flock::terminal_gone(h, old)?
+        {
+            return Err(ShepherdError::Usage(format!(
+                "writer {} predecessor is not confirmed stopped; verify or cancel its exact terminal before dispatch",
+                old.name
+            )));
+        }
+    }
+    Ok(())
 }

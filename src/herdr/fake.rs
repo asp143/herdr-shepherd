@@ -25,6 +25,7 @@ pub struct FakeHerdr {
     pub notify_error: Cell<bool>,
     pub agent_records: RefCell<Vec<AgentInfo>>,
     pub agent_get_results: RefCell<VecDeque<Option<AgentInfo>>>,
+    pub agent_get_errors: RefCell<HashMap<String, String>>,
     pub start_results: RefCell<VecDeque<AgentStart>>,
     /// False acknowledges tab closure without removing its pane or process.
     pub close_tab_effects: RefCell<VecDeque<bool>>,
@@ -58,6 +59,7 @@ impl FakeHerdr {
             notify_error: Cell::new(false),
             agent_records: RefCell::new(Vec::new()),
             agent_get_results: RefCell::new(VecDeque::new()),
+            agent_get_errors: RefCell::new(HashMap::new()),
             start_results: RefCell::new(VecDeque::new()),
             close_tab_effects: RefCell::new(VecDeque::new()),
             prompt_results: RefCell::new(VecDeque::new()),
@@ -177,6 +179,9 @@ impl Herdr for FakeHerdr {
         Ok(result)
     }
     fn agent_get(&self, name: &str) -> Result<Option<AgentInfo>, ShepherdError> {
+        if let Some(message) = self.agent_get_errors.borrow().get(name) {
+            return Err(ShepherdError::Usage(message.clone()));
+        }
         let info = self
             .agent_get_results
             .borrow_mut()
