@@ -1,5 +1,7 @@
 pub(crate) mod automatic;
-pub use automatic::retire as retire_automatically;
+pub use automatic::{
+    retire as retire_automatically, retire_with_config as retire_automatically_with_config,
+};
 
 use crate::{error::ShepherdError, store::Report};
 
@@ -253,6 +255,16 @@ pub fn reconcile(
                 None if current.prompt_delivery_uncertain() => {
                     current.status = AgentStatus::Blocked;
                 }
+                None if current.task_id.is_some()
+                    && current.attempt_id.is_some()
+                    && (!current.prompt_pending || !current.completed_tasks.is_empty()) =>
+                {
+                    // An accepted assignment, including a reused task waiting
+                    // for recovery input, remains pending after process loss.
+                    // Preserve its payload, session and claim for recovery or
+                    // explicit cancellation instead of silently retiring it.
+                    current.status = AgentStatus::Blocked;
+                }
                 None if current.status == AgentStatus::Starting => {
                     current.status = AgentStatus::LaunchFailed;
                     current.observed = Some("launch_failed: role re-queued".into());
@@ -272,11 +284,9 @@ pub fn reconcile(
             Ok(send_pending)
         })?;
         if send_pending {
-            let current = store
-                .read()?
-                .agents
-                .into_iter()
-                .find(|a| a.name == rec.name);
+            let current = store.read()?.agents.into_iter().find(|a| {
+                a.name == rec.name && a.task_id == rec.task_id && a.attempt_id == rec.attempt_id
+            });
             let delivery = if let Some(current) = current
                 && automatic::recipient(h, store, &current, false)?
                     .is_some_and(|info| matches!(info.agent_status.as_str(), "idle" | "done"))
@@ -289,8 +299,11 @@ pub fn reconcile(
                 && !error.prompt_submission_uncertain()
             {
                 store.update(|data| {
-                    if let Some(current) = data.agents.iter_mut().find(|a| a.name == rec.name)
-                        && current.report.is_none()
+                    if let Some(current) = data.agents.iter_mut().find(|a| {
+                        a.name == rec.name
+                            && a.task_id == rec.task_id
+                            && a.attempt_id == rec.attempt_id
+                    }) && current.report.is_none()
                         && current.status != AgentStatus::Retired
                     {
                         current.prompt_pending = true;
@@ -379,8 +392,9 @@ pub fn report_for_task(
     );
     crate::hooks::emit(
         cfg,
-        "agent.retired",
-        &serde_json::json!({"ticket":rec.ticket,"agent":rec.name,"role":rec.role}),
+        "agent.reported",
+        &serde_json::json!({"ticket":rec.ticket,"agent":rec.name,"role":rec.role,
+            "task_id":rec.task_id,"attempt_id":rec.attempt_id}),
     );
     Ok(rec)
 }
@@ -403,12 +417,72 @@ pub fn spawn(
     crate::launch::launch_configured(h, store, req, cfg)
 }
 
+/// A close acknowledgement alone cannot authorize retirement or cleanup.
+pub(crate) fn terminal_gone(
+    h: &dyn crate::herdr::Herdr,
+    rec: &crate::store::AgentRecord,
+) -> Result<bool, ShepherdError> {
+    let live = |info: &crate::herdr::AgentInfo| {
+        !matches!(info.agent_status.as_str(), "exited" | "stopped")
+    };
+    if h.agent_get(&rec.name)?.as_ref().is_some_and(live)
+        || h.agents()?.iter().any(|info| {
+            live(info)
+                && (info.name.as_deref() == Some(rec.name.as_str())
+                    || rec.pane_id.as_deref() == Some(info.pane_id.as_str()))
+        })
+    {
+        return Ok(false);
+    }
+    match rec.pane_id.as_deref() {
+        Some(pane) => h.pane_exists(pane).map(|exists| !exists),
+        None => Ok(true),
+    }
+}
+
+/// Call only after the owned terminal has closed and retirement is persisted.
+pub(crate) fn emit_retired(cfg: &crate::config::Config, rec: &crate::store::AgentRecord) {
+    crate::hooks::emit(
+        cfg,
+        "agent.retired",
+        &serde_json::json!({
+            "ticket":rec.ticket,"agent":rec.name,"role":rec.role,
+            "task_id":rec.task_id,"attempt_id":rec.attempt_id,
+        }),
+    );
+}
+
 pub fn cancel(
     h: &dyn crate::herdr::Herdr,
     store: &crate::store::Store,
     name: &str,
     force: bool,
 ) -> Result<crate::store::AgentRecord, ShepherdError> {
+    cancel_inner(h, store, name, force, None)
+}
+
+/// Explicit configuration keeps custom CLI hook selection intact.
+pub fn cancel_with_config(
+    h: &dyn crate::herdr::Herdr,
+    store: &crate::store::Store,
+    name: &str,
+    force: bool,
+    cfg: &crate::config::Config,
+) -> Result<crate::store::AgentRecord, ShepherdError> {
+    cancel_inner(h, store, name, force, Some(cfg))
+}
+
+fn cancel_inner(
+    h: &dyn crate::herdr::Herdr,
+    store: &crate::store::Store,
+    name: &str,
+    force: bool,
+    cfg: Option<&crate::config::Config>,
+) -> Result<crate::store::AgentRecord, ShepherdError> {
+    let _hooks = crate::hooks::defer();
+    // Dispatch and recovery own this same lock while task input is in flight.
+    // Wait before reading the assignment that cancellation will actually stop.
+    let _operation = agent_operation(store, name)?;
     use crate::store::AgentStatus;
     let data = store.read()?;
     let rec = data
@@ -416,6 +490,9 @@ pub fn cancel(
         .iter()
         .find(|a| a.name == name)
         .ok_or_else(|| ShepherdError::Usage(format!("unknown agent: {name}")))?;
+    if rec.status == AgentStatus::Retired && terminal_gone(h, rec)? {
+        return Ok(rec.clone());
+    }
     if let Some(live) = h.agent_get(name)? {
         let inside = live
             .cwd
@@ -436,15 +513,33 @@ pub fn cancel(
     if let Some(tab) = &rec.tab_id {
         h.close_tab(tab)?;
     }
-    store.update(|data| {
+    if !terminal_gone(h, rec)? {
+        return Err(ShepherdError::PolicyDenied(
+            "agent terminal has not closed; resources kept".into(),
+        ));
+    }
+    let retired = store.update(|data| {
         let rec = data
             .agents
             .iter_mut()
-            .find(|a| a.name == name)
-            .expect("record retained");
+            .find(|a| {
+                a.name == name
+                    && a.task_id == rec.task_id
+                    && a.attempt_id == rec.attempt_id
+                    && a.pane_id == rec.pane_id
+            })
+            .ok_or_else(|| {
+                ShepherdError::PolicyDenied("cancelled assignment changed; resources kept".into())
+            })?;
         rec.status = AgentStatus::Retired;
         Ok(rec.clone())
-    })
+    })?;
+    if rec.status != AgentStatus::Retired
+        && let Some(cfg) = cfg
+    {
+        emit_retired(cfg, &retired);
+    }
+    Ok(retired)
 }
 
 /// An operation releases its OS lock even when a concurrent fork inherited
@@ -467,19 +562,35 @@ impl Drop for AgentOperationGuard {
 
 /// A live launcher owns its intent until it finishes or its process exits.
 /// Recovery skips busy records instead of mistaking in-flight admission for loss.
-pub fn try_agent_operation(
+fn agent_operation_file(
     store: &crate::store::Store,
     name: &str,
-) -> Result<Option<AgentOperationGuard>, ShepherdError> {
+) -> Result<std::fs::File, ShepherdError> {
     std::fs::create_dir_all(store.root()).map_err(anyhow::Error::from)?;
     let hash = crate::store::project_hash(std::path::Path::new(name));
-    let lock = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(store.root().join(format!("agent-{}.lock", &hash[..16])))
-        .map_err(anyhow::Error::from)?;
+        .map_err(|error| anyhow::Error::from(error).into())
+}
+
+fn agent_operation(
+    store: &crate::store::Store,
+    name: &str,
+) -> Result<AgentOperationGuard, ShepherdError> {
+    let lock = agent_operation_file(store, name)?;
+    lock.lock().map_err(anyhow::Error::from)?;
+    Ok(AgentOperationGuard { file: lock })
+}
+
+pub fn try_agent_operation(
+    store: &crate::store::Store,
+    name: &str,
+) -> Result<Option<AgentOperationGuard>, ShepherdError> {
+    let lock = agent_operation_file(store, name)?;
     match lock.try_lock() {
         Ok(()) => Ok(Some(AgentOperationGuard { file: lock })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),

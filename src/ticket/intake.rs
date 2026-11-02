@@ -183,6 +183,29 @@ pub fn cancel_agents(
     now: &str,
     max_revision_rounds: u32,
 ) -> Result<Ticket, ShepherdError> {
+    cancel_agents_inner(h, store, id, now, max_revision_rounds, None)
+}
+
+pub fn cancel_agents_with_config(
+    h: &dyn crate::herdr::Herdr,
+    store: &Store,
+    id: &str,
+    now: &str,
+    max_revision_rounds: u32,
+    cfg: &crate::config::Config,
+) -> Result<Ticket, ShepherdError> {
+    cancel_agents_inner(h, store, id, now, max_revision_rounds, Some(cfg))
+}
+
+fn cancel_agents_inner(
+    h: &dyn crate::herdr::Herdr,
+    store: &Store,
+    id: &str,
+    now: &str,
+    max_revision_rounds: u32,
+    cfg: Option<&crate::config::Config>,
+) -> Result<Ticket, ShepherdError> {
+    let _hooks = crate::hooks::defer();
     let _dispatch = super::revise::dispatch_lock(store, id)?;
     let _operation = super::operation::exclusive(store, id)?;
     for agent in store.read()?.agents.into_iter().filter(|agent| {
@@ -192,7 +215,11 @@ pub fn cancel_agents(
                 crate::store::AgentStatus::Retired | crate::store::AgentStatus::LaunchFailed
             )
     }) {
-        crate::flock::cancel(h, store, &agent.name, false)?;
+        if let Some(cfg) = cfg {
+            crate::flock::cancel_with_config(h, store, &agent.name, false, cfg)?;
+        } else {
+            crate::flock::cancel(h, store, &agent.name, false)?;
+        }
     }
     close_ticket(store, id, now, max_revision_rounds)
 }

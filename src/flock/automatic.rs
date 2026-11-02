@@ -236,7 +236,17 @@ pub(crate) fn dispatch(
 /// Nonblocking automatic retirement. A deferred retirement is NOT cleanup
 /// success: callers must retain the worktree and retry only after resolution.
 pub fn retire(h: &dyn Herdr, store: &Store, expected: &AgentRecord) -> Result<bool, ShepherdError> {
-    retire_inner(h, store, expected, None)
+    retire_inner(h, store, expected, None, None)
+}
+
+/// Configured lifecycle entry points emit retirement after the terminal closes.
+pub fn retire_with_config(
+    h: &dyn Herdr,
+    store: &Store,
+    expected: &AgentRecord,
+    cfg: &crate::config::Config,
+) -> Result<bool, ShepherdError> {
+    retire_inner(h, store, expected, None, Some(cfg))
 }
 
 /// The integration receipt also journals tab closure. A missing terminal is
@@ -246,8 +256,9 @@ pub(crate) fn retire_for_cleanup(
     store: &Store,
     expected: &AgentRecord,
     receipt: &crate::store::ChildCleanup,
+    cfg: Option<&crate::config::Config>,
 ) -> Result<bool, ShepherdError> {
-    retire_inner(h, store, expected, Some(receipt))
+    retire_inner(h, store, expected, Some(receipt), cfg)
 }
 
 fn cleanup_current(
@@ -268,7 +279,9 @@ fn retire_inner(
     store: &Store,
     expected: &AgentRecord,
     cleanup: Option<&crate::store::ChildCleanup>,
+    cfg: Option<&crate::config::Config>,
 ) -> Result<bool, ShepherdError> {
+    let _hooks = crate::hooks::defer();
     let name = &expected.name;
     let Some(_operation) = super::try_agent_operation(store, name)? else {
         return Ok(false);
@@ -293,16 +306,23 @@ fn retire_inner(
                 .any(|a| a.pane_id == *pane || a.name.as_deref() == Some(name))
             && !h.pane_exists(pane)?
         {
-            return store.update(|data| {
+            let retired = store.update(|data| {
                 if !cleanup_current(data, &rec, receipt) {
                     return Ok(false);
                 }
                 data.agents.iter_mut().find(|a| **a == rec).unwrap().status = AgentStatus::Retired;
                 Ok(true)
-            });
+            })?;
+            if retired && let Some(cfg) = cfg {
+                super::emit_retired(cfg, &rec);
+            }
+            return Ok(retired);
         }
     }
     let Some(info) = recipient(h, store, &rec, true)? else {
+        return Ok(false);
+    };
+    let Some(tab) = rec.tab_id.as_deref() else {
         return Ok(false);
     };
     if rec.status != AgentStatus::Reported
@@ -340,10 +360,11 @@ fn retire_inner(
             return Ok(false);
         }
     }
-    if let Some(tab) = &rec.tab_id {
-        h.close_tab(tab)?;
+    h.close_tab(tab)?;
+    if !super::terminal_gone(h, &rec)? {
+        return Ok(false);
     }
-    store.update(|data| {
+    let retired = store.update(|data| {
         if cleanup
             .as_ref()
             .is_some_and(|receipt| !cleanup_current(data, &rec, receipt))
@@ -355,5 +376,9 @@ fn retire_inner(
         };
         current.status = AgentStatus::Retired;
         Ok(true)
-    })
+    })?;
+    if retired && let Some(cfg) = cfg {
+        super::emit_retired(cfg, &rec);
+    }
+    Ok(retired)
 }

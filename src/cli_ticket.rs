@@ -284,12 +284,13 @@ pub fn cancel(
     id: &str,
 ) -> Result<herdr_shepherd::store::Ticket, ShepherdError> {
     let resolved = roles::resolve(cfg)?;
-    let ticket = intake::cancel_agents(
+    let ticket = intake::cancel_agents_with_config(
         h,
         store,
         id,
         &launch::now(),
         resolved.shepherd.max_revision_rounds,
+        cfg,
     )?;
     herdr_shepherd::hooks::emit(cfg, "ticket.closed", &serde_json::json!({"ticket":id}));
     Ok(ticket)
@@ -448,7 +449,7 @@ pub fn integrate(
                 t.integration_ranges = report.ranges.clone();
                 Ok(())
             })?;
-            children::cleanup_integrated_recorded(h, store, &ticket)?;
+            children::cleanup_integrated_recorded_with_config(h, store, &ticket, cfg)?;
             Ok(report)
         }
     }

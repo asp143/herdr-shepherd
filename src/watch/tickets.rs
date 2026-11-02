@@ -258,7 +258,7 @@ fn poll_ticket(
             {
                 return Ok(false);
             }
-            crate::ticket::merge::retire_flock(store, h, &ticket.id)?;
+            crate::ticket::merge::retire_flock_with_config(store, h, &ticket.id, cfg)?;
             let changed = store.update(|data| {
                 let Some(current) = data
                     .tickets

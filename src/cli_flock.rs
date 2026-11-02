@@ -99,7 +99,8 @@ pub fn run(
             .expect("serializable")
         }
         AgentCommand::Cancel { name, force } => {
-            serde_json::to_value(flock::cancel(h, &store, name, *force)?).expect("serializable")
+            serde_json::to_value(flock::cancel_with_config(h, &store, name, *force, &cfg)?)
+                .expect("serializable")
         }
         AgentCommand::Spawn {
             ticket,

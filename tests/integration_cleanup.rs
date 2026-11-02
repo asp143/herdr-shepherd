@@ -3,7 +3,7 @@
 use herdr_shepherd::{
     error::ShepherdError,
     herdr::{AgentInfo, Herdr, Workspace, WorktreeInfo},
-    store::{AgentRecord, AgentStatus, ChildWorktree, Store, Ticket},
+    store::{AgentRecord, AgentStatus, ChildWorktree, CompletedTask, Store, Ticket},
     ticket::children::{cleanup_integrated_recorded, integrate},
 };
 use std::{
@@ -122,6 +122,16 @@ impl Herdr for LocalHerdr {
             .retain(|w| w.workspace_id != ws);
         Ok(())
     }
+    fn send_keys(&self, name: &str, keys: &[String]) -> Result<(), ShepherdError> {
+        assert_eq!(keys, ["esc"]);
+        assert!(
+            self.agents
+                .borrow()
+                .iter()
+                .any(|a| a.name.as_deref() == Some(name))
+        );
+        Ok(())
+    }
     fn close_tab(&self, tab: &str) -> Result<(), ShepherdError> {
         if self.fault.get() == Fault::TabReject {
             self.fault.set(Fault::None);
@@ -175,7 +185,14 @@ struct Fixture {
 }
 impl Fixture {
     fn new(legacy: &[bool]) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::with_dir(legacy, tempfile::tempdir().unwrap())
+    }
+    fn reuse_fixture(legacy: &[bool]) -> Self {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/lifecycle-fixtures");
+        fs::create_dir_all(&base).unwrap();
+        Self::with_dir(legacy, tempfile::tempdir_in(base).unwrap())
+    }
+    fn with_dir(legacy: &[bool], dir: tempfile::TempDir) -> Self {
         let root = dir.path().join("repo");
         let ticket = dir.path().join("ticket");
         fs::create_dir(&root).unwrap();
@@ -779,4 +796,199 @@ fn ancestry_receipt_survives_later_edits_to_landed_lines() {
         fs::read_to_string(f.ticket.join("work-2")).unwrap(),
         "later ticket edit\n"
     );
+}
+
+fn original_assignment() -> CompletedTask {
+    CompletedTask {
+        task_id: Some("original-task".into()),
+        attempt_id: Some("original-task-1".into()),
+        task: "original task".into(),
+        report: herdr_shepherd::flock::validate_report(
+            r#"{"task_id":"original-task","status":"completed","summary":"original complete","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#,
+        ).unwrap(),
+        completed_at: "0".into(),
+    }
+}
+
+#[test]
+fn integration_retires_reused_unit_coder_without_touching_parent_cohort() {
+    for legacy in [false, true] {
+        let f = Fixture::reuse_fixture(&[legacy]);
+        f.reported_agent("reused-child", "ticket:p1", &f.child(1));
+        f.reported_agent("idle-parent-reviewer", "ticket:p2", &f.ticket);
+        f.store
+            .update(|data| {
+                let child = &mut data.agents[0];
+                child.task_id = Some("revision-task".into());
+                child.attempt_id = Some("revision-task-1".into());
+                child.unit = Some(1);
+                child.completed_tasks.push(original_assignment());
+                child.observed = Some(r#"{"tab_workspace_id":"ticket"}"#.into());
+                child.task = "verify the revised unit".into();
+                child.dispatch_reason = Some("reused: eligible reported agent".into());
+                let parent = &mut data.agents[1];
+                parent.role = "reviewer".into();
+                Ok(())
+            })
+            .unwrap();
+        herdr_shepherd::flock::store_report_for_task(
+            &f.store, "reused-child", Some("revision-task"),
+            r#"{"status":"completed","summary":"revised unit complete","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#,
+        ).unwrap();
+        let before = f.store.read().unwrap().agents;
+        f.run().unwrap();
+        f.assert_done(1);
+        let after = f.store.read().unwrap().agents;
+        let mut expected_child = before[0].clone();
+        expected_child.status = AgentStatus::Retired;
+        assert_eq!(after[0], expected_child);
+        assert_eq!(after[1], before[1]);
+        assert_eq!(f.h.closed_tabs.borrow().as_slice(), ["ticket:t1"]);
+        assert_eq!(f.h.agents.borrow().len(), 1);
+        assert_eq!(
+            f.h.agents.borrow()[0].name.as_deref(),
+            Some("idle-parent-reviewer")
+        );
+        assert!(!f.h.panes.borrow().contains_key("ticket:p1"));
+    }
+}
+
+#[test]
+fn cancel_closes_reused_reported_process_for_every_role() {
+    for role in ["coder", "reviewer", "qa"] {
+        let f = Fixture::reuse_fixture(&[]);
+        f.reported_agent("reused", "ticket:p1", &f.ticket);
+        f.store
+            .update(|data| {
+                let rec = &mut data.agents[0];
+                rec.role = role.into();
+                rec.completed_tasks.push(original_assignment());
+                rec.task_id = Some("revision-task".into());
+                rec.attempt_id = Some("revision-task-1".into());
+                rec.dispatch_reason = Some("reused: eligible reported agent".into());
+                Ok(())
+            })
+            .unwrap();
+        let before = herdr_shepherd::flock::store_report_for_task(
+            &f.store, "reused", Some("revision-task"),
+            r#"{"status":"completed","summary":"revision complete","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#,
+        ).unwrap();
+        let retired = herdr_shepherd::flock::cancel(&f.h, &f.store, "reused", false).unwrap();
+        let mut expected = before;
+        expected.status = AgentStatus::Retired;
+        assert_eq!(retired, expected);
+        assert_eq!(retired.status, AgentStatus::Retired);
+        assert_eq!(retired.task_id.as_deref(), Some("revision-task"));
+        assert_eq!(retired.attempt_id.as_deref(), Some("revision-task-1"));
+        assert!(f.h.agents.borrow().is_empty());
+        assert!(f.h.panes.borrow().is_empty());
+        assert_eq!(f.h.closed_tabs.borrow().as_slice(), ["ticket:t1"]);
+        assert!(f.ticket.exists());
+    }
+}
+
+#[test]
+fn configured_lifecycle_hooks_follow_real_retirement_once() {
+    use herdr_shepherd::{
+        config,
+        store::TicketState,
+        ticket::{
+            children::cleanup_integrated_recorded_with_config, intake::cancel_agents_with_config,
+        },
+    };
+
+    let f = Fixture::reuse_fixture(&[false]);
+    f.reported_agent("reused-child", "ticket:p1", &f.child(1));
+    f.reported_agent("reused-parent", "ticket:p2", &f.ticket);
+    for (index, role, task) in [(0, "coder", "child-task"), (1, "qa", "parent-task")] {
+        f.store
+            .update(|data| {
+                let rec = &mut data.agents[index];
+                rec.role = role.into();
+                rec.task_id = Some(task.into());
+                rec.attempt_id = Some(format!("{task}-1"));
+                rec.completed_tasks.push(original_assignment());
+                rec.dispatch_reason = Some("reused: eligible reported agent".into());
+                Ok(())
+            })
+            .unwrap();
+        herdr_shepherd::flock::store_report_for_task(
+            &f.store, if index == 0 { "reused-child" } else { "reused-parent" }, Some(task),
+            r#"{"status":"completed","summary":"revision complete","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#,
+        ).unwrap();
+    }
+    let config_dir = f.dir.path().join("hook-config");
+    fs::create_dir(&config_dir).unwrap();
+    let events = f.dir.path().join("retirement-events.jsonl");
+    let command: toml::Value = vec![
+        "sh".to_owned(),
+        "-c".into(),
+        "cat >> \"$1\"; printf '\\n' >> \"$1\"".into(),
+        "hook".into(),
+        events.display().to_string(),
+    ]
+    .into();
+    fs::write(
+        config_dir.join("shepherd.toml"),
+        format!("[[hooks]]\non = 'agent.retired'\ncommand = {command}\n"),
+    )
+    .unwrap();
+    let cfg = config::load(&config_dir, None).unwrap();
+    let emitted = || -> Vec<serde_json::Value> {
+        fs::read_to_string(&events)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+
+    // Closure may succeed before transport returns an error. Its durable
+    // receipt lets retry confirm the exact process is gone before retirement.
+    f.h.fault.set(Fault::TabClose);
+    assert!(cleanup_integrated_recorded_with_config(&f.h, &f.store, &f.snapshot(), &cfg).is_err());
+    assert!(emitted().is_empty());
+    assert!(f.child(1).exists());
+    assert_eq!(
+        f.store.read().unwrap().agents[0].status,
+        AgentStatus::Reported
+    );
+    assert!(!f.h.panes.borrow().contains_key("ticket:p1"));
+    assert_eq!(
+        cleanup_integrated_recorded_with_config(&f.h, &f.store, &f.snapshot(), &cfg).unwrap(),
+        [1]
+    );
+    f.assert_done(1);
+    assert_eq!(emitted().len(), 1);
+    assert_eq!(emitted()[0]["agent"], "reused-child");
+    assert_eq!(emitted()[0]["task_id"], "child-task");
+    assert_eq!(emitted()[0]["attempt_id"], "child-task-1");
+    assert_eq!(f.h.agents.borrow().len(), 1);
+    assert_eq!(
+        f.h.agents.borrow()[0].name.as_deref(),
+        Some("reused-parent")
+    );
+    assert!(
+        cleanup_integrated_recorded_with_config(&f.h, &f.store, &f.snapshot(), &cfg)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(emitted().len(), 1);
+
+    let ticket = cancel_agents_with_config(&f.h, &f.store, "T-1", "1", 3, &cfg).unwrap();
+    assert_eq!(ticket.state, TicketState::Closed);
+    assert_eq!(emitted().len(), 2);
+    assert_eq!(emitted()[1]["agent"], "reused-parent");
+    assert_eq!(emitted()[1]["role"], "qa");
+    assert_eq!(emitted()[1]["task_id"], "parent-task");
+    assert_eq!(emitted()[1]["attempt_id"], "parent-task-1");
+    assert!(f.h.agents.borrow().is_empty());
+    assert!(f.h.panes.borrow().is_empty());
+    assert_eq!(
+        f.h.closed_tabs.borrow().as_slice(),
+        ["ticket:t1", "ticket:t2"]
+    );
+    // A duplicate ticket close is refused, and cannot repeat retirement effects.
+    assert!(cancel_agents_with_config(&f.h, &f.store, "T-1", "2", 3, &cfg).is_err());
+    assert_eq!(emitted().len(), 2);
+    assert_eq!(f.h.closed_tabs.borrow().len(), 2);
 }
