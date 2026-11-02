@@ -12,7 +12,7 @@ use std::{
 use serde::Serialize;
 
 mod cleanup;
-pub use cleanup::cleanup_integrated_recorded;
+pub use cleanup::{cleanup_integrated_recorded, cleanup_integrated_recorded_with_config};
 
 use crate::{
     error::ShepherdError,

@@ -86,11 +86,18 @@ fn is_lead(data: &StoreData, rec: &AgentRecord) -> bool {
 
 fn ask_lead(ctx: &ApplyContext<'_>, rec: &AgentRecord, text: &str) -> Result<(), ShepherdError> {
     let notify_user = ctx.store.update(|data| {
+        if !data
+            .agents
+            .iter()
+            .any(|a| same_assignment(a, rec) && active(a.status) && a.report.is_none())
+        {
+            return Ok(false);
+        }
         let lead = is_lead(data, rec);
         let Some(current) = data
             .agents
             .iter_mut()
-            .find(|a| a.name == rec.name && active(a.status))
+            .find(|a| same_assignment(a, rec) && active(a.status))
         else {
             return Ok(false);
         };
@@ -127,6 +134,14 @@ fn active(status: AgentStatus) -> bool {
         status,
         AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
     )
+}
+
+/// Legacy records compare as the original assignment; verified assignments
+/// require both identities so delayed terminal callbacks cannot cross rounds.
+fn same_assignment(current: &AgentRecord, expected: &AgentRecord) -> bool {
+    current.name == expected.name
+        && current.task_id == expected.task_id
+        && current.attempt_id == expected.attempt_id
 }
 
 fn cancellable(rec: &AgentRecord) -> bool {
@@ -166,6 +181,9 @@ fn observe_at(
     now: u64,
     data: Option<&StoreData>,
 ) -> Result<(Option<Condition>, Option<AgentInfo>), ShepherdError> {
+    if !active(rec.status) || rec.report.is_some() {
+        return Ok((None, None));
+    }
     let Some(info) = h.agent_get(&rec.name)? else {
         return Ok((
             Some(if rec.prompt_delivery_uncertain() {
@@ -188,9 +206,11 @@ fn observe_at(
         return Ok((Some(Condition::PromptDeliveryUncertain), Some(info)));
     }
     if rec.prompt_delivery_uncertain()
-        && rec
-            .prompt_claim()
-            .is_some_and(|claim| claim.kind != "initial")
+        && rec.prompt_claim().is_some_and(|claim| {
+            claim.kind != "initial"
+                || claim.task_id != rec.task_id
+                || claim.attempt_id != rec.attempt_id
+        })
     {
         rec.status = AgentStatus::Blocked;
         return Ok((Some(Condition::PromptDeliveryUncertain), Some(info)));
@@ -365,13 +385,14 @@ fn save_observation(
         if let Some(current) = data
             .agents
             .iter()
-            .find(|a| a.name == rec.name && active(a.status))
+            .find(|a| same_assignment(a, rec) && active(a.status))
             && current.prompt_delivery_uncertain()
             && !rec.prompt_delivery_uncertain()
-            && (current
-                .prompt_claim()
-                .is_some_and(|claim| claim.kind != "initial")
-                || live.is_none_or(|info| !owned(data, current, info))
+            && (current.prompt_claim().is_some_and(|claim| {
+                claim.kind != "initial"
+                    || claim.task_id != current.task_id
+                    || claim.attempt_id != current.attempt_id
+            }) || live.is_none_or(|info| !owned(data, current, info))
                 || !same_session(current, prior(rec).session_ref.as_deref()))
         {
             return Ok(());
@@ -379,7 +400,7 @@ fn save_observation(
         if let Some(current) = data
             .agents
             .iter_mut()
-            .find(|a| a.name == rec.name && active(a.status))
+            .find(|a| same_assignment(a, rec) && active(a.status))
         {
             current.observed = rec.observed.clone();
             current.last_progress_at = rec.last_progress_at.clone();
@@ -397,6 +418,13 @@ fn log_action(
     now: u64,
 ) -> Result<(), ShepherdError> {
     store.update(|data| {
+        if !data
+            .agents
+            .iter()
+            .any(|a| same_assignment(a, rec) && active(a.status) && a.report.is_none())
+        {
+            return Ok(());
+        }
         if let Some(ticket) = data.tickets.iter_mut().find(|t| t.id == rec.ticket) {
             ticket.history.push(Transition {
                 from: ticket.state,
@@ -408,7 +436,7 @@ fn log_action(
         if let Some(current) = data
             .agents
             .iter_mut()
-            .find(|r| r.name == rec.name && active(r.status))
+            .find(|r| same_assignment(r, rec) && active(r.status))
         {
             let mut obs = prior(current);
             obs.last_action = Some(format!("{decision:?}"));
@@ -427,6 +455,13 @@ fn block(
 ) -> Result<(), ShepherdError> {
     let resolved = roles::resolve(ctx.cfg)?;
     let notify_user = ctx.store.update(|data| {
+        if !data.agents.iter().any(|a| {
+            same_assignment(a, rec)
+                && (active(a.status)
+                    || a.status == AgentStatus::Reported && reason == BlockedReason::Policy)
+        }) {
+            return Ok(None);
+        }
         let lead = is_lead(data, rec);
         let mut notify_user = false;
         let mut ping_lead = false;
@@ -444,7 +479,7 @@ fn block(
         if let Some(current) = data
             .agents
             .iter_mut()
-            .find(|r| r.name == rec.name && active(r.status))
+            .find(|r| same_assignment(r, rec) && active(r.status))
         {
             current.status = AgentStatus::Blocked;
             let mut observation = prior(current);
@@ -466,8 +501,11 @@ fn block(
                 Some(&rec.name),
             );
         }
-        Ok(notify_user)
+        Ok(Some(notify_user))
     })?;
+    let Some(notify_user) = notify_user else {
+        return Ok(());
+    };
     hooks::emit(
         ctx.cfg,
         "agent.escalated",
@@ -493,7 +531,7 @@ pub fn apply(
     let Some(current) = data
         .agents
         .iter()
-        .find(|r| r.name == rec.name && active(r.status) && r.report.is_none())
+        .find(|r| same_assignment(r, rec) && active(r.status) && r.report.is_none())
     else {
         return Ok(());
     };
@@ -506,6 +544,15 @@ pub fn apply(
     }
     let rec = current;
     let live = crate::flock::automatic::recipient(ctx.h, ctx.store, rec, false)?;
+    if !ctx
+        .store
+        .read()?
+        .agents
+        .iter()
+        .any(|a| same_assignment(a, rec) && active(a.status) && a.report.is_none())
+    {
+        return Ok(());
+    }
     let in_worktree = live.is_some();
     match decision {
         Decision::SendKeys { rule, keys } => {
@@ -592,7 +639,7 @@ pub fn apply(
             // Reports do not wait for terminal operation ownership. Escape
             // may have raced the real report; do not close its terminal next.
             let fresh = ctx.store.read()?.agents.into_iter().find(|a| {
-                a.name == rec.name
+                same_assignment(a, rec)
                     && cancellable(a)
                     && a.pane_id == rec.pane_id
                     && a.worktree == rec.worktree
@@ -605,16 +652,21 @@ pub fn apply(
                 if let Some(tab) = &rec.tab_id {
                     ctx.h.close_tab(tab)?;
                 }
-                ctx.store.update(|d| {
-                    if let Some(a) = d
-                        .agents
-                        .iter_mut()
-                        .find(|a| a.name == rec.name && cancellable(a))
-                    {
-                        a.status = AgentStatus::Retired;
-                    }
-                    Ok(())
-                })?;
+                let retired = crate::flock::terminal_gone(ctx.h, &fresh)?
+                    && ctx.store.update(|d| {
+                        if let Some(a) = d
+                            .agents
+                            .iter_mut()
+                            .find(|a| same_assignment(a, rec) && cancellable(a))
+                        {
+                            a.status = AgentStatus::Retired;
+                            return Ok(true);
+                        }
+                        Ok(false)
+                    })?;
+                if retired {
+                    crate::flock::emit_retired(ctx.cfg, rec);
+                }
             }
             // The snapshot only schedules siblings. Never wait on another
             // agent while owning the primary: simultaneous denials must not
@@ -629,7 +681,7 @@ pub fn apply(
                 };
                 let fresh = ctx.store.read()?;
                 let Some(sibling) = fresh.agents.iter().find(|a| {
-                    a.name == candidate.name
+                    same_assignment(a, candidate)
                         && a.ticket == rec.ticket
                         && a.role != "lead"
                         && cancellable(a)
@@ -648,16 +700,21 @@ pub fn apply(
                     if let Some(tab) = &sibling.tab_id {
                         ctx.h.close_tab(tab)?;
                     }
-                    ctx.store.update(|d| {
-                        if let Some(a) = d
-                            .agents
-                            .iter_mut()
-                            .find(|a| a.name == sibling.name && cancellable(a))
-                        {
-                            a.status = AgentStatus::Retired;
-                        }
-                        Ok(())
-                    })?;
+                    let retired = crate::flock::terminal_gone(ctx.h, sibling)?
+                        && ctx.store.update(|d| {
+                            if let Some(a) = d
+                                .agents
+                                .iter_mut()
+                                .find(|a| same_assignment(a, sibling) && cancellable(a))
+                            {
+                                a.status = AgentStatus::Retired;
+                                return Ok(true);
+                            }
+                            Ok(false)
+                        })?;
+                    if retired {
+                        crate::flock::emit_retired(ctx.cfg, sibling);
+                    }
                 }
             }
         }
@@ -767,6 +824,11 @@ fn resume(ctx: &ApplyContext<'_>, rec: &AgentRecord) -> Result<(), ShepherdError
         let Some(a) = data.agents.iter_mut().find(|a| *a == rec) else {
             return Ok(false);
         };
+        if let Some(reference) = &session {
+            let mut observation = prior(a);
+            observation.session_ref = Some(reference.clone());
+            remember(a, &observation);
+        }
         a.restarts = a.restarts.saturating_add(1);
         a.status = AgentStatus::Starting;
         Ok(true)
@@ -790,7 +852,7 @@ fn resume(ctx: &ApplyContext<'_>, rec: &AgentRecord) -> Result<(), ShepherdError
             if let Some(a) = data
                 .agents
                 .iter_mut()
-                .find(|a| a.name == rec.name && active(a.status))
+                .find(|a| same_assignment(a, rec) && active(a.status) && a.report.is_none())
             {
                 a.status = if start == AgentStart::Ready {
                     AgentStatus::Working
@@ -861,6 +923,14 @@ fn respawn(
     if let Some(tab) = &rec.tab_id {
         ctx.h.close_tab(tab)?;
     }
+    if !crate::flock::terminal_gone(ctx.h, rec)? {
+        return block(
+            ctx,
+            rec,
+            BlockedReason::Escalated,
+            "Provider fallback deferred: predecessor terminal has not closed",
+        );
+    }
     if !ctx.store.read()?.agents.contains(rec) {
         return Ok(());
     }
@@ -874,13 +944,14 @@ fn respawn(
             return Ok(false);
         };
         a.runner = runner.name.clone();
+        a.launch_profile = Some(runner.into());
         a.tab_id = Some(tab);
         a.pane_id = Some(pane.clone());
         a.status = AgentStatus::Starting;
         a.prompt_pending = true;
         a.nudges = 0;
-        // This pane starts a new task/session. Keep action history, but none
-        // of the predecessor terminal's session, screen or nudge evidence.
+        // This pane recovers the same assignment in a new session. Preserve
+        // its task identities/payload/history, but discard terminal evidence.
         let observation = Observation {
             tab_workspace_id: Some(workspace.into()),
             actions: prior(a).actions,
@@ -901,6 +972,15 @@ fn respawn(
         &harness.managed_args(harness.launch_args(runner), ctx.state_dir)?,
         &launch_env(ctx.state_dir, &data.project_root),
     )?;
+    if !ctx
+        .store
+        .read()?
+        .agents
+        .iter()
+        .any(|a| same_assignment(a, rec) && active(a.status) && a.report.is_none())
+    {
+        return Ok(());
+    }
     if start == AgentStart::Ready {
         match crate::flock::deliver_pending_prompt(ctx.h, ctx.store, &rec.name) {
             Ok(_) => {}
@@ -917,7 +997,7 @@ fn respawn(
             if let Some(a) = d
                 .agents
                 .iter_mut()
-                .find(|a| a.name == rec.name && active(a.status))
+                .find(|a| same_assignment(a, rec) && active(a.status) && a.report.is_none())
             {
                 a.status = AgentStatus::Blocked;
             }
@@ -1094,11 +1174,9 @@ pub fn supervise_project(
                         >= resolved.supervision.escalate_minutes.saturating_mul(60)
                     && let Condition::Blocked { screen } = &condition
                 {
-                    let current = store
-                        .read()?
-                        .agents
-                        .into_iter()
-                        .find(|a| a.name == rec.name && active(a.status) && a.report.is_none());
+                    let current = store.read()?.agents.into_iter().find(|a| {
+                        same_assignment(a, &rec) && active(a.status) && a.report.is_none()
+                    });
                     if let Some(current) = current
                         && !prior(&current).escalated
                         && h.agent_get(&current.name)?.is_some_and(|live| {
@@ -1131,7 +1209,7 @@ pub fn supervise_project(
                 .read()?
                 .agents
                 .into_iter()
-                .find(|a| a.name == rec.name);
+                .find(|a| same_assignment(a, &rec));
             if let Some(current) = current.filter(|a| active(a.status)) {
                 deliver_pending(h, store, &current)?;
             }
@@ -3784,5 +3862,434 @@ mod tests {
         assert!(crate::flock::retire_automatically(&h, &store, &current).unwrap());
         assert_eq!(store.read().unwrap().agents[1].status, AgentStatus::Retired);
         assert!(!h.calls.borrow().iter().any(|c| c.contains("w-legacy")));
+    }
+
+    #[test]
+    fn earlier_assignment_observation_cannot_change_current_task() {
+        for changed in ["task", "attempt"] {
+            let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/unit5-fixtures");
+            std::fs::create_dir_all(&base).unwrap();
+            let dir = tempfile::tempdir_in(base).unwrap();
+            let (store, cfg, h) = fixture(dir.path());
+            store
+                .update(|data| {
+                    data.agents[0].task_id = Some("task-2".into());
+                    data.agents[0].attempt_id = Some("task-2-1".into());
+                    Ok(())
+                })
+                .unwrap();
+            h.agent_records.borrow_mut()[0].agent_status = "working".into();
+            let callback_store = store.clone();
+            let fired = std::sync::atomic::AtomicBool::new(false);
+            *h.on_get.borrow_mut() = Some(Box::new(move |_| {
+                if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                callback_store
+                    .update(|data| {
+                        let rec = &mut data.agents[0];
+                        if changed == "task" {
+                            rec.task_id = Some("task-3".into());
+                        } else {
+                            rec.attempt_id = Some("task-2-2".into());
+                        }
+                        rec.task = "current assignment must survive".into();
+                        rec.status = AgentStatus::Working;
+                        rec.last_progress_at = "new-clock".into();
+                        rec.observed = Some(r#"{"session_ref":"new-session"}"#.into());
+                        Ok(())
+                    })
+                    .unwrap();
+            }));
+            sweep_ok(&h, &store, &cfg, &dir.path().join("state"), 5000);
+            let data = store.read().unwrap();
+            let current = &data.agents[0];
+            assert_eq!(current.last_progress_at, "new-clock", "{changed}");
+            assert_eq!(current.status, AgentStatus::Working, "{changed}");
+            assert_eq!(
+                current.observed.as_deref(),
+                Some(r#"{"session_ref":"new-session"}"#),
+                "{changed}"
+            );
+            assert!(data.tickets[0].history.is_empty());
+            assert_no_terminal_mutation(&h, current);
+        }
+    }
+
+    fn unit5_dir() -> tempfile::TempDir {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/unit5-fixtures");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::tempdir_in(base).unwrap()
+    }
+
+    #[test]
+    fn late_recovery_completion_cannot_change_current_assignment() {
+        for recovery in [Decision::Resume, Decision::Respawn] {
+            for changed in ["task", "attempt"] {
+                let dir = unit5_dir();
+                let (store, mut cfg, h) = fixture(dir.path());
+                cfg.raw = "[roles.coder]\nrunners=['codex-sol-high','omp-astra']\n"
+                    .parse()
+                    .unwrap();
+                store
+                    .update(|data| {
+                        data.agents[0].task_id = Some("task-2".into());
+                        data.agents[0].attempt_id = Some("task-2-1".into());
+                        Ok(())
+                    })
+                    .unwrap();
+                let rec = store.read().unwrap().agents[0].clone();
+                if recovery == Decision::Resume {
+                    h.agent_records.borrow_mut().clear();
+                    h.pane_cwds
+                        .borrow_mut()
+                        .insert("w1:p1".into(), rec.worktree.clone());
+                }
+                h.start_results.borrow_mut().push_back(AgentStart::NotReady);
+                let callback_store = store.clone();
+                *h.on_start.borrow_mut() = Some(Box::new(move |_| {
+                    callback_store
+                        .update(|data| {
+                            let current = &mut data.agents[0];
+                            if changed == "task" {
+                                current.task_id = Some("task-3".into());
+                            } else {
+                                current.attempt_id = Some("task-2-2".into());
+                            }
+                            current.status = AgentStatus::Working;
+                            current.last_progress_at = "new-clock".into();
+                            Ok(())
+                        })
+                        .unwrap();
+                }));
+                apply(
+                    &ApplyContext {
+                        h: &h,
+                        store: &store,
+                        cfg: &cfg,
+                        state_dir: &dir.path().join("state"),
+                        now_s: 5,
+                    },
+                    &rec,
+                    &recovery,
+                )
+                .unwrap();
+                let data = store.read().unwrap();
+                assert_eq!(
+                    data.agents[0].status,
+                    AgentStatus::Working,
+                    "{recovery:?} {changed}"
+                );
+                assert_eq!(
+                    data.agents[0].last_progress_at, "new-clock",
+                    "{recovery:?} {changed}"
+                );
+                assert!(data.tickets[0].history.is_empty());
+            }
+        }
+    }
+
+    fn reused_assignment(store: &Store) -> AgentRecord {
+        store
+            .update(|data| {
+                data.agents[0].task_id = Some("task-1".into());
+                data.agents[0].attempt_id = Some("task-1-1".into());
+                Ok(())
+            })
+            .unwrap();
+        crate::flock::store_report_for_task(store, "sh-owned-coder-1", Some("task-1"),
+            r#"{"status":"completed","summary":"old task","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+        store
+            .update(|data| {
+                let rec = &mut data.agents[0];
+                rec.task_id = Some("task-2".into());
+                rec.attempt_id = Some("task-2-1".into());
+                rec.task = "current task; report --task-id task-2".into();
+                rec.report = None;
+                rec.status = AgentStatus::Working;
+                rec.prompt_pending = false;
+                Ok(rec.clone())
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn reused_task_survives_native_resume_and_provider_fallback() {
+        for recovery in [Decision::Resume, Decision::Respawn] {
+            let dir = unit5_dir();
+            let (store, mut cfg, h) = fixture(dir.path());
+            cfg.raw = "[roles.coder]\nrunners=['codex-sol-high','omp-astra']\n"
+                .parse()
+                .unwrap();
+            let rec = reused_assignment(&store);
+            h.pane_sessions
+                .borrow_mut()
+                .insert("w1:p1".into(), "current-session".into());
+            if recovery == Decision::Resume {
+                h.agent_records.borrow_mut().clear();
+                h.pane_cwds
+                    .borrow_mut()
+                    .insert("w1:p1".into(), rec.worktree.clone());
+            }
+            apply(
+                &ApplyContext {
+                    h: &h,
+                    store: &store,
+                    cfg: &cfg,
+                    state_dir: &dir.path().join("state"),
+                    now_s: 5,
+                },
+                &rec,
+                &recovery,
+            )
+            .unwrap();
+            let current = store.read().unwrap().agents[0].clone();
+            assert_eq!(current.task_id, rec.task_id);
+            assert_eq!(current.attempt_id, rec.attempt_id);
+            assert_eq!(current.task, rec.task);
+            assert_eq!(current.completed_tasks, rec.completed_tasks);
+            assert!(current.report.is_none());
+            assert!(crate::flock::store_report_for_task(&store, &current.name, Some("task-1"),
+                r#"{"status":"completed","summary":"old task","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).is_err());
+            if recovery == Decision::Respawn {
+                assert_eq!(*h.accepted_prompts.borrow(), vec![rec.name.clone()]);
+                assert!(h.calls.borrow().iter().any(|call| call == &format!("prompt_agent {} {} true", rec.name, rec.task)));
+                assert_eq!(
+                    current.launch_profile,
+                    Some((&roles::resolve(&cfg).unwrap().runners["omp-astra"]).into())
+                );
+            } else {
+                assert!(h.accepted_prompts.borrow().is_empty());
+                assert!(
+                    h.start_args.borrow()[0]
+                        .iter()
+                        .any(|arg| arg == "current-session")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reported_idle_agents_never_receive_supervision_work() {
+        for status in ["idle", "done", "working", "blocked", "exited"] {
+            let dir = unit5_dir();
+            let (store, cfg, h) = fixture(dir.path());
+            reused_assignment(&store);
+            crate::flock::store_report_for_task(&store, "sh-owned-coder-1", Some("task-2"),
+                r#"{"status":"completed","summary":"current done","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+            h.agent_records.borrow_mut()[0].agent_status = status.into();
+            let before = store.read().unwrap().agents[0].clone();
+            assert!(
+                observe(&h, &before, &*harness_for("codex").unwrap())
+                    .unwrap()
+                    .is_none(),
+                "{status}"
+            );
+            let report =
+                supervise_project(&h, &store, &cfg, &dir.path().join("state"), 100000).unwrap();
+            assert!(report.errors.is_empty());
+            assert_eq!((report.observed, report.acted), (0, 0), "{status}");
+            assert_eq!(store.read().unwrap().agents[0], before);
+            assert_no_terminal_mutation(&h, &before);
+        }
+    }
+
+    #[test]
+    fn ambiguous_reused_assignment_keeps_claim_without_recovery() {
+        for status in ["idle", "working", "blocked", "missing"] {
+            let dir = unit5_dir();
+            let (store, cfg, h) = fixture(dir.path());
+            let rec = reused_assignment(&store);
+            store
+                .update(|data| {
+                    let current = &mut data.agents[0];
+                    current.status = AgentStatus::Blocked;
+                    current.set_prompt_delivery_uncertain(true);
+                    current.set_prompt_claim(Some(crate::store::PromptClaim {
+                        task_id: current.task_id.clone(),
+                        attempt_id: current.attempt_id.clone(),
+                        kind: "assignment".into(),
+                        text: current.task.clone(),
+                        queued_ping: None,
+                    }));
+                    Ok(())
+                })
+                .unwrap();
+            let claim = store.read().unwrap().agents[0].prompt_claim();
+            if status == "missing" {
+                h.agent_records.borrow_mut().clear();
+            } else {
+                h.agent_records.borrow_mut()[0].agent_status = status.into();
+            }
+            for now in [100000, 200000] {
+                sweep_ok(&h, &store, &cfg, &dir.path().join("state"), now);
+            }
+            let current = store.read().unwrap().agents[0].clone();
+            assert_eq!(current.prompt_claim(), claim, "{status}");
+            assert!(current.prompt_delivery_uncertain());
+            assert_eq!(current.status, AgentStatus::Blocked);
+            assert_eq!(current.task, rec.task);
+            assert_eq!(current.task_id, rec.task_id);
+            assert_eq!(current.attempt_id, rec.attempt_id);
+            assert_eq!(current.restarts, 0);
+            assert_eq!(current.nudges, 0);
+            assert_eq!(
+                store.read().unwrap().tickets[0].state,
+                TicketState::Building
+            );
+            assert_no_terminal_mutation(&h, &current);
+        }
+    }
+
+    #[test]
+    fn working_signal_cannot_resolve_another_assignments_claim() {
+        for changed in ["task", "attempt"] {
+            let dir = unit5_dir();
+            let (store, cfg, h) = fixture(dir.path());
+            let rec = reused_assignment(&store);
+            store
+                .update(|data| {
+                    let current = &mut data.agents[0];
+                    current.status = AgentStatus::Blocked;
+                    current.set_prompt_delivery_uncertain(true);
+                    current.set_prompt_claim(Some(crate::store::PromptClaim {
+                        task_id: Some(
+                            if changed == "task" {
+                                "task-1"
+                            } else {
+                                "task-2"
+                            }
+                            .into(),
+                        ),
+                        attempt_id: Some(
+                            if changed == "attempt" {
+                                "task-2-0"
+                            } else {
+                                "task-2-1"
+                            }
+                            .into(),
+                        ),
+                        kind: "initial".into(),
+                        text: current.task.clone(),
+                        queued_ping: None,
+                    }));
+                    Ok(())
+                })
+                .unwrap();
+            let claim = store.read().unwrap().agents[0].prompt_claim();
+            h.agent_records.borrow_mut()[0].agent_status = "working".into();
+            sweep_ok(&h, &store, &cfg, &dir.path().join("state"), 100000);
+            let current = store.read().unwrap().agents[0].clone();
+            assert_eq!(current.prompt_claim(), claim, "{changed}");
+            assert!(current.prompt_delivery_uncertain());
+            assert_no_terminal_mutation(&h, &rec);
+        }
+    }
+
+    #[test]
+    fn provider_fallback_waits_for_confirmed_predecessor_shutdown() {
+        let dir = unit5_dir();
+        let (store, mut cfg, h) = fixture(dir.path());
+        cfg.raw = "[roles.coder]\nrunners=['codex-sol-high','omp-astra']\n"
+            .parse()
+            .unwrap();
+        let rec = reused_assignment(&store);
+        h.close_tab_effects.borrow_mut().push_back(false);
+        apply(
+            &ApplyContext {
+                h: &h,
+                store: &store,
+                cfg: &cfg,
+                state_dir: &dir.path().join("state"),
+                now_s: 5,
+            },
+            &rec,
+            &Decision::Respawn,
+        )
+        .unwrap();
+        assert_eq!(h.agent_records.borrow().len(), 1);
+        assert!(
+            !h.calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("start_agent") || call.starts_with("create_tab"))
+        );
+        let current = store.read().unwrap().agents[0].clone();
+        assert_eq!(current.task, rec.task);
+        assert_eq!(current.task_id, rec.task_id);
+        assert_eq!(current.attempt_id, rec.attempt_id);
+        assert_eq!(current.runner, rec.runner);
+    }
+
+    #[test]
+    fn reused_exited_task_is_preserved_after_native_resume_budget() {
+        let dir = unit5_dir();
+        let (store, cfg, h) = fixture(dir.path());
+        let rec = reused_assignment(&store);
+        h.agent_records.borrow_mut().clear();
+        h.pane_cwds
+            .borrow_mut()
+            .insert("w1:p1".into(), rec.worktree.clone());
+        h.pane_sessions
+            .borrow_mut()
+            .insert("w1:p1".into(), "current-session".into());
+        sweep_ok(&h, &store, &cfg, &dir.path().join("state"), 1);
+        assert_eq!(h.start_args.borrow().len(), 1);
+        h.agent_records.borrow_mut().clear();
+        sweep_ok(&h, &store, &cfg, &dir.path().join("state"), 2);
+        let current = store.read().unwrap().agents[0].clone();
+        assert_eq!(current.status, AgentStatus::Blocked);
+        assert_eq!(current.task, rec.task);
+        assert_eq!(current.task_id, rec.task_id);
+        assert_eq!(current.attempt_id, rec.attempt_id);
+        assert_eq!(current.completed_tasks, rec.completed_tasks);
+        assert!(current.report.is_none());
+        assert_eq!(
+            prior(&current).session_ref.as_deref(),
+            Some("current-session")
+        );
+        assert_eq!(h.start_args.borrow().len(), 1);
+        assert!(h.accepted_prompts.borrow().is_empty());
+    }
+
+    #[test]
+    fn late_reconcile_rejection_cannot_block_a_new_attempt() {
+        let dir = unit5_dir();
+        let (store, _cfg, h) = fixture(dir.path());
+        let rec = reused_assignment(&store);
+        store
+            .update(|data| {
+                data.agents[0].prompt_pending = true;
+                Ok(())
+            })
+            .unwrap();
+        h.agent_records.borrow_mut()[0].agent_status = "idle".into();
+        let callback_store = store.clone();
+        *h.on_prompt.borrow_mut() = Some(Box::new(move |_| {
+            callback_store
+                .update(|data| {
+                    let current = &mut data.agents[0];
+                    current.attempt_id = Some("next-attempt".into());
+                    current.status = AgentStatus::Working;
+                    current.prompt_pending = false;
+                    current.set_prompt_delivery_uncertain(false);
+                    current.set_prompt_claim(None);
+                    Ok(())
+                })
+                .unwrap();
+        }));
+        h.prompt_results.borrow_mut().push_back((
+            false,
+            Err(ShepherdError::HerdrCommand {
+                code: "agent_not_ready".into(),
+                message: "late rejection".into(),
+            }),
+        ));
+        assert!(crate::flock::reconcile(&h, &store).is_err());
+        let current = store.read().unwrap().agents[0].clone();
+        assert_eq!(current.status, AgentStatus::Working);
+        assert!(!current.prompt_pending);
+        assert_eq!(current.task_id, rec.task_id);
+        assert_eq!(current.attempt_id.as_deref(), Some("next-attempt"));
     }
 }

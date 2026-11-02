@@ -125,6 +125,7 @@ pub fn launch_with_reservation(
                 .find(|a| a.name == transfer.reserved.name)
                 .ok_or_else(|| ShepherdError::Usage("reuse recipient disappeared".into()))?;
             if current.task_id != transfer.reserved.task_id
+                || current.attempt_id != transfer.reserved.attempt_id
                 || current.report.is_some()
                 || current.status == AgentStatus::Retired
             {
@@ -232,6 +233,11 @@ pub fn launch_with_reservation(
     if !needs_launch {
         return Ok(record);
     }
+    if let Some(transfer) = &transfer
+        && transfer.original.status == AgentStatus::Retired
+    {
+        crate::flock::emit_retired(cfg, &transfer.original);
+    }
     let result = launch_reserved(h, store, &req, cfg, &mut record);
     if result.is_err() {
         // A CLI timeout can follow a successful admission. Retain Starting
@@ -261,7 +267,11 @@ fn save(store: &Store, record: &AgentRecord) -> Result<(), ShepherdError> {
             .ok_or_else(|| ShepherdError::Usage("launch record disappeared".into()))?;
         // Reports can land after the launch reload. Preserve their immutable
         // history and resolved claims along with the accepted result.
-        if stored.status == AgentStatus::Retired || stored.report.is_some() {
+        if stored.task_id != record.task_id
+            || stored.attempt_id != record.attempt_id
+            || stored.status == AgentStatus::Retired
+            || stored.report.is_some()
+        {
             return Ok(());
         }
         *stored = record.clone();

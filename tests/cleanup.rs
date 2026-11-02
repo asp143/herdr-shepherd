@@ -54,6 +54,10 @@ struct LocalHerdr {
     workspaces: RefCell<Vec<Workspace>>,
     removals: RefCell<Vec<String>>,
     agents: RefCell<Vec<AgentInfo>>,
+    closed_tabs: RefCell<Vec<String>>,
+    pane_sessions: RefCell<std::collections::HashMap<String, String>>,
+    close_tab_effects: RefCell<bool>,
+    agent_after_close: RefCell<Option<AgentInfo>>,
     notifications: RefCell<Vec<String>>,
     rewrite_after_remove: RefCell<Option<(String, String)>>,
     require_object_before_remove: RefCell<Option<String>>,
@@ -66,6 +70,25 @@ impl Herdr for LocalHerdr {
     }
     fn agents(&self) -> Result<Vec<AgentInfo>, ShepherdError> {
         Ok(self.agents.borrow().clone())
+    }
+    fn close_tab(&self, tab: &str) -> Result<(), ShepherdError> {
+        self.closed_tabs.borrow_mut().push(tab.into());
+        if *self.close_tab_effects.borrow() {
+            let pane = tab.replace(":t", ":p");
+            self.agents.borrow_mut().retain(|a| a.pane_id != pane);
+            self.pane_sessions.borrow_mut().remove(&pane);
+            if let Some(agent) = self.agent_after_close.borrow_mut().take() {
+                self.agents.borrow_mut().push(agent);
+            }
+        }
+        Ok(())
+    }
+    fn pane_exists(&self, pane: &str) -> Result<bool, ShepherdError> {
+        Ok(self.pane_sessions.borrow().contains_key(pane)
+            || self.agents.borrow().iter().any(|a| a.pane_id == pane))
+    }
+    fn pane_session_ref(&self, pane: &str) -> Result<Option<String>, ShepherdError> {
+        Ok(self.pane_sessions.borrow().get(pane).cloned())
     }
     fn rename_workspace(&self, _: &str, _: &str) -> Result<(), ShepherdError> {
         Ok(())
@@ -224,6 +247,10 @@ impl Repo {
             workspaces: RefCell::new(vec![ws("main", &main, false), ws("ticket", &ticket, true)]),
             removals: RefCell::new(vec![]),
             agents: RefCell::new(vec![]),
+            closed_tabs: RefCell::default(),
+            pane_sessions: RefCell::default(),
+            close_tab_effects: RefCell::new(true),
+            agent_after_close: RefCell::new(None),
             notifications: RefCell::new(vec![]),
             rewrite_after_remove: RefCell::new(None),
             require_object_before_remove: RefCell::new(None),
@@ -1647,4 +1674,312 @@ fn integration_refuses_final_cleanup_intent_before_mutation() {
     );
     cleanup::run(repo.preflight(false).unwrap(), false).unwrap();
     assert_cleanup_finished(&repo);
+}
+
+fn reported_cleanup_agent(repo: &Repo, role: &str, number: u32) {
+    use herdr_shepherd::store::{AgentRecord, AgentStatus, Store};
+    let pane = format!("ticket:p{number}");
+    let session = format!("session-{number}");
+    let name = format!("reused-{role}");
+    let task = format!("{role}-revision");
+    let store = Store::open(&repo.state, &repo.main).unwrap();
+    store
+        .update(|data| {
+            data.agents.push(AgentRecord {
+                name: name.clone(),
+                ticket: "T".into(),
+                role: role.into(),
+                runner: "codex-sol-high".into(),
+                status: AgentStatus::Working,
+                pane_id: Some(pane.clone()),
+                tab_id: Some(format!("ticket:t{number}")),
+                worktree: repo.ticket.clone(),
+                task: format!("verify {role} revision"),
+                report: None,
+                observed: Some(serde_json::json!({"session_ref":session}).to_string()),
+                last_progress_at: "0".into(),
+                nudges: 0,
+                restarts: 0,
+                prompt_pending: false,
+                task_id: Some(task.clone()),
+                attempt_id: Some(format!("{task}-1")),
+                unit: None,
+                launch_profile: None,
+                completed_tasks: vec![],
+                dispatch_reason: Some("reused: eligible reported agent".into()),
+            });
+            Ok(())
+        })
+        .unwrap();
+    herdr_shepherd::flock::store_report_for_task(
+        &store, &name, Some(&task),
+        r#"{"status":"completed","summary":"revision complete","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#,
+    ).unwrap();
+    repo.h.agents.borrow_mut().push(AgentInfo {
+        name: Some(name),
+        agent: "codex".into(),
+        agent_status: "idle".into(),
+        cwd: Some(repo.ticket.clone()),
+        pane_id: pane.clone(),
+        workspace_id: Some("ticket".into()),
+    });
+    repo.h.pane_sessions.borrow_mut().insert(pane, session);
+}
+
+fn retirement_hook(repo: &mut Repo) -> PathBuf {
+    let events = repo._dir.path().join("retirement-events.jsonl");
+    let command: toml::Value = vec![
+        "sh".to_owned(),
+        "-c".into(),
+        "cat >> \"$1\"; printf '\\n' >> \"$1\"".into(),
+        "hook".into(),
+        events.display().to_string(),
+    ]
+    .into();
+    repo.cfg.raw.insert(
+        "hooks".into(),
+        toml::Value::Array(vec![toml::Value::Table(toml::Table::from_iter([
+            ("on".into(), "agent.retired".into()),
+            ("command".into(), command),
+        ]))]),
+    );
+    events
+}
+
+#[test]
+fn cleanup_retires_owned_reported_agents_before_removal() {
+    use herdr_shepherd::store::{AgentStatus, Store};
+    let mut repo = Repo::new();
+    let native = recorded_child(&repo, 1, false);
+    repo.merge();
+    let events = retirement_hook(&mut repo);
+    for (number, role) in [(1, "coder"), (2, "reviewer"), (3, "qa")] {
+        reported_cleanup_agent(&repo, role, number);
+    }
+    let store = Store::open(&repo.state, &repo.main).unwrap();
+    store
+        .update(|data| {
+            data.agents[0].worktree = native.clone();
+            data.agents[0].unit = Some(1);
+            Ok(())
+        })
+        .unwrap();
+    repo.h.agents.borrow_mut()[0].cwd = Some(native.clone());
+    let before = store.read().unwrap().agents;
+    let preflight = repo
+        .preflight(false)
+        .expect("owned idle reported agents should be retired by cleanup");
+    assert_eq!(store.read().unwrap().agents, before);
+    assert!(repo.h.closed_tabs.borrow().is_empty());
+    assert!(!events.exists());
+    let report = cleanup::run(preflight, false).unwrap();
+    assert!(report.workspace_removed);
+    assert!(!repo.ticket.exists());
+    assert!(repo.h.agents.borrow().is_empty());
+    assert!(repo.h.pane_sessions.borrow().is_empty());
+    assert_eq!(repo.h.closed_tabs.borrow().len(), 3);
+    assert!(!native.exists());
+    let emitted: Vec<serde_json::Value> = fs::read_to_string(events)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(emitted.len(), 3);
+    for (index, role) in ["coder", "reviewer", "qa"].into_iter().enumerate() {
+        assert_eq!(emitted[index]["role"], role);
+        assert_eq!(emitted[index]["task_id"], format!("{role}-revision"));
+    }
+    for (old, current) in before.iter().zip(store.read().unwrap().agents) {
+        let mut expected = old.clone();
+        expected.status = AgentStatus::Retired;
+        assert_eq!(current, expected);
+    }
+}
+
+#[test]
+fn dry_run_previews_reported_retirement_without_effects() {
+    use herdr_shepherd::store::Store;
+    let mut repo = Repo::new();
+    repo.merge();
+    let events = retirement_hook(&mut repo);
+    reported_cleanup_agent(&repo, "reviewer", 1);
+    let store = Store::open(&repo.state, &repo.main).unwrap();
+    let before = store.read().unwrap().agents;
+    let refs = ok(&repo.main, &["for-each-ref"]);
+    let report = cleanup::run(
+        repo.preflight(true)
+            .expect("idle agents should permit preview"),
+        true,
+    )
+    .unwrap();
+    assert!(report.dry_run);
+    assert_eq!(store.read().unwrap().agents, before);
+    assert_eq!(ok(&repo.main, &["for-each-ref"]), refs);
+    assert_eq!(repo.h.agents.borrow().len(), 1);
+    assert_eq!(repo.h.pane_sessions.borrow().len(), 1);
+    assert!(repo.h.closed_tabs.borrow().is_empty());
+    assert!(repo.h.removals.borrow().is_empty());
+    assert!(repo.h.notifications.borrow().is_empty());
+    assert!(!events.exists());
+    assert!(repo.ticket.exists());
+}
+
+#[test]
+fn cleanup_requires_physical_reported_process_shutdown() {
+    use herdr_shepherd::store::{AgentStatus, Store};
+    let repo = Repo::new();
+    repo.merge();
+    reported_cleanup_agent(&repo, "coder", 1);
+    *repo.h.close_tab_effects.borrow_mut() = false;
+    let preflight = repo
+        .preflight(false)
+        .expect("verified idle agent is a retirement candidate");
+    assert!(cleanup::run(preflight, false).is_err());
+    assert!(repo.ticket.exists());
+    assert!(repo.h.removals.borrow().is_empty());
+    assert_eq!(repo.h.closed_tabs.borrow().len(), 1);
+    assert_eq!(repo.h.agents.borrow().len(), 1);
+    assert_eq!(
+        Store::open(&repo.state, &repo.main)
+            .unwrap()
+            .read()
+            .unwrap()
+            .agents[0]
+            .status,
+        AgentStatus::Reported
+    );
+}
+
+#[test]
+fn cleanup_refuses_unverified_reported_recipients() {
+    use herdr_shepherd::store::{PromptClaim, Store};
+    for change in [
+        "pane",
+        "session",
+        "workspace",
+        "working",
+        "uncertain",
+        "claim",
+        "missing-session",
+    ] {
+        let repo = Repo::new();
+        repo.merge();
+        reported_cleanup_agent(&repo, "coder", 1);
+        match change {
+            "pane" => repo.h.agents.borrow_mut()[0].pane_id = "ticket:other".into(),
+            "session" => {
+                repo.h
+                    .pane_sessions
+                    .borrow_mut()
+                    .insert("ticket:p1".into(), "replacement".into());
+            }
+            "workspace" => repo.h.agents.borrow_mut()[0].workspace_id = Some("unowned".into()),
+            "working" => repo.h.agents.borrow_mut()[0].agent_status = "working".into(),
+            "uncertain" | "claim" | "missing-session" => {
+                Store::open(&repo.state, &repo.main)
+                    .unwrap()
+                    .update(|data| {
+                        let rec = &mut data.agents[0];
+                        if change == "uncertain" {
+                            rec.set_prompt_delivery_uncertain(true);
+                        } else if change == "claim" {
+                            let claim = PromptClaim {
+                                task_id: rec.task_id.clone(),
+                                attempt_id: rec.attempt_id.clone(),
+                                kind: "assignment".into(),
+                                text: "possibly pending".into(),
+                                queued_ping: None,
+                            };
+                            let mut observed: serde_json::Value =
+                                serde_json::from_str(rec.observed.as_deref().unwrap()).unwrap();
+                            observed["prompt_claim"] = serde_json::to_value(claim).unwrap();
+                            rec.observed = Some(observed.to_string());
+                        } else {
+                            rec.observed = None;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(repo.preflight(false).is_err(), "accepted {change}");
+        assert!(repo.h.closed_tabs.borrow().is_empty(), "closed {change}");
+        assert!(repo.h.removals.borrow().is_empty());
+        assert!(repo.ticket.exists());
+    }
+}
+
+#[test]
+fn cleanup_rechecks_planned_reported_agent_before_closing() {
+    for change in ["record", "session", "working", "new-agent"] {
+        let repo = Repo::new();
+        repo.merge();
+        reported_cleanup_agent(&repo, "coder", 1);
+        let preflight = repo
+            .preflight(false)
+            .expect("owned idle recipient should be planned");
+        match change {
+            "record" => herdr_shepherd::store::Store::open(&repo.state, &repo.main)
+                .unwrap()
+                .update(|data| {
+                    data.agents[0].attempt_id = Some("replacement-attempt".into());
+                    Ok(())
+                })
+                .unwrap(),
+            "session" => {
+                repo.h
+                    .pane_sessions
+                    .borrow_mut()
+                    .insert("ticket:p1".into(), "replacement".into());
+            }
+            "working" => repo.h.agents.borrow_mut()[0].agent_status = "working".into(),
+            "new-agent" => {
+                let mut live = repo.h.agents.borrow()[0].clone();
+                live.name = Some("unowned".into());
+                live.pane_id = "ticket:other".into();
+                repo.h.agents.borrow_mut().push(live);
+            }
+            _ => unreachable!(),
+        }
+        assert!(cleanup::run(preflight, false).is_err(), "accepted {change}");
+        assert!(repo.h.closed_tabs.borrow().is_empty(), "closed {change}");
+        assert!(repo.h.removals.borrow().is_empty());
+        assert!(repo.ticket.exists());
+    }
+}
+
+#[test]
+fn cleanup_keeps_actual_no_agents_check_after_reported_retirement() {
+    use herdr_shepherd::store::{AgentStatus, Store};
+    let repo = Repo::new();
+    repo.merge();
+    reported_cleanup_agent(&repo, "coder", 1);
+    let preflight = repo.preflight(false).unwrap();
+    *repo.h.agent_after_close.borrow_mut() = Some(AgentInfo {
+        name: Some("unowned-late-process".into()),
+        agent: "codex".into(),
+        agent_status: "working".into(),
+        cwd: Some(repo.ticket.clone()),
+        pane_id: "ticket:other".into(),
+        workspace_id: Some("ticket".into()),
+    });
+    assert!(cleanup::run(preflight, false).is_err());
+    assert!(repo.ticket.exists());
+    assert!(repo.h.removals.borrow().is_empty());
+    assert_eq!(repo.h.closed_tabs.borrow().len(), 1);
+    assert_eq!(repo.h.agents.borrow().len(), 1);
+    assert_eq!(
+        repo.h.agents.borrow()[0].name.as_deref(),
+        Some("unowned-late-process")
+    );
+    assert_eq!(
+        Store::open(&repo.state, &repo.main)
+            .unwrap()
+            .read()
+            .unwrap()
+            .agents[0]
+            .status,
+        AgentStatus::Retired
+    );
 }

@@ -479,14 +479,51 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 &state_dir(cli),
             )?;
             let h = CliHerdr::from_env();
-            let preflight = herdr_shepherd::cleanup::preflight_with_state(
+            let transport = herdr_shepherd::gate::transport::PushTransport::open(
+                &state_dir(cli),
+                Path::new(&root),
+            )?;
+            let store =
+                herdr_shepherd::store::Store::open(&state_dir(cli), &transport.trust.project_root)?;
+            let worktree = Path::new(&root)
+                .canonicalize()
+                .map_err(anyhow::Error::from)?;
+            let ticket = store
+                .read()?
+                .tickets
+                .into_iter()
+                .find(|ticket| ticket.worktree.as_deref() == Some(worktree.as_path()))
+                .ok_or_else(|| {
+                    ShepherdError::PolicyDenied("cleanup requires a stored ticket worktree".into())
+                })?;
+            // Drain all admitted launches before planning retirement and keep
+            // admission excluded until the physical cleanup has finished.
+            let _hooks = herdr_shepherd::hooks::defer();
+            let _dispatch = herdr_shepherd::ticket::revise::dispatch_lock(&store, &ticket.id)?;
+            let _operation = herdr_shepherd::ticket::operation::exclusive(&store, &ticket.id)?;
+            let current = store.read()?;
+            let owners: Vec<_> = current
+                .tickets
+                .iter()
+                .filter(|candidate| candidate.worktree.as_deref() == Some(worktree.as_path()))
+                .collect();
+            if owners.len() != 1
+                || owners[0].id != ticket.id
+                || owners[0].branch != ticket.branch
+                || owners[0].workspace_id != ticket.workspace_id
+            {
+                return Err(ShepherdError::PolicyDenied(
+                    "cleanup ticket ownership changed while admission drained".into(),
+                ));
+            }
+            let preflight = herdr_shepherd::cleanup::preflight_with_transport(
                 &h,
                 github_client(&state_dir(cli))?.as_ref(),
                 &cfg,
-                Path::new(&root),
+                &worktree,
                 *force_discard,
                 *dry_run,
-                &state_dir(cli),
+                transport,
             )?;
             let report = herdr_shepherd::cleanup::run(preflight, *dry_run)?;
             output::emit(cli.json, &report, || {

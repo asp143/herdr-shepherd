@@ -66,6 +66,7 @@ pub(crate) fn known_hook_event(event: &str) -> bool {
             | "ticket.cleaned_up"
             | "ticket.closed"
             | "agent.spawned"
+            | "agent.reported"
             | "agent.retired"
             | "agent.unblocked"
             | "agent.escalated"

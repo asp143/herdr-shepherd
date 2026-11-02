@@ -644,3 +644,60 @@ fn recipient_becoming_busy_before_input_cannot_duplicate_writers() {
     assert_eq!(store.read().unwrap().agents[0].status, AgentStatus::Retired);
     assert_eq!(next.status, AgentStatus::Working);
 }
+
+#[test]
+fn late_reuse_delivery_cannot_change_a_new_attempt() {
+    let (dir, store, h, cfg, old) = fixture("coder");
+    let callback_store = store.clone();
+    *h.on_prompt.borrow_mut() = Some(Box::new(move |name| {
+        callback_store
+            .update(|data| {
+                let current = data.agents.iter_mut().find(|a| a.name == name).unwrap();
+                current.attempt_id = Some("new-recovery-attempt".into());
+                current.dispatch_reason = Some("new attempt is authoritative".into());
+                let mut claim = current.prompt_claim().unwrap();
+                claim.attempt_id = current.attempt_id.clone();
+                current.set_prompt_claim(Some(claim));
+                Ok(())
+            })
+            .unwrap();
+    }));
+    h.prompt_results.borrow_mut().push_back((
+        true,
+        Err(ShepherdError::HerdrCommand {
+            code: "timeout".into(),
+            message: "late timeout".into(),
+        }),
+    ));
+    let current = crate::flock::spawn(&h, &store, &cfg, request(dir.path(), "coder")).unwrap();
+    assert_eq!(current.name, old.name);
+    assert_eq!(current.attempt_id.as_deref(), Some("new-recovery-attempt"));
+    assert_eq!(
+        current.dispatch_reason.as_deref(),
+        Some("new attempt is authoritative")
+    );
+    assert_eq!(store.read().unwrap().agents.len(), 1);
+}
+
+#[test]
+fn late_launch_save_cannot_restore_an_earlier_assignment() {
+    for changed in ["task", "attempt"] {
+        let (_dir, store, _h, _cfg, old) = fixture("coder");
+        let current = store
+            .update(|data| {
+                let current = &mut data.agents[0];
+                current.report = None;
+                current.status = AgentStatus::Working;
+                if changed == "task" {
+                    current.task_id = Some("next-task".into());
+                } else {
+                    current.attempt_id = Some("next-attempt".into());
+                }
+                current.task = "current payload".into();
+                Ok(current.clone())
+            })
+            .unwrap();
+        save(&store, &old).unwrap();
+        assert_eq!(store.read().unwrap().agents[0], current, "{changed}");
+    }
+}

@@ -358,6 +358,7 @@ pub(super) fn admit(
             .find(|a| a.name == reserved.name)
             .expect("reserved record retained");
         if current.task_id != reserved.task_id
+            || current.attempt_id != reserved.attempt_id
             || current.report.is_some()
             || current.status == AgentStatus::Retired
         {
@@ -401,6 +402,7 @@ pub(super) fn admit(
                             .find(|a| a.name == reserved.name)
                             .expect("record retained");
                         if rec.task_id == reserved.task_id
+                            && rec.attempt_id == reserved.attempt_id
                             && rec.report.is_none()
                             && rec.status != AgentStatus::Retired
                         {
@@ -446,13 +448,16 @@ pub(super) fn admit(
             if !stopped {
                 let current = store.update(|data| {
                     let rec = data.agents.iter_mut().find(|a| a.name == reserved.name).expect("record retained");
-                    if rec.task_id == reserved.task_id && rec.report.is_none() && rec.status != AgentStatus::Retired {
+                    if rec.task_id == reserved.task_id && rec.attempt_id == reserved.attempt_id && rec.report.is_none() && rec.status != AgentStatus::Retired {
                         rec.dispatch_reason = Some("reused: rejected delivery; task pending until busy predecessor is confirmed stopped".into());
                     }
                     Ok(rec.clone())
                 })?;
                 return Ok(Admission::Reused(Box::new(current)));
             }
+            // Transfer restores this retired predecessor in the same store
+            // transaction that reserves its replacement. That transaction's
+            // caller emits agent.retired only after the retirement is durable.
             original.status = AgentStatus::Retired;
         }
         return Ok(Admission::Fresh {

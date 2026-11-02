@@ -87,7 +87,27 @@ fn verify_owned(store: &Store, h: &dyn Herdr, ticket: &Ticket) -> Result<(), She
     Ok(())
 }
 
-pub(crate) fn retire_flock(store: &Store, h: &dyn Herdr, id: &str) -> Result<(), ShepherdError> {
+#[cfg(test)]
+fn retire_flock(store: &Store, h: &dyn Herdr, id: &str) -> Result<(), ShepherdError> {
+    retire_flock_inner(store, h, id, None)
+}
+
+pub(crate) fn retire_flock_with_config(
+    store: &Store,
+    h: &dyn Herdr,
+    id: &str,
+    cfg: &Config,
+) -> Result<(), ShepherdError> {
+    retire_flock_inner(store, h, id, Some(cfg))
+}
+
+fn retire_flock_inner(
+    store: &Store,
+    h: &dyn Herdr,
+    id: &str,
+    cfg: Option<&Config>,
+) -> Result<(), ShepherdError> {
+    let _hooks = crate::hooks::defer();
     for agent in store.read()?.agents.into_iter().filter(|agent| {
         agent.ticket == id
             && matches!(
@@ -98,7 +118,12 @@ pub(crate) fn retire_flock(store: &Store, h: &dyn Herdr, id: &str) -> Result<(),
                     | AgentStatus::Reported
             )
     }) {
-        if !crate::flock::retire_automatically(h, store, &agent)? {
+        let retired = if let Some(cfg) = cfg {
+            crate::flock::retire_automatically_with_config(h, store, &agent, cfg)?
+        } else {
+            crate::flock::retire_automatically(h, store, &agent)?
+        };
+        if !retired {
             return Err(ShepherdError::PolicyDenied(format!(
                 "{}: automatic retirement deferred; resources kept",
                 agent.name
@@ -326,7 +351,7 @@ fn handle_with_context(
             }
         }
         if ticket.blocked_reason == Some(BlockedReason::Escalated) {
-            retire_flock(store, h, id)?;
+            retire_flock_with_config(store, h, id, cfg)?;
         }
         return Ok(MergeOutcome::Unchanged);
     }
@@ -344,7 +369,7 @@ fn handle_with_context(
         return Err(error);
     }
     if ticket.state == TicketState::Closed {
-        retire_flock(store, h, id)?;
+        retire_flock_with_config(store, h, id, cfg)?;
         return Ok(MergeOutcome::Unchanged);
     }
     let notifier = Notifier::new(h, cfg.upkeep.notifications);
@@ -359,7 +384,7 @@ fn handle_with_context(
             "ticket.closed",
             &serde_json::json!({"ticket":id,"pr":status.number}),
         );
-        retire_flock(store, h, id)?;
+        retire_flock_with_config(store, h, id, cfg)?;
         return Ok(MergeOutcome::Closed);
     }
     if status.merged_at.as_deref().is_none_or(str::is_empty) {
@@ -389,7 +414,7 @@ fn handle_with_context(
                     now,
                     &format!("{id}: cannot verify merged worktree: {error}"),
                 )?;
-                retire_flock(store, h, id)?;
+                retire_flock_with_config(store, h, id, cfg)?;
                 return Ok(outcome);
             }
         }
@@ -400,7 +425,7 @@ fn handle_with_context(
             ticket.worktree.as_deref().unwrap().display()
         );
         let outcome = escalate(store, h, cfg, id, now, &message)?;
-        if let Err(error) = retire_flock(store, h, id) {
+        if let Err(error) = retire_flock_with_config(store, h, id, cfg) {
             notifier.send(
                 &format!("{id}: flock retirement failed"),
                 &error.to_string(),
@@ -418,7 +443,7 @@ fn handle_with_context(
         );
     }
     let cleanup = (|| {
-        retire_flock(store, h, id)?;
+        retire_flock_with_config(store, h, id, cfg)?;
         verify_children(ticket, h)?;
         let preflight = crate::cleanup::preflight_with_transport(
             h,
@@ -547,6 +572,9 @@ mod tests {
                 return Err(anyhow::anyhow!("fixture retirement failed").into());
             }
             self.fake.send_keys(name, keys)
+        }
+        fn pane_exists(&self, pane: &str) -> Result<bool, ShepherdError> {
+            self.fake.pane_exists(pane)
         }
         fn close_tab(&self, tab: &str) -> Result<(), ShepherdError> {
             self.fake.close_tab(tab)

@@ -246,6 +246,25 @@ pub fn cleanup_integrated_recorded(
     store: &Store,
     expected: &Ticket,
 ) -> Result<Vec<u32>, ShepherdError> {
+    cleanup_integrated_inner(h, store, expected, None)
+}
+
+pub fn cleanup_integrated_recorded_with_config(
+    h: &dyn Herdr,
+    store: &Store,
+    expected: &Ticket,
+    cfg: &crate::config::Config,
+) -> Result<Vec<u32>, ShepherdError> {
+    cleanup_integrated_inner(h, store, expected, Some(cfg))
+}
+
+fn cleanup_integrated_inner(
+    h: &dyn Herdr,
+    store: &Store,
+    expected: &Ticket,
+    cfg: Option<&crate::config::Config>,
+) -> Result<Vec<u32>, ShepherdError> {
+    let _hooks = crate::hooks::defer();
     let ticket_wt = expected.worktree.as_deref().ok_or_else(denied)?;
     let _lock = integration_lock(ticket_wt)?;
     if git(ticket_wt, &["branch", "--show-current"])? != expected.branch {
@@ -323,7 +342,7 @@ pub fn cleanup_integrated_recorded(
                 .find(|r| r.child == original.child)
                 .ok_or_else(denied)?;
             validate_receipt(ticket, receipt, &fresh.agents)?;
-            if !crate::flock::automatic::retire_for_cleanup(h, store, agent, receipt)? {
+            if !crate::flock::automatic::retire_for_cleanup(h, store, agent, receipt, cfg)? {
                 return Err(ShepherdError::PolicyDenied(format!(
                     "{}: automatic retirement deferred; child resources kept",
                     agent.name
