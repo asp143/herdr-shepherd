@@ -212,6 +212,18 @@ enum TicketCommands {
     Integrate {
         id: String,
     },
+    /// Accept a saved legacy report or discard ambiguous reports and redispatch.
+    Reconcile {
+        id: String,
+        #[arg(
+            long,
+            required_unless_present = "discard_reports",
+            conflicts_with = "discard_reports"
+        )]
+        accept_report: Option<String>,
+        #[arg(long)]
+        discard_reports: bool,
+    },
     Transition {
         id: String,
         #[arg(long)]
@@ -479,14 +491,51 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                 &state_dir(cli),
             )?;
             let h = CliHerdr::from_env();
-            let preflight = herdr_shepherd::cleanup::preflight_with_state(
+            let transport = herdr_shepherd::gate::transport::PushTransport::open(
+                &state_dir(cli),
+                Path::new(&root),
+            )?;
+            let store =
+                herdr_shepherd::store::Store::open(&state_dir(cli), &transport.trust.project_root)?;
+            let worktree = Path::new(&root)
+                .canonicalize()
+                .map_err(anyhow::Error::from)?;
+            let ticket = store
+                .read()?
+                .tickets
+                .into_iter()
+                .find(|ticket| ticket.worktree.as_deref() == Some(worktree.as_path()))
+                .ok_or_else(|| {
+                    ShepherdError::PolicyDenied("cleanup requires a stored ticket worktree".into())
+                })?;
+            // Drain all admitted launches before planning retirement and keep
+            // admission excluded until the physical cleanup has finished.
+            let _hooks = herdr_shepherd::hooks::defer();
+            let _dispatch = herdr_shepherd::ticket::revise::dispatch_lock(&store, &ticket.id)?;
+            let _operation = herdr_shepherd::ticket::operation::exclusive(&store, &ticket.id)?;
+            let current = store.read()?;
+            let owners: Vec<_> = current
+                .tickets
+                .iter()
+                .filter(|candidate| candidate.worktree.as_deref() == Some(worktree.as_path()))
+                .collect();
+            if owners.len() != 1
+                || owners[0].id != ticket.id
+                || owners[0].branch != ticket.branch
+                || owners[0].workspace_id != ticket.workspace_id
+            {
+                return Err(ShepherdError::PolicyDenied(
+                    "cleanup ticket ownership changed while admission drained".into(),
+                ));
+            }
+            let preflight = herdr_shepherd::cleanup::preflight_with_transport(
                 &h,
                 github_client(&state_dir(cli))?.as_ref(),
                 &cfg,
-                Path::new(&root),
+                &worktree,
                 *force_discard,
                 *dry_run,
-                &state_dir(cli),
+                transport,
             )?;
             let report = herdr_shepherd::cleanup::run(preflight, *dry_run)?;
             output::emit(cli.json, &report, || {
@@ -681,6 +730,30 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                     )?;
                     output::emit(cli.json, &result, || {
                         serde_json::to_string_pretty(&result).expect("serializable")
+                    });
+                }
+                TicketCommands::Reconcile {
+                    id,
+                    accept_report,
+                    discard_reports,
+                } => {
+                    let store = herdr_shepherd::store::Store::open(&state_dir(cli), &project)?;
+                    let cfg = herdr_shepherd::trusted::committed_config(
+                        &config::resolve_config_dir(cli.config_dir.as_deref()),
+                        &project,
+                        None,
+                        &state_dir(cli),
+                    )?;
+                    let ticket = herdr_shepherd::ticket::revise::reconcile_legacy_reports(
+                        &store,
+                        &cfg,
+                        id,
+                        accept_report.as_deref(),
+                        *discard_reports,
+                        &herdr_shepherd::launch::now(),
+                    )?;
+                    output::emit(cli.json, &ticket, || {
+                        serde_json::to_string_pretty(&ticket).expect("serializable")
                     });
                 }
                 TicketCommands::Transition { id, to, reason } => {
@@ -894,6 +967,13 @@ fn herdr_client() -> Result<Box<dyn Herdr>, ShepherdError> {
                 .get("agents")
                 .cloned()
                 .unwrap_or(serde_json::json!([])),
+        )
+        .map_err(anyhow::Error::from)?;
+        *h.pane_sessions.borrow_mut() = serde_json::from_value(
+            value
+                .get("pane_sessions")
+                .cloned()
+                .unwrap_or(serde_json::json!({})),
         )
         .map_err(anyhow::Error::from)?;
         return Ok(Box::new(h));

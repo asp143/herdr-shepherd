@@ -434,6 +434,8 @@ fn revision_stages_keep_the_dispatched_ticket_workspace() {
                     synced_sha: Some(head.clone()),
                     stage,
                     agent: None,
+                    task_id: None,
+                    attempt_id: None,
                     tested_sha: None,
                 });
                 Ok(())

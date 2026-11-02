@@ -15,6 +15,26 @@ pub enum AgentStart {
     NotReady,
 }
 
+/// Identity observed for an existing harness. Callers must hold admission locks
+/// while reserving the assignment and submitting it to this exact recipient.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskRecipient {
+    pub name: String,
+    pub harness: String,
+    pub pane_id: String,
+    pub session_ref: String,
+}
+
+/// Only Accepted acknowledges the waited prompt. Ambiguous must never trigger
+/// an automatic retry or replacement writer until the old recipient is stopped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskDelivery {
+    Accepted,
+    Rejected { reason: String },
+    Dead { reason: String },
+    Ambiguous { reason: String },
+}
+
 fn unsupported(operation: &str) -> ShepherdError {
     anyhow::anyhow!("Herdr adapter does not support {operation}").into()
 }
@@ -55,6 +75,67 @@ pub trait Herdr {
         _until_working: bool,
     ) -> Result<(), ShepherdError> {
         Err(unsupported("prompt_agent"))
+    }
+    /// Submit a new assignment, rather than an ordinary followup or nudge.
+    /// Err means preflight failed before any input was sent. Once submission
+    /// begins, every outcome (including a transport error) is a TaskDelivery.
+    /// This does not reserve assignments: callers must serialize dispatch and
+    /// persist task intent first. It never retries, starts or stops a process.
+    fn deliver_task(
+        &self,
+        recipient: &TaskRecipient,
+        text: &str,
+    ) -> Result<TaskDelivery, ShepherdError> {
+        if text.trim().is_empty() {
+            return Ok(TaskDelivery::Rejected {
+                reason: "empty task".into(),
+            });
+        }
+        if crate::harness::harness_for(&recipient.harness).is_err() {
+            return Ok(TaskDelivery::Rejected {
+                reason: "unsupported harness".into(),
+            });
+        }
+        let Some(info) = self.agent_get(&recipient.name)? else {
+            return Ok(TaskDelivery::Dead {
+                reason: "recipient no longer exists".into(),
+            });
+        };
+        if info.name.as_deref() != Some(recipient.name.as_str())
+            || info.agent != recipient.harness
+            || info.pane_id != recipient.pane_id
+            || recipient.pane_id.is_empty()
+            || recipient.session_ref.is_empty()
+            || self.pane_session_ref(&recipient.pane_id)?.as_deref()
+                != Some(recipient.session_ref.as_str())
+        {
+            return Ok(TaskDelivery::Rejected {
+                reason: "recipient identity or session changed".into(),
+            });
+        }
+        if !matches!(info.agent_status.as_str(), "idle" | "done") {
+            return Ok(TaskDelivery::Rejected {
+                reason: "recipient is not idle or done".into(),
+            });
+        }
+        Ok(match self.prompt_agent(&recipient.name, text, true) {
+            Ok(()) => TaskDelivery::Accepted,
+            Err(error) => {
+                // Unknown failures can follow a partial PTY write or acceptance.
+                // Preserve only the protocol code, never prompt/server prose.
+                let code = error.herdr_code().unwrap_or("transport_error");
+                let reason = format!("task prompt: {code}");
+                match code {
+                    "agent_blocked" | "agent_not_ready" | "empty_agent_prompt" => {
+                        TaskDelivery::Rejected { reason }
+                    }
+                    "agent_not_found" | "not_found" | "agent_target_not_found" => {
+                        TaskDelivery::Dead { reason }
+                    }
+                    _ => TaskDelivery::Ambiguous { reason },
+                }
+            }
+        })
     }
     fn send_keys(&self, _name: &str, _keys: &[String]) -> Result<(), ShepherdError> {
         Err(unsupported("send_keys"))
@@ -109,3 +190,6 @@ pub trait Herdr {
 }
 #[cfg(any(test, debug_assertions, feature = "test-support"))]
 pub mod fake;
+
+#[cfg(test)]
+mod delivery_tests;

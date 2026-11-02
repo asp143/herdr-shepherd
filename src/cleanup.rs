@@ -136,6 +136,7 @@ pub struct Preflight<'a> {
     target: Target,
     children: Vec<Target>,
     removed_children: Vec<Target>,
+    retiring_agents: Vec<crate::store::AgentRecord>,
     ticket: crate::store::Ticket,
     proof: MergeProof,
     policy: BranchPolicy,
@@ -493,40 +494,139 @@ fn check_tree_set(
     Ok(())
 }
 
+fn related_agent(
+    agent: &crate::herdr::AgentInfo,
+    targets: &[&Target],
+    records: &[crate::store::AgentRecord],
+) -> bool {
+    let cwd = agent
+        .cwd
+        .as_ref()
+        .map(|cwd| cwd.canonicalize().unwrap_or_else(|_| cwd.clone()));
+    targets.iter().any(|target| {
+        target
+            .workspace
+            .as_ref()
+            .is_some_and(|id| agent.workspace_id.as_ref() == Some(id))
+            || cwd
+                .as_ref()
+                .is_some_and(|cwd| cwd.starts_with(&target.path))
+            || records.iter().any(|record| {
+                agent.name.as_deref() == Some(record.name.as_str())
+                    && record.pane_id.as_deref() == Some(agent.pane_id.as_str())
+                    && record
+                        .worktree
+                        .canonicalize()
+                        .unwrap_or_else(|_| record.worktree.clone())
+                        .starts_with(&target.path)
+            })
+    })
+}
+
+fn agents_present() -> ShepherdError {
+    ShepherdError::Usage("worktree still has agents; retire them before cleanup".into())
+}
+
 fn check_agents(
     h: &dyn Herdr,
     targets: &[&Target],
     records: &[crate::store::AgentRecord],
 ) -> Result<(), ShepherdError> {
     for agent in h.agents()? {
-        let cwd = agent
-            .cwd
-            .as_ref()
-            .map(|cwd| cwd.canonicalize().unwrap_or_else(|_| cwd.clone()));
-        if targets.iter().any(|target| {
-            target
-                .workspace
-                .as_ref()
-                .is_some_and(|id| agent.workspace_id.as_ref() == Some(id))
-                || cwd
-                    .as_ref()
-                    .is_some_and(|cwd| cwd.starts_with(&target.path))
-                || records.iter().any(|record| {
-                    agent.name.as_deref() == Some(record.name.as_str())
-                        && record.pane_id.as_deref() == Some(agent.pane_id.as_str())
-                        && record
-                            .worktree
-                            .canonicalize()
-                            .unwrap_or_else(|_| record.worktree.clone())
-                            .starts_with(&target.path)
-                })
-        }) {
-            return Err(ShepherdError::Usage(
-                "worktree still has agents; retire them before cleanup".into(),
-            ));
+        if related_agent(&agent, targets, records) {
+            return Err(agents_present());
         }
     }
     Ok(())
+}
+
+// Preflight may plan retirement, but never treats a reported record as proof
+// that its process has stopped. Execution retains the strict physical checks.
+fn planned_retirements(
+    h: &dyn Herdr,
+    targets: &[&Target],
+    data: &crate::store::StoreData,
+    ticket: &crate::store::Ticket,
+) -> Result<Vec<crate::store::AgentRecord>, ShepherdError> {
+    let mut retiring = Vec::new();
+    // Live enumeration cannot recover a close whose acknowledgement was lost.
+    // Only a previously journaled exact recipient may be reconciled as gone.
+    for expected in data
+        .cleanup_retiring_agents
+        .iter()
+        .filter(|rec| rec.ticket == ticket.id)
+    {
+        let current = data
+            .agents
+            .iter()
+            .find(|current| crate::flock::automatic::same_retirement_identity(expected, current));
+        let Some(current) = current else {
+            return Err(ShepherdError::PolicyDenied(
+                "cleanup retirement intent changed; resources kept".into(),
+            ));
+        };
+        if current.status == crate::store::AgentStatus::Retired {
+            continue;
+        }
+        if current.ticket != ticket.id
+            || current.status != crate::store::AgentStatus::Reported
+            || !targets.iter().any(|target| {
+                current
+                    .worktree
+                    .canonicalize()
+                    .unwrap_or_else(|_| expected.worktree.clone())
+                    .starts_with(&target.path)
+            })
+        {
+            return Err(ShepherdError::PolicyDenied(
+                "cleanup retirement intent changed; resources kept".into(),
+            ));
+        }
+        retiring.push(current.clone());
+    }
+    for agent in h.agents()? {
+        if !related_agent(&agent, targets, &data.agents) {
+            continue;
+        }
+        let rec = data
+            .agents
+            .iter()
+            .find(|rec| {
+                agent.name.as_deref() == Some(rec.name.as_str())
+                    && rec.pane_id.as_deref() == Some(agent.pane_id.as_str())
+                    && rec.ticket == ticket.id
+                    && rec.status == crate::store::AgentStatus::Reported
+            })
+            .ok_or_else(agents_present)?;
+        let observation: serde_json::Value = rec
+            .observed
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok())
+            .unwrap_or_default();
+        let session = observation
+            .get("session_ref")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(agents_present)?;
+        if !matches!(agent.agent_status.as_str(), "idle" | "done")
+            || rec.tab_id.as_deref().is_none_or(str::is_empty)
+            || rec.prompt_pending
+            || rec.prompt_delivery_uncertain()
+            || rec.prompt_claim().is_some()
+            || !crate::supervise::owned(data, rec, &agent)
+            || h.pane_session_ref(&agent.pane_id)?.as_deref() != Some(session)
+            || rec
+                .launch_profile
+                .as_ref()
+                .is_some_and(|profile| profile.harness != agent.agent)
+        {
+            return Err(agents_present());
+        }
+        if !retiring.contains(rec) {
+            retiring.push(rec.clone());
+        }
+    }
+    Ok(retiring)
 }
 
 /// `dry_run` avoids fetch as well as mutations. Fetching would otherwise change
@@ -782,7 +882,7 @@ pub fn preflight_with_transport<'a>(
         check_tree_set(&trees, &target, &children)?;
         let mut targets = vec![&target];
         targets.extend(children.iter().chain(removed_children.iter()));
-        check_agents(h, &targets, &data.agents)?;
+        let retiring_agents = planned_retirements(h, &targets, &data, &ticket)?;
         // A squash merge is sufficient to remove a clean workspace, but local
         // and remote branches are retained unless ancestry proves containment.
         let tip = target.tip.clone();
@@ -793,6 +893,7 @@ pub fn preflight_with_transport<'a>(
             target,
             children,
             removed_children,
+            retiring_agents,
             ticket,
             proof: MergeProof {
                 pr: status.number,
@@ -883,6 +984,8 @@ fn delete_local(main: &Path, branch: &str, tip: &str, base: &str) -> Result<bool
     Ok(true)
 }
 
+/// Resource-changing callers retain ticket dispatch and exclusive admission
+/// ownership across preflight and execution. Merge already owns both guards.
 pub fn run(mut p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, ShepherdError> {
     if dry_run != p.dry_run {
         return Err(ShepherdError::Usage(
@@ -964,7 +1067,47 @@ pub fn run(mut p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, Shepher
         }
         let mut targets = vec![&p.target];
         targets.extend(p.children.iter().chain(p.removed_children.iter()));
-        check_agents(p.herdr, &targets, &data.agents)?;
+        // Recheck the whole recipient set before closing any tab. New work,
+        // uncertain input, or a replaced session keeps every checkout intact.
+        let retiring = planned_retirements(p.herdr, &targets, &data, &p.ticket)?;
+        if retiring.len() != p.retiring_agents.len()
+            || retiring.iter().any(|rec| !p.retiring_agents.contains(rec))
+        {
+            return Err(ShepherdError::PolicyDenied(
+                "cleanup retirement recipients changed after preflight".into(),
+            ));
+        }
+        let store = crate::store::Store::open(&p.proof.state_dir, &p.proof.project_root)?;
+        // Persist the whole validated recipient set before the first close. A
+        // successful close followed by a transport error must remain recoverable.
+        store.update(|data| {
+            check_recorded_resources(&p.ticket, data)?;
+            if p.retiring_agents
+                .iter()
+                .any(|rec| !data.agents.contains(rec))
+            {
+                return Err(ShepherdError::PolicyDenied(
+                    "cleanup retirement recipients changed before journaling".into(),
+                ));
+            }
+            for rec in &p.retiring_agents {
+                if !data.cleanup_retiring_agents.iter().any(|expected| {
+                    crate::flock::automatic::same_retirement_identity(expected, rec)
+                }) {
+                    data.cleanup_retiring_agents.push(rec.clone());
+                }
+            }
+            Ok(())
+        })?;
+        for rec in &p.retiring_agents {
+            if !crate::flock::automatic::retire_for_ticket_cleanup(p.herdr, &store, rec, p.cfg)? {
+                return Err(ShepherdError::PolicyDenied(format!(
+                    "{}: retirement deferred; cleanup resources kept",
+                    rec.name
+                )));
+            }
+        }
+        check_agents(p.herdr, &targets, &store.read()?.agents)?;
         for target in &p.removed_children {
             finish_child_cleanup(&p.proof, p.herdr, &p.main, &mut p.ticket, target)?;
         }
@@ -1085,6 +1228,37 @@ pub fn run(mut p: Preflight<'_>, dry_run: bool) -> Result<CleanupReport, Shepher
         if p.cfg.upkeep.regroup {
             regroup::apply(p.herdr, &regroup::plan_regroup(&p.herdr.workspaces()?))?;
         }
+        // Direct cleanup can precede the watcher's merged observation. Its
+        // verified merge proof and completed physical removal authorize the
+        // terminal receipt here, so no pending assignment targets a gone tree.
+        store.update(|data| {
+            check_recorded_resources(&p.ticket, data)?;
+            let ticket = data
+                .tickets
+                .iter_mut()
+                .find(|t| t.id == p.ticket.id)
+                .expect("checked ticket");
+            if ticket.state != crate::store::TicketState::CleanedUp {
+                let now = crate::launch::now();
+                ticket.history.push(crate::store::Transition {
+                    from: ticket.state,
+                    to: crate::store::TicketState::CleanedUp,
+                    reason: None,
+                    at: now.clone(),
+                });
+                ticket.state = crate::store::TicketState::CleanedUp;
+                ticket.blocked_reason = None;
+                ticket.updated_at = now;
+            }
+            ticket.ci_failure_task = None;
+            ticket.ci_recovery = None;
+            ticket.revision_task = None;
+            ticket.revision_run = None;
+            ticket.pr_reviewers_pending.clear();
+            data.cleanup_retiring_agents
+                .retain(|rec| rec.ticket != p.ticket.id);
+            Ok(())
+        })?;
         Ok(report)
     })();
     if !dry_run {

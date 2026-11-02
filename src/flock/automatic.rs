@@ -83,6 +83,8 @@ pub(crate) fn dispatch(
     let (mut claim, nudge_at, queued, initial, recipient_info) = match prompt {
         Prompt::Initial => (
             PromptClaim {
+                task_id: expected.task_id.clone(),
+                attempt_id: expected.attempt_id.clone(),
                 kind: "initial".into(),
                 text: expected.task.clone(),
                 queued_ping: None,
@@ -106,6 +108,8 @@ pub(crate) fn dispatch(
             }
             (
                 PromptClaim {
+                    task_id: expected.task_id.clone(),
+                    attempt_id: expected.attempt_id.clone(),
                     kind: kind.into(),
                     text: text.into(),
                     queued_ping: None,
@@ -232,7 +236,76 @@ pub(crate) fn dispatch(
 /// Nonblocking automatic retirement. A deferred retirement is NOT cleanup
 /// success: callers must retain the worktree and retry only after resolution.
 pub fn retire(h: &dyn Herdr, store: &Store, expected: &AgentRecord) -> Result<bool, ShepherdError> {
-    retire_inner(h, store, expected, None)
+    retire_inner(h, store, expected, None, None, false)
+}
+
+/// Configured lifecycle entry points emit retirement after the terminal closes.
+pub fn retire_with_config(
+    h: &dyn Herdr,
+    store: &Store,
+    expected: &AgentRecord,
+    cfg: &crate::config::Config,
+) -> Result<bool, ShepherdError> {
+    retire_inner(h, store, expected, None, Some(cfg), false)
+}
+
+/// Handoff shares direct cleanup's exact-recipient journal. Persist each intent
+/// after the final ownership check, before invoking the non-idempotent close.
+pub(crate) fn retire_for_ticket_handoff(
+    h: &dyn Herdr,
+    store: &Store,
+    expected: &AgentRecord,
+    cfg: Option<&crate::config::Config>,
+) -> Result<bool, ShepherdError> {
+    retire_inner(h, store, expected, None, cfg, true)
+}
+
+/// Direct cleanup journals its entire recipient set before any tab closes.
+/// A vanished recipient is reconciled only against that exact persisted intent.
+pub(crate) fn retire_for_ticket_cleanup(
+    h: &dyn Herdr,
+    store: &Store,
+    expected: &AgentRecord,
+    cfg: &crate::config::Config,
+) -> Result<bool, ShepherdError> {
+    if !ticket_retirement_current(&store.read()?, expected) {
+        return Ok(false);
+    }
+    retire_for_ticket_handoff(h, store, expected, Some(cfg))
+}
+
+fn ticket_retirement_current(data: &crate::store::StoreData, rec: &AgentRecord) -> bool {
+    data.agents.contains(rec)
+        && data.tickets.iter().any(|ticket| ticket.id == rec.ticket)
+        && data
+            .cleanup_retiring_agents
+            .iter()
+            .any(|expected| same_retirement_identity(expected, rec))
+}
+
+/// A report can arrive while a failed close is awaiting retry. Completion and
+/// observation fields may change, but the journal still owns only this exact
+/// assignment and terminal, including its saved harness session.
+pub(crate) fn same_retirement_identity(left: &AgentRecord, right: &AgentRecord) -> bool {
+    let session = |rec: &AgentRecord| {
+        rec.observed
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .and_then(|value| value.get("session_ref").cloned())
+    };
+    left.name == right.name
+        && left.ticket == right.ticket
+        && left.role == right.role
+        && left.runner == right.runner
+        && left.worktree == right.worktree
+        && left.task == right.task
+        && left.task_id == right.task_id
+        && left.attempt_id == right.attempt_id
+        && left.unit == right.unit
+        && left.launch_profile == right.launch_profile
+        && left.pane_id == right.pane_id
+        && left.tab_id == right.tab_id
+        && session(left) == session(right)
 }
 
 /// The integration receipt also journals tab closure. A missing terminal is
@@ -242,8 +315,9 @@ pub(crate) fn retire_for_cleanup(
     store: &Store,
     expected: &AgentRecord,
     receipt: &crate::store::ChildCleanup,
+    cfg: Option<&crate::config::Config>,
 ) -> Result<bool, ShepherdError> {
-    retire_inner(h, store, expected, Some(receipt))
+    retire_inner(h, store, expected, Some(receipt), cfg, false)
 }
 
 fn cleanup_current(
@@ -264,7 +338,10 @@ fn retire_inner(
     store: &Store,
     expected: &AgentRecord,
     cleanup: Option<&crate::store::ChildCleanup>,
+    cfg: Option<&crate::config::Config>,
+    ticket_intent: bool,
 ) -> Result<bool, ShepherdError> {
+    let _hooks = crate::hooks::defer();
     let name = &expected.name;
     let Some(_operation) = super::try_agent_operation(store, name)? else {
         return Ok(false);
@@ -274,6 +351,22 @@ fn retire_inner(
     };
     if rec.status == AgentStatus::Retired {
         return Ok(true);
+    }
+    if ticket_intent
+        && ticket_retirement_current(&store.read()?, &rec)
+        && super::terminal_gone(h, &rec)?
+    {
+        let retired = store.update(|data| {
+            if !ticket_retirement_current(data, &rec) {
+                return Ok(false);
+            }
+            data.agents.iter_mut().find(|a| **a == rec).unwrap().status = AgentStatus::Retired;
+            Ok(true)
+        })?;
+        if retired && let Some(cfg) = cfg {
+            super::emit_retired(cfg, &rec);
+        }
+        return Ok(retired);
     }
     let mut cleanup = cleanup.cloned();
     if let Some(receipt) = &cleanup {
@@ -289,16 +382,23 @@ fn retire_inner(
                 .any(|a| a.pane_id == *pane || a.name.as_deref() == Some(name))
             && !h.pane_exists(pane)?
         {
-            return store.update(|data| {
+            let retired = store.update(|data| {
                 if !cleanup_current(data, &rec, receipt) {
                     return Ok(false);
                 }
                 data.agents.iter_mut().find(|a| **a == rec).unwrap().status = AgentStatus::Retired;
                 Ok(true)
-            });
+            })?;
+            if retired && let Some(cfg) = cfg {
+                super::emit_retired(cfg, &rec);
+            }
+            return Ok(retired);
         }
     }
     let Some(info) = recipient(h, store, &rec, true)? else {
+        return Ok(false);
+    };
+    let Some(tab) = rec.tab_id.as_deref() else {
         return Ok(false);
     };
     if rec.status != AgentStatus::Reported
@@ -336,14 +436,38 @@ fn retire_inner(
             return Ok(false);
         }
     }
-    if let Some(tab) = &rec.tab_id {
-        h.close_tab(tab)?;
+    if ticket_intent {
+        let saved = store.update(|data| {
+            if !data.agents.contains(&rec)
+                || !data.tickets.iter().any(|ticket| ticket.id == rec.ticket)
+            {
+                return Ok(false);
+            }
+            if !data
+                .cleanup_retiring_agents
+                .iter()
+                .any(|expected| same_retirement_identity(expected, &rec))
+            {
+                data.cleanup_retiring_agents.push(rec.clone());
+            }
+            Ok(true)
+        })?;
+        if !saved || recipient(h, store, &rec, true)?.is_none() {
+            return Ok(false);
+        }
     }
-    store.update(|data| {
+    h.close_tab(tab)?;
+    if !super::terminal_gone(h, &rec)? {
+        return Ok(false);
+    }
+    let retired = store.update(|data| {
         if cleanup
             .as_ref()
             .is_some_and(|receipt| !cleanup_current(data, &rec, receipt))
         {
+            return Ok(false);
+        }
+        if ticket_intent && !ticket_retirement_current(data, &rec) {
             return Ok(false);
         }
         let Some(current) = data.agents.iter_mut().find(|a| **a == rec) else {
@@ -351,5 +475,9 @@ fn retire_inner(
         };
         current.status = AgentStatus::Retired;
         Ok(true)
-    })
+    })?;
+    if retired && let Some(cfg) = cfg {
+        super::emit_retired(cfg, &rec);
+    }
+    Ok(retired)
 }

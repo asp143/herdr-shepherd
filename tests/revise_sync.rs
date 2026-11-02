@@ -1359,9 +1359,8 @@ impl herdr_shepherd::github::PrBackend for PushBackend {
 }
 
 #[test]
-fn automatic_revision_retirement_waits_for_owned_reported_recipient() {
-    if !local_transport_enabled("automatic_revision_retirement_waits_for_owned_reported_recipient")
-    {
+fn revision_consumes_report_without_retiring_recipient() {
+    if !local_transport_enabled("revision_consumes_report_without_retiring_recipient") {
         return;
     }
     use herdr_shepherd::{store::AgentStatus, ticket::revise::RevisionOutcome};
@@ -1407,7 +1406,10 @@ fn automatic_revision_retirement_waits_for_owned_reported_recipient() {
         h.calls.borrow_mut().clear();
         assert_eq!(
             resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later").unwrap(),
-            RevisionOutcome::Waiting,
+            RevisionOutcome::Started {
+                agent: store.read().unwrap().agents.last().unwrap().name.clone(),
+                role: "reviewer".into()
+            },
             "{blocked_by}"
         );
         assert_eq!(store.read().unwrap().agents[0], before);
@@ -1416,11 +1418,1065 @@ fn automatic_revision_retirement_waits_for_owned_reported_recipient() {
             !h.calls
                 .borrow()
                 .iter()
-                .any(|call| call.starts_with("close_tab ")
-                    || call.starts_with("start_agent ")
-                    || call.starts_with("prompt_agent ")),
+                .any(|call| call.starts_with("close_tab ")),
             "{blocked_by}"
         );
         assert_eq!(gh.pushes.get(), 0);
     }
+}
+
+fn report_round(
+    store: &Store,
+    h: &herdr_shepherd::herdr::fake::FakeHerdr,
+    name: &str,
+    reject: bool,
+    sha: &str,
+) {
+    let record = store
+        .read()
+        .unwrap()
+        .agents
+        .into_iter()
+        .find(|a| a.name == name)
+        .unwrap();
+    if matches!(record.role.as_str(), "reviewer" | "qa") {
+        let ticket = store.read().unwrap().tickets.remove(0);
+        let run = ticket.revision_run.unwrap();
+        assert!(
+            record
+                .task
+                .contains(&format!("pinned base {}", run.base_sha))
+        );
+        assert!(record.task.contains(&format!("pinned HEAD {sha}")));
+        for rule in [
+            "complete revision diff",
+            "every acceptance criterion",
+            "new commands and evidence",
+            "revalidate earlier findings",
+            "earlier verdicts are context rather than proof",
+        ] {
+            assert!(
+                record.task.contains(rule),
+                "{}: missing {rule}",
+                record.role
+            );
+        }
+        assert!(record.task.contains(&format!(
+            "--task-id '{}'",
+            record.task_id.as_deref().unwrap()
+        )));
+    }
+    let session = format!("session-{name}");
+    h.pane_sessions
+        .borrow_mut()
+        .insert(record.pane_id.clone().unwrap(), session.clone());
+    h.agent_records
+        .borrow_mut()
+        .iter_mut()
+        .find(|a| a.name.as_deref() == Some(name))
+        .unwrap()
+        .agent_status = "idle".into();
+    store
+        .update(|data| {
+            let a = data.agents.iter_mut().find(|a| a.name == name).unwrap();
+            let mut observed: serde_json::Value =
+                serde_json::from_str(a.observed.as_deref().unwrap()).unwrap();
+            observed["session_ref"] = session.into();
+            a.observed = Some(observed.to_string());
+            Ok(())
+        })
+        .unwrap();
+    herdr_shepherd::flock::store_report_for_task(store, name, record.task_id.as_deref(), &serde_json::json!({"status":"completed","summary":"new evidence", "tests":["fixture"],"changed_paths":[],"blockers":if reject {vec!["fix required"]} else {vec![]},"findings":[],"commit_sha":sha}).to_string()).unwrap();
+}
+
+#[test]
+fn revision_rejection_reuses_each_role_and_rejects_stale_reports() {
+    if !local_transport_enabled("revision_rejection_reuses_each_role_and_rejects_stale_reports") {
+        return;
+    }
+    use herdr_shepherd::ticket::revise::RevisionOutcome;
+    for reject_role in ["reviewer", "qa"] {
+        let repo = Repo::new();
+        let store = stored_revision(&repo);
+        let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+        let gh = PushBackend::new(&repo);
+        let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+        let sha = git(&repo.root, &["rev-parse", "HEAD"]);
+        let mut names = std::collections::HashMap::new();
+        for role in ["coder", "reviewer", "qa"]
+            .into_iter()
+            .take(if reject_role == "qa" { 3 } else { 2 })
+        {
+            let RevisionOutcome::Started {
+                agent,
+                role: actual,
+            } = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "now").unwrap()
+            else {
+                panic!("expected {role}")
+            };
+            assert_eq!(actual, role);
+            report_round(&store, &h, &agent, role == reject_role, &sha);
+            names.insert(role, agent);
+        }
+        let old = store.read().unwrap().agents[0].clone();
+        for role in ["coder", "reviewer", "qa"] {
+            let RevisionOutcome::Started {
+                agent,
+                role: actual,
+            } = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "next").unwrap()
+            else {
+                panic!("expected {role}")
+            };
+            assert_eq!(actual, role);
+            if let Some(previous) = names.get(role) {
+                assert_eq!(
+                    &agent, previous,
+                    "must reuse {role} after {reject_role} rejection"
+                );
+            }
+            if role == "coder" {
+                assert!(
+                    herdr_shepherd::flock::store_report_for_task(
+                        &store,
+                        &agent,
+                        old.task_id.as_deref(),
+                        &serde_json::to_string(old.report.as_ref().unwrap()).unwrap()
+                    )
+                    .is_err()
+                );
+                assert_eq!(
+                    resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "stale").unwrap(),
+                    RevisionOutcome::Waiting
+                );
+            }
+            report_round(&store, &h, &agent, false, &sha);
+        }
+        assert_eq!(store.read().unwrap().agents.len(), 3);
+        assert_eq!(h.start_args.borrow().len(), 3);
+        assert!(!h.calls.borrow().iter().any(|c| c.starts_with("close_tab ")));
+    }
+}
+
+#[test]
+fn pr_comment_round_reuses_existing_cohort() {
+    if !local_transport_enabled("pr_comment_round_reuses_existing_cohort") {
+        return;
+    }
+    use herdr_shepherd::ticket::revise::RevisionOutcome;
+    let repo = Repo::new();
+    let store = stored_revision(&repo);
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+    let gh = PushBackend::new(&repo);
+    let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+    let sha = git(&repo.root, &["rev-parse", "HEAD"]);
+    for round in 0..2 {
+        if round == 1 {
+            store
+                .update(|data| {
+                    let t = &mut data.tickets[0];
+                    t.state = TicketState::Revising;
+                    t.revision_task = Some("Address another accepted PR comment".into());
+                    Ok(())
+                })
+                .unwrap();
+        }
+        for role in ["coder", "reviewer", "qa"] {
+            let RevisionOutcome::Started {
+                agent,
+                role: actual,
+            } = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "round").unwrap()
+            else {
+                panic!("expected {role}")
+            };
+            assert_eq!(actual, role);
+            report_round(&store, &h, &agent, false, &sha);
+        }
+        assert!(matches!(
+            resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "finish").unwrap(),
+            RevisionOutcome::Pushed { .. }
+        ));
+    }
+    assert_eq!(store.read().unwrap().agents.len(), 3);
+    assert_eq!(h.start_args.borrow().len(), 3);
+}
+
+#[test]
+fn revision_assignment_mismatch_cannot_consume_current_report() {
+    if !local_transport_enabled("revision_assignment_mismatch_cannot_consume_current_report") {
+        return;
+    }
+    use herdr_shepherd::ticket::revise::RevisionOutcome;
+    for field in ["task_id", "attempt_id"] {
+        let repo = Repo::new();
+        let store = stored_revision(&repo);
+        let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+        let gh = PushBackend::new(&repo);
+        let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+        let RevisionOutcome::Started { agent, .. } =
+            resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "start").unwrap()
+        else {
+            panic!("expected coder")
+        };
+        report_round(
+            &store,
+            &h,
+            &agent,
+            false,
+            &git(&repo.root, &["rev-parse", "HEAD"]),
+        );
+        store
+            .update(|data| {
+                let run = data.tickets[0].revision_run.as_mut().unwrap();
+                if field == "task_id" {
+                    run.task_id = Some("earlier-task".into());
+                } else {
+                    run.attempt_id = Some("earlier-attempt".into());
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "stale").unwrap(),
+            RevisionOutcome::Waiting
+        );
+        assert_eq!(store.read().unwrap().agents.len(), 1);
+        assert_eq!(gh.pushes.get(), 0);
+    }
+}
+
+#[test]
+fn ambiguous_revision_delivery_keeps_exact_assignment_pending() {
+    if !local_transport_enabled("ambiguous_revision_delivery_keeps_exact_assignment_pending") {
+        return;
+    }
+    use herdr_shepherd::ticket::revise::RevisionOutcome;
+    let repo = Repo::new();
+    let store = stored_revision(&repo);
+    let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+    let gh = PushBackend::new(&repo);
+    let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+    let sha = git(&repo.root, &["rev-parse", "HEAD"]);
+    for role in ["coder", "reviewer"] {
+        let RevisionOutcome::Started { agent, .. } =
+            resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "start").unwrap()
+        else {
+            panic!("expected {role}")
+        };
+        report_round(&store, &h, &agent, role == "reviewer", &sha);
+    }
+    h.prompt_results.borrow_mut().push_back((
+        true,
+        Err(herdr_shepherd::error::ShepherdError::HerdrCommand {
+            code: "timeout".into(),
+            message: "accepted but timed out".into(),
+        }),
+    ));
+    assert_eq!(
+        resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "reuse").unwrap(),
+        RevisionOutcome::Blocked
+    );
+    let data = store.read().unwrap();
+    let run = data.tickets[0].revision_run.as_ref().unwrap();
+    let agent = data
+        .agents
+        .iter()
+        .find(|a| run.agent.as_ref() == Some(&a.name))
+        .unwrap();
+    assert_eq!(run.task_id, agent.task_id);
+    assert_eq!(run.attempt_id, agent.attempt_id);
+    assert_eq!(agent.status, herdr_shepherd::store::AgentStatus::Blocked);
+    assert_eq!(
+        resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "retry").unwrap(),
+        RevisionOutcome::Waiting
+    );
+    assert_eq!(store.read().unwrap().agents.len(), 2);
+    assert_eq!(h.start_args.borrow().len(), 2);
+    report_round(&store, &h, &agent.name, false, &sha);
+    assert!(
+        matches!(resume_revision(&h,&gh,&store,&cfg,&repo.gate(),"T-1","report").unwrap(),RevisionOutcome::Started {role,..} if role == "reviewer")
+    );
+}
+
+#[test]
+fn interrupted_revision_delivery_keeps_persisted_assignment() {
+    if !local_transport_enabled("interrupted_revision_delivery_keeps_persisted_assignment") {
+        return;
+    }
+    use herdr_shepherd::ticket::revise::RevisionOutcome;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    for reuse in [false, true] {
+        let repo = Repo::new();
+        let store = stored_revision(&repo);
+        let h = herdr_shepherd::herdr::fake::FakeHerdr::new(vec![]);
+        let gh = PushBackend::new(&repo);
+        let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+        if reuse {
+            for role in ["coder", "reviewer"] {
+                let RevisionOutcome::Started { agent, .. } =
+                    resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "before").unwrap()
+                else {
+                    panic!("expected {role}")
+                };
+                report_round(
+                    &store,
+                    &h,
+                    &agent,
+                    role == "reviewer",
+                    &git(&repo.root, &["rev-parse", "HEAD"]),
+                );
+            }
+        }
+        let saved = store.clone();
+        let observed = Arc::new(AtomicBool::new(false));
+        let seen = observed.clone();
+        *h.on_prompt.borrow_mut() = Some(Box::new(move |name| {
+            let data = saved.read().unwrap();
+            let run = data.tickets[0].revision_run.as_ref().unwrap();
+            let rec = data.agents.iter().find(|a| a.name == name).unwrap();
+            assert_eq!(run.agent.as_deref(), Some(name));
+            assert_eq!(run.task_id, rec.task_id);
+            assert_eq!(run.attempt_id, rec.attempt_id);
+            seen.store(true, Ordering::SeqCst);
+            panic!("fixture interruption after durable reservation");
+        }));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| resume_revision(
+                &h,
+                &gh,
+                &store,
+                &cfg,
+                &repo.gate(),
+                "T-1",
+                "interrupted"
+            )))
+            .is_err()
+        );
+        assert!(observed.load(Ordering::SeqCst));
+        *h.on_prompt.borrow_mut() = None;
+        assert_eq!(
+            resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "retry").unwrap(),
+            RevisionOutcome::Waiting
+        );
+        assert_eq!(
+            store.read().unwrap().agents.len(),
+            if reuse { 2 } else { 1 }
+        );
+        assert_eq!(h.start_args.borrow().len(), if reuse { 2 } else { 1 });
+    }
+}
+
+#[test]
+fn repeated_revision_text_cannot_bind_old_report() {
+    if !local_transport_enabled("repeated_revision_text_cannot_bind_old_report") {
+        return;
+    }
+    use herdr_shepherd::{herdr::fake::FakeHerdr, ticket::revise::RevisionStage};
+    for stage in [RevisionStage::Reviewer, RevisionStage::Qa] {
+        for status in ["reported", "retired"] {
+            for evidence in ["null_report_sha", "old_report_sha", "missing_tested_sha"] {
+                let repo = Repo::new();
+                let base = git(&repo.root, &["rev-parse", "HEAD"]);
+                let task = format!(
+                    "Revision {base} {stage:?}\nTask: Fix the reviewed edge case\nAccepted comments:\n\nNew diff: {base}..HEAD"
+                );
+                let store = legacy_revision_fixture(&repo, stage, status, &task);
+                fs::write(repo.root.join("new-revision.txt"), "unreviewed change\n").unwrap();
+                git(&repo.root, &["add", "new-revision.txt"]);
+                git(&repo.root, &["commit", "-m", "new revision"]);
+                let head = git(&repo.root, &["rev-parse", "HEAD"]);
+                store
+                    .update(|data| {
+                        let ticket = &mut data.tickets[0];
+                        ticket.revision_round += 1;
+                        let run = ticket.revision_run.as_mut().unwrap();
+                        run.tested_sha = Some(head.clone());
+                        run.synced_sha = Some(head.clone());
+                        if evidence == "null_report_sha" {
+                            data.agents[0].report.as_mut().unwrap().commit_sha = None;
+                        } else if evidence == "missing_tested_sha" {
+                            run.tested_sha = None;
+                            data.agents[0].report.as_mut().unwrap().commit_sha = Some(head.clone());
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                let saved_report = store.read().unwrap().agents[0].report.clone();
+                let h = FakeHerdr::new(vec![]);
+                let gh = PushBackend::new(&repo);
+                let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+                let result =
+                    resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "next-round");
+                let error = result.expect_err(&format!(
+                    "{status} {stage:?} {evidence} needs reconciliation"
+                ));
+                assert!(error.to_string().contains("ticket reconcile T-1"));
+                let data = store.read().unwrap();
+                assert_eq!(data.tickets[0].state, TicketState::Blocked);
+                let run = data.tickets[0].revision_run.as_ref().unwrap();
+                assert_eq!(run.stage, stage);
+                assert!(run.agent.is_none());
+                assert!(data.tickets[0].legacy_dispatch.is_some());
+                assert_eq!(data.agents.len(), 1);
+                assert_eq!(data.agents[0].report, saved_report);
+                assert!(h.start_args.borrow().is_empty());
+                assert_eq!(gh.pushes.get(), 0);
+                // The existing operator path can explicitly discard the
+                // uncertain report and launch a fresh check of this stage.
+                herdr_shepherd::ticket::revise::reconcile_legacy_reports(
+                    &store, &cfg, "T-1", None, true, "decision",
+                )
+                .unwrap();
+                let next =
+                    resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "fresh-check")
+                        .unwrap();
+                let expected_role = if stage == RevisionStage::Reviewer {
+                    "reviewer"
+                } else {
+                    "qa"
+                };
+                assert!(matches!(next,
+                    herdr_shepherd::ticket::revise::RevisionOutcome::Started { role, .. }
+                    if role == expected_role));
+                assert_eq!(store.read().unwrap().agents.len(), 2);
+                assert_eq!(h.start_args.borrow().len(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn unbound_legacy_coder_requires_round_evidence() {
+    if !local_transport_enabled("unbound_legacy_coder_requires_round_evidence") {
+        return;
+    }
+    use herdr_shepherd::{herdr::fake::FakeHerdr, ticket::revise::RevisionStage};
+    for missing_sha in [true, false] {
+        let repo = Repo::new();
+        let head = git(&repo.root, &["rev-parse", "HEAD"]);
+        let task = format!(
+            "Revision {head} Coder\nTask: Fix the reviewed edge case\nAccepted comments:\n\nNew diff:"
+        );
+        let store = legacy_revision_fixture(&repo, RevisionStage::Coder, "retired", &task);
+        if missing_sha {
+            store
+                .update(|data| {
+                    data.agents[0].report.as_mut().unwrap().commit_sha = None;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let h = FakeHerdr::new(vec![]);
+        let gh = PushBackend::new(&repo);
+        let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+        let error = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later")
+            .expect_err("a coder input SHA does not identify this round's output");
+        assert!(error.to_string().contains("ticket reconcile T-1"));
+        let data = store.read().unwrap();
+        assert_eq!(data.tickets[0].state, TicketState::Blocked);
+        assert!(
+            data.tickets[0]
+                .revision_run
+                .as_ref()
+                .unwrap()
+                .agent
+                .is_none()
+        );
+        assert_eq!(data.agents.len(), 1);
+        assert!(h.start_args.borrow().is_empty());
+    }
+}
+
+#[test]
+fn interrupted_legacy_revision_never_repeats_completed_role() {
+    if !local_transport_enabled("interrupted_legacy_revision_never_repeats_completed_role") {
+        return;
+    }
+    use herdr_shepherd::{
+        herdr::fake::FakeHerdr,
+        ticket::revise::{RevisionOutcome, RevisionStage},
+    };
+    for stage in [
+        RevisionStage::Coder,
+        RevisionStage::Reviewer,
+        RevisionStage::Qa,
+    ] {
+        for status in ["reported", "retired"] {
+            let repo = Repo::new();
+            let head = git(&repo.root, &["rev-parse", "HEAD"]);
+            let task = format!(
+                "Revision {head} {stage:?}\nTask: Fix the reviewed edge case\nAccepted comments:\n\nNew diff:"
+            );
+            let store = legacy_revision_fixture(&repo, stage, status, &task);
+            let h = FakeHerdr::new(vec![]);
+            let gh = PushBackend::new(&repo);
+            let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+            let result = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later");
+            let outcome = if stage == RevisionStage::Coder {
+                let error = result.expect_err("unbound coder needs an explicit round decision");
+                assert!(error.to_string().contains("ticket reconcile T-1"));
+                assert!(h.start_args.borrow().is_empty());
+                herdr_shepherd::ticket::revise::reconcile_legacy_reports(
+                    &store,
+                    &cfg,
+                    "T-1",
+                    Some("legacy-role"),
+                    false,
+                    "decision",
+                )
+                .unwrap();
+                resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "after-decision")
+                    .unwrap()
+            } else {
+                result.expect("matching pre-upgrade tested SHA must bind automatically")
+            };
+            let data = store.read().unwrap();
+            assert_eq!(
+                data.agents
+                    .iter()
+                    .filter(|agent| agent.role == data.agents[0].role)
+                    .count(),
+                1,
+                "must not repeat the completed legacy role: {outcome:?}"
+            );
+            match stage {
+                RevisionStage::Coder | RevisionStage::Reviewer => {
+                    let next = if stage == RevisionStage::Coder {
+                        "reviewer"
+                    } else {
+                        "qa"
+                    };
+                    assert!(
+                        matches!(outcome, RevisionOutcome::Started { role, .. } if role == next)
+                    );
+                    assert_eq!(data.agents.len(), 2);
+                    assert_eq!(h.start_args.borrow().len(), 1);
+                }
+                RevisionStage::Qa => {
+                    assert!(matches!(outcome, RevisionOutcome::Pushed { .. }));
+                    assert_eq!(data.agents.len(), 1);
+                    assert!(h.start_args.borrow().is_empty());
+                    // The saved completion already matches the remote tip.
+                    assert_eq!(gh.pushes.get(), 0);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+fn legacy_revision_fixture(
+    repo: &Repo,
+    stage: herdr_shepherd::ticket::revise::RevisionStage,
+    status: &str,
+    task: &str,
+) -> Store {
+    let store = stored_revision(repo);
+    let head = git(&repo.root, &["rev-parse", "HEAD"]);
+    let role = match stage {
+        herdr_shepherd::ticket::revise::RevisionStage::Coder => "coder",
+        herdr_shepherd::ticket::revise::RevisionStage::Reviewer => "reviewer",
+        herdr_shepherd::ticket::revise::RevisionStage::Qa => "qa",
+        _ => unreachable!(),
+    };
+    // Pre-upgrade disk fixture: the separate workflow-reference write never
+    // happened. No new assignment fields or completed-task history existed.
+    let record = serde_json::from_value(serde_json::json!({
+        "name":"legacy-role", "ticket":"T-1", "role":role,
+        "runner":"codex-sol-high", "status":status,
+        "pane_id":null, "tab_id":null, "worktree":repo.root,
+        "task":task, "report": {
+            "status":"completed", "summary":"saved legacy completion",
+            "tests":["fixture"], "changed_paths":[], "blockers":[],
+            "findings":[], "commit_sha":head
+        },
+        "observed":null, "last_progress_at":"0", "nudges":0,"restarts":0
+    }))
+    .unwrap();
+    store
+        .update(|data| {
+            data.tickets[0].revision_run = Some(herdr_shepherd::ticket::revise::RevisionRun {
+                base_sha: head.clone(),
+                synced_sha: Some(head.clone()),
+                stage,
+                agent: None,
+                task_id: None,
+                attempt_id: None,
+                tested_sha: Some(head),
+            });
+            data.agents.push(record);
+            Ok(())
+        })
+        .unwrap();
+    store
+}
+
+#[test]
+fn unrelated_legacy_history_does_not_quarantine_revision() {
+    if !local_transport_enabled("unrelated_legacy_history_does_not_quarantine_revision") {
+        return;
+    }
+    use herdr_shepherd::{
+        herdr::fake::FakeHerdr,
+        ticket::revise::{RevisionOutcome, RevisionStage},
+    };
+    for stage in [
+        RevisionStage::Coder,
+        RevisionStage::Reviewer,
+        RevisionStage::Qa,
+    ] {
+        for status in ["reported", "retired"] {
+            let repo = Repo::new();
+            let store = legacy_revision_fixture(
+                &repo,
+                stage,
+                status,
+                "Original implementation completed before this revision was requested",
+            );
+            let h = FakeHerdr::new(vec![]);
+            let gh = PushBackend::new(&repo);
+            let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+            let result = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later");
+            assert!(
+                matches!(result, Ok(RevisionOutcome::Started { .. })),
+                "unrelated {status} {stage:?} must permit a fresh task: {result:?}"
+            );
+            assert_eq!(store.read().unwrap().agents.len(), 2);
+            assert_eq!(h.start_args.borrow().len(), 1);
+        }
+    }
+}
+
+fn legacy_cli(repo: &Repo, group: &str, args: &[&str]) -> std::process::Output {
+    let fake = repo.dir.path().join("cli-herdr.json");
+    if !fake.exists() {
+        fs::write(&fake, "{}").unwrap();
+    }
+    let github = repo.dir.path().join("cli-github");
+    fs::create_dir_all(&github).unwrap();
+    if !github.join("github.json").exists() {
+        fs::write(github.join("github.json"), "{}").unwrap();
+    }
+    Command::new(env!("CARGO_BIN_EXE_herdr-shepherd"))
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", repo.dir.path().join("empty-home"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("SHEPHERD_FAKE_HERDR", fake)
+        .env("SHEPHERD_FAKE_GITHUB", github)
+        .env("SHEPHERD_TEST_ALLOW_LOCAL_ORIGIN", "allow-local-in-tmp")
+        .args(["--json", "--state-dir"])
+        .arg(&repo.gate().state_dir)
+        .arg("--config-dir")
+        .arg(&repo.gate().config_dir)
+        .args([group, "--project-root"])
+        .arg(&repo.root)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn legacy_cli_success(repo: &Repo, group: &str, args: &[&str]) -> serde_json::Value {
+    let output = legacy_cli(repo, group, args);
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["data"].clone()
+}
+
+#[test]
+fn ambiguous_legacy_revision_recovers_through_public_cli() {
+    if !local_transport_enabled("ambiguous_legacy_revision_recovers_through_public_cli") {
+        return;
+    }
+    use herdr_shepherd::ticket::revise::RevisionStage;
+    for accept in [true, false] {
+        let repo = Repo::new();
+        let head = git(&repo.root, &["rev-parse", "HEAD"]);
+        let task = format!(
+            "Revision {head} Coder\nTask: Fix the reviewed edge case\nAccepted comments:\n\nNew diff:"
+        );
+        let store = legacy_revision_fixture(&repo, RevisionStage::Coder, "reported", &task);
+        // Two indistinguishable pre-upgrade launches need an explicit decision.
+        store
+            .update(|data| {
+                let mut other = data.agents[0].clone();
+                other.name = "legacy-other".into();
+                data.agents.push(other);
+                Ok(())
+            })
+            .unwrap();
+        let first = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+        let message = first["errors"][0]["message"].as_str().unwrap();
+        assert!(message.contains("ticket reconcile T-1"), "{message}");
+        assert_eq!(store.read().unwrap().tickets[0].state, TicketState::Blocked);
+        // Cancellation is a supported operation, not a manual state repair.
+        legacy_cli_success(&repo, "agent", &["cancel", "legacy-role", "--force"]);
+        legacy_cli_success(&repo, "agent", &["cancel", "legacy-other", "--force"]);
+        let wrong = legacy_cli(
+            &repo,
+            "ticket",
+            &["reconcile", "T-1", "--accept-report", "unrelated"],
+        );
+        assert!(!wrong.status.success());
+        assert_eq!(store.read().unwrap().agents.len(), 2);
+        let args: &[&str] = if accept {
+            &["reconcile", "T-1", "--accept-report", "legacy-role"]
+        } else {
+            &["reconcile", "T-1", "--discard-reports"]
+        };
+        legacy_cli_success(&repo, "ticket", args);
+        let recovered = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+        assert!(
+            recovered["errors"].as_array().unwrap().is_empty(),
+            "{recovered}"
+        );
+        let data = store.read().unwrap();
+        assert_eq!(data.tickets[0].state, TicketState::Revising);
+        assert!(
+            data.tickets[0].legacy_dispatch.is_none(),
+            "a recovery decision applies to one dispatch"
+        );
+        assert_eq!(data.agents.len(), 3);
+        assert_eq!(
+            data.agents[2].role,
+            if accept { "reviewer" } else { "coder" }
+        );
+        // The exact accepted report survives; discard also preserves evidence.
+        assert_eq!(
+            data.agents[0].report.as_ref().unwrap().summary,
+            "saved legacy completion"
+        );
+        assert!(
+            !legacy_cli(&repo, "ticket", args).status.success(),
+            "reconciliation must be state-specific"
+        );
+        let again = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+        assert!(again["started"].as_array().unwrap().is_empty());
+        assert_eq!(store.read().unwrap().agents.len(), 3);
+    }
+}
+
+fn legacy_ci_fixture(repo: &Repo, ambiguous: bool) -> Store {
+    use herdr_shepherd::ticket::revise::{RevisionStage, ci_retry_generation};
+    let store = legacy_revision_fixture(repo, RevisionStage::Coder, "reported", "placeholder");
+    store
+        .update(|data| {
+            let ticket = &mut data.tickets[0];
+            ticket.state = TicketState::Building;
+            ticket.revision_run = None;
+            ticket.ci_failure_task = Some("Fix the pending legacy CI check".into());
+            let task = format!(
+                "{}\n{}",
+                ci_retry_generation(ticket),
+                ticket.ci_failure_task.as_deref().unwrap()
+            );
+            data.agents[0].task = task;
+            if ambiguous {
+                let mut other = data.agents[0].clone();
+                other.name = "legacy-other".into();
+                data.agents.push(other);
+            }
+            Ok(())
+        })
+        .unwrap();
+    store
+}
+
+#[test]
+fn ambiguous_legacy_ci_recovers_through_public_cli() {
+    if !local_transport_enabled("ambiguous_legacy_ci_recovers_through_public_cli") {
+        return;
+    }
+    for accept in [true, false] {
+        let repo = Repo::new();
+        let store = legacy_ci_fixture(&repo, true);
+        let first = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+        assert!(
+            first["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("ticket reconcile T-1")
+        );
+        for name in ["legacy-role", "legacy-other"] {
+            legacy_cli_success(&repo, "agent", &["cancel", name, "--force"]);
+        }
+        let args: &[&str] = if accept {
+            &["reconcile", "T-1", "--accept-report", "legacy-role"]
+        } else {
+            &["reconcile", "T-1", "--discard-reports"]
+        };
+        legacy_cli_success(&repo, "ticket", args);
+        let next = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+        assert!(next["errors"].as_array().unwrap().is_empty(), "{next}");
+        let data = store.read().unwrap();
+        assert_eq!(data.tickets[0].state, TicketState::Building);
+        assert!(
+            data.tickets[0].legacy_dispatch.is_none(),
+            "a recovery decision applies to one dispatch"
+        );
+        assert!(data.tickets[0].ci_failure_task.is_none());
+        assert_eq!(data.agents.len(), if accept { 2 } else { 3 });
+        let recovery = data.tickets[0].ci_recovery.as_ref().unwrap();
+        assert_eq!(
+            recovery.assignment.agent,
+            if accept {
+                "legacy-role"
+            } else {
+                &data.agents[2].name
+            }
+        );
+        assert!(!legacy_cli(&repo, "ticket", args).status.success());
+        legacy_cli_success(&repo, "ticket", &["dispatch"]);
+        assert_eq!(store.read().unwrap().agents.len(), data.agents.len());
+    }
+}
+
+#[test]
+fn cancelled_old_legacy_quarantine_resumes_through_public_cli() {
+    if !local_transport_enabled("cancelled_old_legacy_quarantine_resumes_through_public_cli") {
+        return;
+    }
+    use herdr_shepherd::store::{BlockedReason, Transition};
+    use herdr_shepherd::ticket::revise::RevisionStage;
+    for ci in [false, true] {
+        let repo = Repo::new();
+        let head = git(&repo.root, &["rev-parse", "HEAD"]);
+        let task = format!(
+            "Revision {head} Coder\nTask: Fix the reviewed edge case\nAccepted comments:\n\nNew diff:"
+        );
+        let store = if ci {
+            legacy_ci_fixture(&repo, false)
+        } else {
+            legacy_revision_fixture(&repo, RevisionStage::Coder, "reported", &task)
+        };
+        // Disk fixture produced by the previous release's quarantine. Recovery
+        // below uses only public commands, including the cancellation escape.
+        store
+            .update(|data| {
+                let ticket = &mut data.tickets[0];
+                ticket.history.push(Transition {
+                    from: ticket.state,
+                    to: TicketState::Blocked,
+                    reason: Some(BlockedReason::Escalated),
+                    at: "old-quarantine".into(),
+                });
+                ticket.state = TicketState::Blocked;
+                ticket.blocked_reason = Some(BlockedReason::Escalated);
+                ticket.updated_at = "old-quarantine".into();
+                if ci {
+                    data.agents[0].dispatch_reason = Some("blocked: unbound legacy dispatch for CI recovery coder: legacy-role; inspect and reconcile".into());
+                }
+                Ok(())
+            })
+            .unwrap();
+        legacy_cli_success(&repo, "agent", &["cancel", "legacy-role", "--force"]);
+        legacy_cli_success(
+            &repo,
+            "ticket",
+            &[
+                "transition",
+                "T-1",
+                "--to",
+                if ci { "building" } else { "revising" },
+            ],
+        );
+        let mut next = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+        if !ci {
+            assert!(
+                next["errors"][0]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("ticket reconcile T-1")
+            );
+            assert_eq!(store.read().unwrap().agents.len(), 1);
+            legacy_cli_success(
+                &repo,
+                "ticket",
+                &["reconcile", "T-1", "--accept-report", "legacy-role"],
+            );
+            next = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+        }
+        assert!(next["errors"].as_array().unwrap().is_empty(), "{next}");
+        let data = store.read().unwrap();
+        if ci {
+            assert_eq!(
+                data.agents.len(),
+                1,
+                "completed legacy CI must not repeat after cancellation"
+            );
+            assert!(data.tickets[0].ci_failure_task.is_none());
+        } else {
+            assert_eq!(data.agents.len(), 2);
+            assert_eq!(data.agents[1].role, "reviewer");
+        }
+    }
+}
+
+#[test]
+fn matching_ci_generation_binds_null_sha_report() {
+    if !local_transport_enabled("matching_ci_generation_binds_null_sha_report") {
+        return;
+    }
+    let repo = Repo::new();
+    let store = legacy_ci_fixture(&repo, false);
+    store
+        .update(|data| {
+            data.agents[0].report.as_mut().unwrap().commit_sha = None;
+            Ok(())
+        })
+        .unwrap();
+    let next = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+    assert!(next["errors"].as_array().unwrap().is_empty(), "{next}");
+    let data = store.read().unwrap();
+    assert!(data.tickets[0].ci_failure_task.is_none());
+    assert_eq!(data.agents.len(), 1);
+    assert_eq!(
+        data.tickets[0]
+            .ci_recovery
+            .as_ref()
+            .unwrap()
+            .assignment
+            .agent,
+        "legacy-role"
+    );
+}
+
+#[test]
+fn same_ci_text_in_new_generation_starts_fresh() {
+    if !local_transport_enabled("same_ci_text_in_new_generation_starts_fresh") {
+        return;
+    }
+    for missing_sha in [true, false] {
+        let repo = Repo::new();
+        let store = legacy_ci_fixture(&repo, false);
+        // A fresh CI failure may repeat a task/round after a loop-cap reset. Its
+        // baseline digest must distinguish the new generation from old evidence.
+        store
+            .update(|data| {
+                let ticket = &mut data.tickets[0];
+                ticket.updated_at = "new-ci-failure".into();
+                ticket.history.push(herdr_shepherd::store::Transition {
+                    from: TicketState::CiWait,
+                    to: TicketState::Building,
+                    reason: None,
+                    at: "new-ci-failure".into(),
+                });
+                data.agents[0].status = herdr_shepherd::store::AgentStatus::Retired;
+                if missing_sha {
+                    data.agents[0].report.as_mut().unwrap().commit_sha = None;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let next = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+        assert!(next["errors"].as_array().unwrap().is_empty(), "{next}");
+        let data = store.read().unwrap();
+        assert_eq!(
+            data.agents.len(),
+            2,
+            "a different CI generation needs its own task"
+        );
+        assert_eq!(
+            data.tickets[0]
+                .ci_recovery
+                .as_ref()
+                .unwrap()
+                .assignment
+                .agent,
+            data.agents[1].name
+        );
+    }
+}
+
+#[test]
+fn unverifiable_old_ci_quarantine_requires_public_choice() {
+    if !local_transport_enabled("unverifiable_old_ci_quarantine_requires_public_choice") {
+        return;
+    }
+    use herdr_shepherd::store::{BlockedReason, Transition};
+    use herdr_shepherd::ticket::revise::ci_retry_generation;
+    let repo = Repo::new();
+    let store = legacy_ci_fixture(&repo, false);
+    store.update(|data| {
+        let ticket = &mut data.tickets[0];
+        ticket.updated_at = "clock-not-retained-in-history".into();
+        data.agents[0].task = format!("{}\n{}", ci_retry_generation(ticket), ticket.ci_failure_task.as_deref().unwrap());
+        data.agents[0].dispatch_reason = Some("blocked: unbound legacy dispatch for CI recovery coder: legacy-role; inspect and reconcile".into());
+        ticket.history.push(Transition { from:TicketState::Building, to:TicketState::Blocked,
+            reason:Some(BlockedReason::Escalated), at:"old-quarantine".into() });
+        ticket.state = TicketState::Blocked;
+        ticket.blocked_reason = Some(BlockedReason::Escalated);
+        ticket.updated_at = "old-quarantine".into();
+        Ok(())
+    }).unwrap();
+    legacy_cli_success(&repo, "agent", &["cancel", "legacy-role", "--force"]);
+    legacy_cli_success(&repo, "ticket", &["transition", "T-1", "--to", "building"]);
+    let next = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+    assert!(
+        next["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("ticket reconcile T-1")
+    );
+    assert_eq!(store.read().unwrap().agents.len(), 1);
+    legacy_cli_success(
+        &repo,
+        "ticket",
+        &["reconcile", "T-1", "--accept-report", "legacy-role"],
+    );
+    let recovered = legacy_cli_success(&repo, "ticket", &["dispatch"]);
+    assert!(
+        recovered["errors"].as_array().unwrap().is_empty(),
+        "{recovered}"
+    );
+    let data = store.read().unwrap();
+    assert_eq!(data.agents.len(), 1);
+    assert!(data.tickets[0].ci_failure_task.is_none());
+    assert_eq!(data.tickets[0].state, TicketState::Building);
+}
+
+#[test]
+fn legacy_reconcile_refuses_unquarantined_or_terminal_ticket() {
+    if !local_transport_enabled("legacy_reconcile_refuses_unquarantined_or_terminal_ticket") {
+        return;
+    }
+    use herdr_shepherd::ticket::revise::RevisionStage;
+    let repo = Repo::new();
+    let head = git(&repo.root, &["rev-parse", "HEAD"]);
+    let task = format!(
+        "Revision {head} Coder\nTask: Fix the reviewed edge case\nAccepted comments:\n\nNew diff:"
+    );
+    let store = legacy_revision_fixture(&repo, RevisionStage::Coder, "reported", &task);
+    store
+        .update(|data| {
+            let mut other = data.agents[0].clone();
+            other.name = "legacy-other".into();
+            data.agents.push(other);
+            Ok(())
+        })
+        .unwrap();
+    let args = ["reconcile", "T-1", "--accept-report", "legacy-role"];
+    assert!(!legacy_cli(&repo, "ticket", &args).status.success());
+    assert_eq!(
+        store.read().unwrap().tickets[0].state,
+        TicketState::Revising
+    );
+    legacy_cli_success(&repo, "ticket", &["dispatch"]);
+    legacy_cli_success(&repo, "ticket", &["transition", "T-1", "--to", "failed"]);
+    let before = store.read().unwrap().tickets[0].clone();
+    assert!(!legacy_cli(&repo, "ticket", &args).status.success());
+    assert!(
+        !legacy_cli(&repo, "ticket", &["reconcile", "T-1", "--discard-reports"])
+            .status
+            .success()
+    );
+    assert_eq!(store.read().unwrap().tickets[0], before);
+    assert_eq!(store.read().unwrap().agents.len(), 2);
 }

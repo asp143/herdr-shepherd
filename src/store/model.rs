@@ -61,6 +61,10 @@ pub struct Ticket {
     pub pr_number: Option<u64>,
     #[serde(default)]
     pub ci_failure_task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_recovery: Option<crate::ticket::revise::CiRecovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_dispatch: Option<crate::ticket::revise::LegacyDispatch>,
     #[serde(default)]
     pub ci_none_since: Option<String>,
     #[serde(default)]
@@ -145,12 +149,61 @@ pub struct AgentRecord {
     pub restarts: u32,
     #[serde(default)]
     pub prompt_pending: bool,
+    /// Current assignment identity; absent on legacy single-assignment agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Delivery attempt identity. Recovery of the same attempt retains this ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_profile: Option<LaunchProfile>,
+    /// Append-only accepted results, including the current completed assignment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_tasks: Vec<CompletedTask>,
+    /// Admission decision for the current or most recent dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_reason: Option<String>,
+}
+
+/// Exact configured profile inputs, compared structurally rather than by name.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LaunchProfile {
+    pub name: String,
+    pub harness: String,
+    pub args: Vec<String>,
+}
+
+impl From<&crate::roles::Runner> for LaunchProfile {
+    fn from(runner: &crate::roles::Runner) -> Self {
+        Self {
+            name: runner.name.clone(),
+            harness: runner.harness.clone(),
+            args: runner.args.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CompletedTask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    pub task: String,
+    pub report: Report,
+    pub completed_at: String,
 }
 
 /// Persisted before automatic input. Follow-up acceptance cannot be inferred
 /// from Working because that may describe an earlier turn in the same session.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PromptClaim {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
     pub kind: String,
     pub text: String,
     /// Preserve the queue entry's provenance when a proven rejection restores it.
@@ -213,6 +266,9 @@ pub enum AgentStatus {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Report {
+    /// Optional for reports produced by legacy single-assignment prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     pub status: String,
     pub summary: String,
     pub tests: Vec<String>,
@@ -266,6 +322,9 @@ pub struct StoreData {
     pub lead: Option<LeadRecord>,
     pub tickets: Vec<Ticket>,
     pub agents: Vec<AgentRecord>,
+    /// Exact recipients journaled before ticket handoff or cleanup closes tabs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cleanup_retiring_agents: Vec<AgentRecord>,
     #[serde(default)]
     pub pending_pings: Vec<PendingPing>,
     #[serde(default)]

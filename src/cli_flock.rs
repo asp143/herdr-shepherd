@@ -21,6 +21,9 @@ pub enum AgentCommand {
         agent: String,
         #[arg(long)]
         report_file: std::path::PathBuf,
+        /// Assignment token from the task prompt (optional for legacy reports).
+        #[arg(long)]
+        task_id: Option<String>,
     },
     List {
         #[arg(long)]
@@ -65,7 +68,11 @@ pub fn run(
                 .ok_or_else(|| ShepherdError::Usage(format!("unknown agent: {name}")))?,
         )
         .expect("serializable"),
-        AgentCommand::Report { agent, report_file } => {
+        AgentCommand::Report {
+            agent,
+            report_file,
+            task_id,
+        } => {
             let text = crate::cli_pr::read_text(report_file)?;
             flock::validate_report(&text)?;
             if let Ok(caller) = std::env::var("HERDR_PANE_ID") {
@@ -81,11 +88,19 @@ pub fn run(
                     ));
                 }
             }
-            serde_json::to_value(flock::report(h, &store, &cfg, agent, &text)?)
-                .expect("serializable")
+            serde_json::to_value(flock::report_for_task(
+                h,
+                &store,
+                &cfg,
+                agent,
+                task_id.as_deref(),
+                &text,
+            )?)
+            .expect("serializable")
         }
         AgentCommand::Cancel { name, force } => {
-            serde_json::to_value(flock::cancel(h, &store, name, *force)?).expect("serializable")
+            serde_json::to_value(flock::cancel_with_config(h, &store, name, *force, &cfg)?)
+                .expect("serializable")
         }
         AgentCommand::Spawn {
             ticket,
@@ -198,6 +213,7 @@ pub fn run(
                 ticket.branch = child.branch;
                 label = Some(format!("{}-{unit}", role.name));
             }
+            drop(_placement);
             let rec = spawn_task_request(
                 h,
                 &store,
@@ -210,7 +226,6 @@ pub fn run(
                     tab_label: label.as_deref(),
                 },
             )?;
-            drop(_placement);
             drop(_ticket_operation);
             drop(_hooks);
             // A synchronous spawn hook may have reported or retired the agent.
@@ -237,34 +252,21 @@ pub struct TaskRequest<'a> {
     pub tab_label: Option<&'a str>,
 }
 
-pub fn spawn_task(
-    h: &dyn Herdr,
-    store: &Store,
-    cfg: &herdr_shepherd::config::Config,
-    state: &Path,
-    ticket: &herdr_shepherd::store::Ticket,
-    role_name: &str,
-    task: &str,
-) -> Result<herdr_shepherd::store::AgentRecord, ShepherdError> {
-    spawn_task_request(
-        h,
-        store,
-        cfg,
-        TaskRequest {
-            state,
-            ticket,
-            role_name,
-            task,
-            tab_label: None,
-        },
-    )
-}
-
 pub fn spawn_task_request(
     h: &dyn Herdr,
     store: &Store,
     cfg: &herdr_shepherd::config::Config,
     request: TaskRequest<'_>,
+) -> Result<herdr_shepherd::store::AgentRecord, ShepherdError> {
+    spawn_task_with_reservation(h, store, cfg, request, &|_, _| Ok(()))
+}
+
+pub fn spawn_task_with_reservation(
+    h: &dyn Herdr,
+    store: &Store,
+    cfg: &herdr_shepherd::config::Config,
+    request: TaskRequest<'_>,
+    reserved: &herdr_shepherd::launch::ReservationHook<'_>,
 ) -> Result<herdr_shepherd::store::AgentRecord, ShepherdError> {
     let TaskRequest {
         state,
@@ -300,13 +302,22 @@ pub fn spawn_task_request(
         harness.as_ref(),
     )
     .replace(harness.subagent_hint(), "{{subagent_hint}}");
+    let prompt = if matches!(role.name.as_str(), "reviewer" | "qa") {
+        let (base, head) =
+            herdr_shepherd::trusted::verification_heads(&worktree, &ticket.branch, &ticket.base)?;
+        prompt
+            .replace("{{verification_base}}", &base)
+            .replace("{{verification_head}}", &head)
+    } else {
+        prompt
+    };
     let runners = role
         .runners
         .iter()
         .map(|name| resolved.runners[name].clone())
         .collect();
     let tab_label = requested_label.unwrap_or(&role.name).to_owned();
-    flock::spawn(
+    flock::spawn_with_reservation(
         h,
         store,
         cfg,
@@ -320,6 +331,7 @@ pub fn spawn_task_request(
             prompt,
             state_dir: state.into(),
         },
+        reserved,
     )
 }
 

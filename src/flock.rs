@@ -1,5 +1,7 @@
 pub(crate) mod automatic;
-pub use automatic::retire as retire_automatically;
+pub use automatic::{
+    retire as retire_automatically, retire_with_config as retire_automatically_with_config,
+};
 
 use crate::{error::ShepherdError, store::Report};
 
@@ -20,14 +22,79 @@ pub fn store_report(
     name: &str,
     text: &str,
 ) -> Result<crate::store::AgentRecord, ShepherdError> {
-    use crate::store::AgentStatus;
+    store_report_for_task(store, name, None, text)
+}
+
+/// The CLI flag and JSON token must agree when both are supplied.
+pub fn store_report_for_task(
+    store: &crate::store::Store,
+    name: &str,
+    task_id: Option<&str>,
+    text: &str,
+) -> Result<crate::store::AgentRecord, ShepherdError> {
+    accept_report(store, name, task_id, text).map(|(record, _)| record)
+}
+
+fn accept_report(
+    store: &crate::store::Store,
+    name: &str,
+    task_id: Option<&str>,
+    text: &str,
+) -> Result<(crate::store::AgentRecord, bool), ShepherdError> {
+    use crate::store::{AgentStatus, CompletedTask};
     let report = validate_report(text)?;
+    if task_id
+        .zip(report.task_id.as_deref())
+        .is_some_and(|(flag, json)| flag != json)
+    {
+        return Err(ShepherdError::Usage(
+            "report task ID conflicts with --task-id".into(),
+        ));
+    }
+    let task_id = task_id.or(report.task_id.as_deref());
     store.update(|data| {
         let agent = data
             .agents
             .iter_mut()
             .find(|a| a.name == name)
             .ok_or_else(|| ShepherdError::Usage(format!("unknown agent: {name}")))?;
+        // Fence all effects, including clearing uncertain input claims, before
+        // consulting the old payload. An identical earlier result is still stale.
+        match task_id {
+            Some(id) if agent.task_id.as_deref() != Some(id) => {
+                return Err(ShepherdError::Usage("stale report task ID".into()));
+            }
+            None if agent.completed_tasks.iter().any(|completed| {
+                completed.task_id != agent.task_id || completed.attempt_id != agent.attempt_id
+            }) =>
+            {
+                return Err(ShepherdError::Usage(
+                    "--task-id is required after reassignment".into(),
+                ));
+            }
+            _ => {}
+        }
+        // Persist the verified identity even for flag-only/tokenless clients.
+        // Otherwise equal legacy JSON could be relabelled as a later task.
+        let mut report = report.clone();
+        report.task_id = agent.task_id.clone();
+        if let Some(old) = &agent.report {
+            if old.task_id != agent.task_id
+                || agent.completed_tasks.last().is_some_and(|completed| {
+                    completed.task_id != agent.task_id || completed.attempt_id != agent.attempt_id
+                })
+            {
+                return Err(ShepherdError::Usage(
+                    "stored report belongs to an earlier assignment".into(),
+                ));
+            }
+            if old == &report {
+                return Ok((agent.clone(), false));
+            }
+            return Err(ShepherdError::Usage(
+                "agent already submitted a different report".into(),
+            ));
+        }
         if !matches!(
             agent.status,
             AgentStatus::Starting
@@ -37,13 +104,34 @@ pub fn store_report(
         ) {
             return Err(ShepherdError::Usage("agent has been retired".into()));
         }
-        if let Some(old) = &agent.report {
-            if old == &report {
-                return Ok(agent.clone());
-            }
+        if agent.prompt_claim().is_some_and(|claim| {
+            claim.task_id != agent.task_id || claim.attempt_id != agent.attempt_id
+        }) {
             return Err(ShepherdError::Usage(
-                "agent already submitted a different report".into(),
+                "report does not own the current prompt claim".into(),
             ));
+        }
+        let newly_completed = match agent.completed_tasks.iter().find(|completed| {
+            completed.task_id == agent.task_id && completed.attempt_id == agent.attempt_id
+        }) {
+            Some(completed) => {
+                if completed.report != report || completed.task != agent.task {
+                    return Err(ShepherdError::Usage(
+                        "assignment already has a different completed report".into(),
+                    ));
+                }
+                false
+            }
+            None => true,
+        };
+        if newly_completed {
+            agent.completed_tasks.push(CompletedTask {
+                task_id: agent.task_id.clone(),
+                attempt_id: agent.attempt_id.clone(),
+                task: agent.task.clone(),
+                report: report.clone(),
+                completed_at: crate::launch::now(),
+            });
         }
         agent.status = AgentStatus::Reported;
         agent.prompt_pending = false;
@@ -51,7 +139,9 @@ pub fn store_report(
         agent.set_prompt_claim(None);
         agent.report = Some(report.clone());
         let rec = agent.clone();
-        if let Some(ticket) = data.tickets.iter_mut().find(|t| t.id == rec.ticket) {
+        if newly_completed
+            && let Some(ticket) = data.tickets.iter_mut().find(|t| t.id == rec.ticket)
+        {
             ticket.findings.extend(report.findings.clone());
             if rec.role == "planner" {
                 ticket.plan = Some(report.summary.clone());
@@ -65,7 +155,7 @@ pub fn store_report(
                     .flatten();
             }
         }
-        Ok(rec)
+        Ok((rec, newly_completed))
     })
 }
 
@@ -106,6 +196,18 @@ pub fn reconcile(
             continue;
         };
         let live = h.agent_get(&rec.name)?;
+        if live.is_none()
+            && h.agents()?.iter().any(|info| {
+                !matches!(info.agent_status.as_str(), "exited" | "stopped")
+                    && (info.name.as_deref() == Some(rec.name.as_str())
+                        || rec.pane_id.as_deref() == Some(info.pane_id.as_str()))
+            })
+        {
+            return Err(ShepherdError::PolicyDenied(
+                "agent lookup missing but predecessor process is still present; recovery deferred"
+                    .into(),
+            ));
+        }
         let session = live
             .as_ref()
             .map(|info| h.pane_session_ref(&info.pane_id))
@@ -165,6 +267,16 @@ pub fn reconcile(
                 None if current.prompt_delivery_uncertain() => {
                     current.status = AgentStatus::Blocked;
                 }
+                None if current.task_id.is_some()
+                    && current.attempt_id.is_some()
+                    && (!current.prompt_pending || !current.completed_tasks.is_empty()) =>
+                {
+                    // An accepted assignment, including a reused task waiting
+                    // for recovery input, remains pending after process loss.
+                    // Preserve its payload, session and claim for recovery or
+                    // explicit cancellation instead of silently retiring it.
+                    current.status = AgentStatus::Blocked;
+                }
                 None if current.status == AgentStatus::Starting => {
                     current.status = AgentStatus::LaunchFailed;
                     current.observed = Some("launch_failed: role re-queued".into());
@@ -184,11 +296,9 @@ pub fn reconcile(
             Ok(send_pending)
         })?;
         if send_pending {
-            let current = store
-                .read()?
-                .agents
-                .into_iter()
-                .find(|a| a.name == rec.name);
+            let current = store.read()?.agents.into_iter().find(|a| {
+                a.name == rec.name && a.task_id == rec.task_id && a.attempt_id == rec.attempt_id
+            });
             let delivery = if let Some(current) = current
                 && automatic::recipient(h, store, &current, false)?
                     .is_some_and(|info| matches!(info.agent_status.as_str(), "idle" | "done"))
@@ -201,8 +311,11 @@ pub fn reconcile(
                 && !error.prompt_submission_uncertain()
             {
                 store.update(|data| {
-                    if let Some(current) = data.agents.iter_mut().find(|a| a.name == rec.name)
-                        && current.report.is_none()
+                    if let Some(current) = data.agents.iter_mut().find(|a| {
+                        a.name == rec.name
+                            && a.task_id == rec.task_id
+                            && a.attempt_id == rec.attempt_id
+                    }) && current.report.is_none()
                         && current.status != AgentStatus::Retired
                     {
                         current.prompt_pending = true;
@@ -261,7 +374,21 @@ pub fn report(
     name: &str,
     text: &str,
 ) -> Result<crate::store::AgentRecord, ShepherdError> {
-    let rec = store_report(store, name, text)?;
+    report_for_task(h, store, cfg, name, None, text)
+}
+
+pub fn report_for_task(
+    h: &dyn crate::herdr::Herdr,
+    store: &crate::store::Store,
+    cfg: &crate::config::Config,
+    name: &str,
+    task_id: Option<&str>,
+    text: &str,
+) -> Result<crate::store::AgentRecord, ShepherdError> {
+    let (rec, accepted) = accept_report(store, name, task_id, text)?;
+    if !accepted {
+        return Ok(rec);
+    }
     ping_notice(
         h,
         store,
@@ -277,8 +404,9 @@ pub fn report(
     );
     crate::hooks::emit(
         cfg,
-        "agent.retired",
-        &serde_json::json!({"ticket":rec.ticket,"agent":rec.name,"role":rec.role}),
+        "agent.reported",
+        &serde_json::json!({"ticket":rec.ticket,"agent":rec.name,"role":rec.role,
+            "task_id":rec.task_id,"attempt_id":rec.attempt_id}),
     );
     Ok(rec)
 }
@@ -289,6 +417,16 @@ pub fn spawn(
     cfg: &crate::config::Config,
     req: crate::launch::LaunchRequest,
 ) -> Result<crate::store::AgentRecord, ShepherdError> {
+    spawn_with_reservation(h, store, cfg, req, &|_, _| Ok(()))
+}
+
+pub fn spawn_with_reservation(
+    h: &dyn crate::herdr::Herdr,
+    store: &crate::store::Store,
+    cfg: &crate::config::Config,
+    req: crate::launch::LaunchRequest,
+    reserved: &crate::launch::ReservationHook<'_>,
+) -> Result<crate::store::AgentRecord, ShepherdError> {
     let data = store.read()?;
     let ticket = data
         .tickets
@@ -298,7 +436,42 @@ pub fn spawn(
     if !crate::ticket::state::is_active(ticket.state) {
         return Err(ShepherdError::Usage("ticket is not active".into()));
     }
-    crate::launch::launch_configured(h, store, req, cfg)
+    crate::launch::launch_with_reservation(h, store, req, cfg, reserved)
+}
+
+/// A close acknowledgement alone cannot authorize retirement or cleanup.
+pub(crate) fn terminal_gone(
+    h: &dyn crate::herdr::Herdr,
+    rec: &crate::store::AgentRecord,
+) -> Result<bool, ShepherdError> {
+    let live = |info: &crate::herdr::AgentInfo| {
+        !matches!(info.agent_status.as_str(), "exited" | "stopped")
+    };
+    if h.agent_get(&rec.name)?.as_ref().is_some_and(live)
+        || h.agents()?.iter().any(|info| {
+            live(info)
+                && (info.name.as_deref() == Some(rec.name.as_str())
+                    || rec.pane_id.as_deref() == Some(info.pane_id.as_str()))
+        })
+    {
+        return Ok(false);
+    }
+    match rec.pane_id.as_deref() {
+        Some(pane) => h.pane_exists(pane).map(|exists| !exists),
+        None => Ok(true),
+    }
+}
+
+/// Call only after the owned terminal has closed and retirement is persisted.
+pub(crate) fn emit_retired(cfg: &crate::config::Config, rec: &crate::store::AgentRecord) {
+    crate::hooks::emit(
+        cfg,
+        "agent.retired",
+        &serde_json::json!({
+            "ticket":rec.ticket,"agent":rec.name,"role":rec.role,
+            "task_id":rec.task_id,"attempt_id":rec.attempt_id,
+        }),
+    );
 }
 
 pub fn cancel(
@@ -307,6 +480,31 @@ pub fn cancel(
     name: &str,
     force: bool,
 ) -> Result<crate::store::AgentRecord, ShepherdError> {
+    cancel_inner(h, store, name, force, None)
+}
+
+/// Explicit configuration keeps custom CLI hook selection intact.
+pub fn cancel_with_config(
+    h: &dyn crate::herdr::Herdr,
+    store: &crate::store::Store,
+    name: &str,
+    force: bool,
+    cfg: &crate::config::Config,
+) -> Result<crate::store::AgentRecord, ShepherdError> {
+    cancel_inner(h, store, name, force, Some(cfg))
+}
+
+fn cancel_inner(
+    h: &dyn crate::herdr::Herdr,
+    store: &crate::store::Store,
+    name: &str,
+    force: bool,
+    cfg: Option<&crate::config::Config>,
+) -> Result<crate::store::AgentRecord, ShepherdError> {
+    let _hooks = crate::hooks::defer();
+    // Dispatch and recovery own this same lock while task input is in flight.
+    // Wait before reading the assignment that cancellation will actually stop.
+    let _operation = agent_operation(store, name)?;
     use crate::store::AgentStatus;
     let data = store.read()?;
     let rec = data
@@ -314,6 +512,9 @@ pub fn cancel(
         .iter()
         .find(|a| a.name == name)
         .ok_or_else(|| ShepherdError::Usage(format!("unknown agent: {name}")))?;
+    if rec.status == AgentStatus::Retired && terminal_gone(h, rec)? {
+        return Ok(rec.clone());
+    }
     if let Some(live) = h.agent_get(name)? {
         let inside = live
             .cwd
@@ -334,21 +535,45 @@ pub fn cancel(
     if let Some(tab) = &rec.tab_id {
         h.close_tab(tab)?;
     }
-    store.update(|data| {
+    if !terminal_gone(h, rec)? {
+        return Err(ShepherdError::PolicyDenied(
+            "agent terminal has not closed; resources kept".into(),
+        ));
+    }
+    let retired = store.update(|data| {
         let rec = data
             .agents
             .iter_mut()
-            .find(|a| a.name == name)
-            .expect("record retained");
+            .find(|a| {
+                a.name == name
+                    && a.task_id == rec.task_id
+                    && a.attempt_id == rec.attempt_id
+                    && a.pane_id == rec.pane_id
+            })
+            .ok_or_else(|| {
+                ShepherdError::PolicyDenied("cancelled assignment changed; resources kept".into())
+            })?;
         rec.status = AgentStatus::Retired;
         Ok(rec.clone())
-    })
+    })?;
+    if rec.status != AgentStatus::Retired
+        && let Some(cfg) = cfg
+    {
+        emit_retired(cfg, &retired);
+    }
+    Ok(retired)
 }
 
 /// An operation releases its OS lock even when a concurrent fork inherited
 /// the file description and has not reached close-on-exec yet.
 pub struct AgentOperationGuard {
     file: std::fs::File,
+}
+
+impl AgentOperationGuard {
+    pub(crate) fn from_file(file: std::fs::File) -> Self {
+        Self { file }
+    }
 }
 
 impl Drop for AgentOperationGuard {
@@ -359,19 +584,35 @@ impl Drop for AgentOperationGuard {
 
 /// A live launcher owns its intent until it finishes or its process exits.
 /// Recovery skips busy records instead of mistaking in-flight admission for loss.
-pub fn try_agent_operation(
+fn agent_operation_file(
     store: &crate::store::Store,
     name: &str,
-) -> Result<Option<AgentOperationGuard>, ShepherdError> {
+) -> Result<std::fs::File, ShepherdError> {
     std::fs::create_dir_all(store.root()).map_err(anyhow::Error::from)?;
     let hash = crate::store::project_hash(std::path::Path::new(name));
-    let lock = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(store.root().join(format!("agent-{}.lock", &hash[..16])))
-        .map_err(anyhow::Error::from)?;
+        .map_err(|error| anyhow::Error::from(error).into())
+}
+
+fn agent_operation(
+    store: &crate::store::Store,
+    name: &str,
+) -> Result<AgentOperationGuard, ShepherdError> {
+    let lock = agent_operation_file(store, name)?;
+    lock.lock().map_err(anyhow::Error::from)?;
+    Ok(AgentOperationGuard { file: lock })
+}
+
+pub fn try_agent_operation(
+    store: &crate::store::Store,
+    name: &str,
+) -> Result<Option<AgentOperationGuard>, ShepherdError> {
+    let lock = agent_operation_file(store, name)?;
     match lock.try_lock() {
         Ok(()) => Ok(Some(AgentOperationGuard { file: lock })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -442,6 +683,12 @@ mod tests {
             nudges: 0,
             restarts: 0,
             prompt_pending: false,
+            task_id: None,
+            attempt_id: None,
+            unit: None,
+            launch_profile: None,
+            completed_tasks: vec![],
+            dispatch_reason: None,
         };
         store
             .update(|data| {

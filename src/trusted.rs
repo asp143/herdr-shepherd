@@ -46,6 +46,7 @@ fn safe_path(path: &Path) -> Result<PathBuf, ShepherdError> {
 }
 
 struct Repository {
+    git_dir: PathBuf,
     main: PathBuf,
     common: PathBuf,
 }
@@ -89,6 +90,7 @@ fn repository(path: &Path) -> Result<Option<Repository>, ShepherdError> {
             .to_path_buf()
     };
     Ok(Some(Repository {
+        git_dir,
         main: safe_path(&main)?,
         common,
     }))
@@ -395,6 +397,44 @@ fn main_head(common: &Path) -> Result<(Option<String>, Option<String>), Shepherd
     }
     Ok((None, valid_oid(text.trim()).then(|| text.trim().into())))
 }
+/// Observe verification SHAs without creating or changing project trust. These
+/// are task inputs, never authorization for a push or configuration change.
+/// Filesystem ref reads preserve legacy direct-spawn support and cannot execute
+/// checkout hooks, helpers, or Git configuration supplied by an earlier agent.
+pub fn verification_heads(
+    worktree: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<(String, String), ShepherdError> {
+    let repo =
+        repository(worktree)?.ok_or_else(|| denied("verification requires a Git checkout"))?;
+    if repo.git_dir != repo.common && !repo.git_dir.starts_with(repo.common.join("worktrees")) {
+        return Err(denied("verification worktree metadata left the repository"));
+    }
+    let head_path = safe_path(&repo.git_dir.join("HEAD"))?;
+    if !head_path.starts_with(&repo.git_dir) {
+        return Err(denied("verification HEAD escapes its Git directory"));
+    }
+    let head_text = fs::read_to_string(&head_path).map_err(anyhow::Error::from)?;
+    let reference = format!("refs/heads/{branch}");
+    if head_text.trim() != format!("ref: {reference}") {
+        return Err(denied(
+            "verification checkout differs from its assigned branch",
+        ));
+    }
+    let head = read_ref(&repo.common, &reference, 0)?
+        .ok_or_else(|| denied("verification HEAD is missing"))?;
+    let base = read_ref(&repo.common, &format!("refs/remotes/origin/{base}"), 0)?
+        .or(read_ref(&repo.common, &format!("refs/heads/{base}"), 0)?)
+        .ok_or_else(|| denied("verification base is missing"))?;
+    if fs::read_to_string(head_path).map_err(anyhow::Error::from)? != head_text
+        || read_ref(&repo.common, &reference, 0)?.as_ref() != Some(&head)
+    {
+        return Err(denied("verification HEAD changed while pinning the task"));
+    }
+    Ok((base, head))
+}
+
 fn global_config() -> Result<Option<PathBuf>, ShepherdError> {
     let path = std::env::var_os("GIT_CONFIG_GLOBAL")
         .map(PathBuf::from)

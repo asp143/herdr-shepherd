@@ -12,10 +12,12 @@ use super::{
 };
 
 pub type StartObserver = Box<dyn Fn(&str) + Send>;
+pub type PromptEffect = Box<dyn Fn(&FakeHerdr, &str) + Send>;
 
 pub struct FakeHerdr {
     pub on_start: RefCell<Option<StartObserver>>,
     pub on_prompt: RefCell<Option<StartObserver>>,
+    pub on_prompt_effect: RefCell<Option<PromptEffect>>,
     pub on_send_keys: RefCell<Option<StartObserver>>,
     pub on_get: RefCell<Option<StartObserver>>,
     pub workspaces: RefCell<Vec<Workspace>>,
@@ -23,7 +25,12 @@ pub struct FakeHerdr {
     pub notify_error: Cell<bool>,
     pub agent_records: RefCell<Vec<AgentInfo>>,
     pub agent_get_results: RefCell<VecDeque<Option<AgentInfo>>>,
+    pub agent_get_errors: RefCell<HashMap<String, String>>,
     pub start_results: RefCell<VecDeque<AgentStart>>,
+    /// False acknowledges tab closure without removing its pane or process.
+    pub close_tab_effects: RefCell<VecDeque<bool>>,
+    /// A close may take effect before its acknowledgement is lost.
+    pub close_tab_results: RefCell<VecDeque<Result<(), ShepherdError>>>,
     /// Script transport outcomes independently of application acceptance.
     pub prompt_results: RefCell<VecDeque<(bool, Result<(), ShepherdError>)>>,
     pub accepted_prompts: RefCell<Vec<String>>,
@@ -46,6 +53,7 @@ impl FakeHerdr {
         Self {
             on_start: RefCell::new(None),
             on_prompt: RefCell::new(None),
+            on_prompt_effect: RefCell::new(None),
             on_send_keys: RefCell::new(None),
             on_get: RefCell::new(None),
             workspaces: RefCell::new(workspaces),
@@ -53,7 +61,10 @@ impl FakeHerdr {
             notify_error: Cell::new(false),
             agent_records: RefCell::new(Vec::new()),
             agent_get_results: RefCell::new(VecDeque::new()),
+            agent_get_errors: RefCell::new(HashMap::new()),
             start_results: RefCell::new(VecDeque::new()),
+            close_tab_effects: RefCell::new(VecDeque::new()),
+            close_tab_results: RefCell::new(VecDeque::new()),
             prompt_results: RefCell::new(VecDeque::new()),
             accepted_prompts: RefCell::new(Vec::new()),
             visible_screens: RefCell::new(VecDeque::new()),
@@ -171,6 +182,9 @@ impl Herdr for FakeHerdr {
         Ok(result)
     }
     fn agent_get(&self, name: &str) -> Result<Option<AgentInfo>, ShepherdError> {
+        if let Some(message) = self.agent_get_errors.borrow().get(name) {
+            return Err(ShepherdError::Usage(message.clone()));
+        }
         let info = self
             .agent_get_results
             .borrow_mut()
@@ -198,6 +212,9 @@ impl Herdr for FakeHerdr {
             .push(format!("prompt_agent {name} {text} {until_working}"));
         if let Some(observer) = self.on_prompt.borrow().as_ref() {
             observer(name);
+        }
+        if let Some(effect) = self.on_prompt_effect.borrow().as_ref() {
+            effect(self, name);
         }
         if self
             .agent_records
@@ -249,10 +266,24 @@ impl Herdr for FakeHerdr {
     }
     fn close_tab(&self, tab: &str) -> Result<(), ShepherdError> {
         self.calls.borrow_mut().push(format!("close_tab {tab}"));
+        if !self
+            .close_tab_effects
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(true)
+        {
+            return self
+                .close_tab_results
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Ok(()));
+        }
         let panes: Vec<String> = self
             .pane_cwds
             .borrow()
             .keys()
+            .chain(self.pane_sessions.borrow().keys())
+            .chain(self.pane_workspaces.borrow().keys())
             .filter(|pane| pane.replace(":p", ":t") == tab)
             .cloned()
             .collect();
@@ -264,7 +295,10 @@ impl Herdr for FakeHerdr {
             self.pane_workspaces.borrow_mut().remove(&pane);
             self.pane_sessions.borrow_mut().remove(&pane);
         }
-        Ok(())
+        self.close_tab_results
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(Ok(()))
     }
     fn focus_agent(&self, name: &str) -> Result<(), ShepherdError> {
         self.calls.borrow_mut().push(format!("focus_agent {name}"));

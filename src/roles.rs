@@ -18,6 +18,7 @@ pub struct ShepherdSettings {
     pub max_concurrent_tickets: usize,
     pub max_parallel_agents: usize,
     pub max_revision_rounds: u32,
+    pub max_completed_assignments: usize,
     pub pr_poll_seconds: u64,
     pub integration_branch: String,
     pub protected_branches: Vec<String>,
@@ -30,6 +31,7 @@ impl Default for ShepherdSettings {
             max_concurrent_tickets: 2,
             max_parallel_agents: 6,
             max_revision_rounds: 3,
+            max_completed_assignments: 5,
             pr_poll_seconds: 180,
             integration_branch: "auto".into(),
             protected_branches: [
@@ -430,6 +432,10 @@ pub fn resolve(cfg: &Config) -> Result<Resolved, ShepherdError> {
             "max_revision_rounds",
             resolved.shepherd.max_revision_rounds == 0,
         ),
+        (
+            "max_completed_assignments",
+            resolved.shepherd.max_completed_assignments == 0,
+        ),
     ] {
         if zero {
             return Err(invalid(cfg, format!("shepherd.{name} must be at least 1")));
@@ -718,6 +724,7 @@ mod tests {
             "max_concurrent_tickets",
             "max_parallel_agents",
             "max_revision_rounds",
+            "max_completed_assignments",
         ] {
             let error = resolve(&config(&format!("[shepherd]\n{name} = 0"))).unwrap_err();
             assert_eq!(error.code(), "config_invalid");

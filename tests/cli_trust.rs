@@ -133,6 +133,12 @@ fn cli_hooks_use_frozen_text_after_shared_local_ref_poisoning() {
                 nudges: 0,
                 restarts: 0,
                 prompt_pending: false,
+                task_id: None,
+                attempt_id: None,
+                unit: None,
+                launch_profile: None,
+                completed_tasks: vec![],
+                dispatch_reason: None,
             });
             Ok(())
         })

@@ -1,3 +1,7 @@
+mod reuse;
+#[cfg(test)]
+mod reuse_tests;
+
 use crate::{
     config::Config,
     error::ShepherdError,
@@ -58,15 +62,44 @@ pub fn agent_name(project_root: &Path, ticket: &str, role: &str, number: usize) 
     format!("sh-{}-{role}{suffix}", &hash[..6])
 }
 
+/// Opaque assignment token, generated once before persisting a launch intent.
+/// Native resume and provider fallback keep the current token.
+pub fn new_task_id(name: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(name.as_bytes());
+    hash.update(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes(),
+    );
+    format!("{:x}", hash.finalize())[..24].to_owned()
+}
+
 pub fn launch_configured(
     h: &dyn Herdr,
     store: &Store,
     req: LaunchRequest,
     cfg: &Config,
 ) -> Result<AgentRecord, ShepherdError> {
+    launch_with_reservation(h, store, req, cfg, &|_, _| Ok(()))
+}
+
+/// Persist the caller's assignment reference in the same transaction as the
+/// launch/reuse intent, before any input can reach the recipient.
+pub type ReservationHook<'a> =
+    dyn Fn(&mut crate::store::StoreData, &AgentRecord) -> Result<(), ShepherdError> + 'a;
+
+pub fn launch_with_reservation(
+    h: &dyn Herdr,
+    store: &Store,
+    req: LaunchRequest,
+    cfg: &Config,
+    reserved: &ReservationHook<'_>,
+) -> Result<AgentRecord, ShepherdError> {
     let _hooks = crate::hooks::defer();
     let _ticket_operation = crate::ticket::operation::shared(store, &req.ticket)?;
-    let resolved = crate::roles::resolve(cfg)?;
     let first = req
         .runners
         .first()
@@ -75,37 +108,49 @@ pub fn launch_configured(
     for runner in &req.runners {
         crate::harness::harness_for(&runner.harness)?;
     }
-    let (mut record, _operation) = store.update(|data| {
+    // Fail a conflicting writer before waiting on placement. The same check
+    // runs again under placement and in the reservation transaction.
+    reuse::check_admission(&store.read()?, &req, cfg)?;
+    let _placement = reuse::placement(store)?;
+    let admission = reuse::admit(h, store, &req, cfg, reserved)?;
+    let (reason, transfer) = match admission {
+        reuse::Admission::Reused(record) => return Ok(*record),
+        reuse::Admission::Fresh { reason, transfer } => (reason, transfer),
+    };
+    reuse::retire_predecessor_writers(
+        h,
+        store,
+        &req,
+        cfg,
+        transfer.as_ref().map(|t| t.reserved.name.as_str()),
+    )?;
+    let (mut record, _operation, needs_launch) = store.update(|data| {
+        if let Some(transfer) = &transfer {
+            let current = data
+                .agents
+                .iter_mut()
+                .find(|a| a.name == transfer.reserved.name)
+                .ok_or_else(|| ShepherdError::Usage("reuse recipient disappeared".into()))?;
+            if current.task_id != transfer.reserved.task_id
+                || current.attempt_id != transfer.reserved.attempt_id
+                || current.report.is_some()
+                || current.status == AgentStatus::Retired
+            {
+                return Ok((current.clone(), None, false));
+            }
+            if current != &transfer.reserved {
+                return Err(ShepherdError::Usage(
+                    "reuse intent changed; retry dispatch".into(),
+                ));
+            }
+            *current = transfer.original.clone();
+            current.dispatch_reason = Some(format!("unavailable: {reason}"));
+        }
+        reuse::check_admission(data, &req, cfg)?;
         let cwd = req
             .worktree
             .canonicalize()
             .unwrap_or_else(|_| req.worktree.clone());
-        if data.tickets.iter().any(|ticket| {
-            ticket.child_cleanup.iter().any(|receipt| {
-                cwd.starts_with(&receipt.path) || req.worktree.starts_with(&receipt.child.path)
-            })
-        }) {
-            return Err(ShepherdError::Usage(
-                "child checkout has outstanding cleanup; finish cleanup before launching an agent"
-                    .into(),
-            ));
-        }
-        if req.role.name != "lead"
-            && data
-                .agents
-                .iter()
-                .filter(|record| {
-                    record.role != "lead"
-                        && matches!(
-                            record.status,
-                            AgentStatus::Starting | AgentStatus::Working | AgentStatus::Blocked
-                        )
-                })
-                .count()
-                >= resolved.shepherd.max_parallel_agents
-        {
-            return Err(ShepherdError::Capacity);
-        }
         if req.role.name == "lead"
             && data.agents.iter().any(|record| {
                 record.role == "lead"
@@ -118,12 +163,6 @@ pub fn launch_configured(
             return Err(ShepherdError::Usage(
                 "lead is already running; resume it".into(),
             ));
-        }
-        if req.role.name != "lead"
-            && let Some(ticket) = data.tickets.iter().find(|t| t.id == req.ticket)
-            && !crate::ticket::state::is_active(ticket.state)
-        {
-            return Err(ShepherdError::Usage("ticket is not active".into()));
         }
         let mut number = data
             .agents
@@ -144,8 +183,30 @@ pub fn launch_configured(
         if req.role.name == "lead" {
             data.agents.retain(|record| record.name != name);
         }
+        let task_id = transfer
+            .as_ref()
+            .and_then(|t| t.reserved.task_id.clone())
+            .unwrap_or_else(|| new_task_id(&name));
+        let attempt = if transfer.is_some() { 2 } else { 1 };
+        let unit = data
+            .tickets
+            .iter()
+            .find(|ticket| ticket.id == req.ticket)
+            .and_then(|ticket| {
+                ticket.children.iter().find(|child| {
+                    child
+                        .path
+                        .canonicalize()
+                        .unwrap_or_else(|_| child.path.clone())
+                        == cwd
+                })
+            })
+            .map(|child| child.unit);
         let record = AgentRecord {
-            task: req.prompt.replace("{{agent_name}}", &name),
+            task: req
+                .prompt
+                .replace("{{agent_name}}", &name)
+                .replace("{{task_id}}", &task_id),
             name,
             ticket: req.ticket.clone(),
             role: req.role.name.clone(),
@@ -165,10 +226,25 @@ pub fn launch_configured(
             nudges: 0,
             restarts: 0,
             prompt_pending: true,
+            attempt_id: Some(format!("{task_id}-{attempt}")),
+            task_id: Some(task_id),
+            unit,
+            launch_profile: Some(first.into()),
+            completed_tasks: vec![],
+            dispatch_reason: Some(reason.clone()),
         };
         data.agents.push(record.clone());
-        Ok((record, operation))
+        reserved(data, &record)?;
+        Ok((record, Some(operation), true))
     })?;
+    if !needs_launch {
+        return Ok(record);
+    }
+    if let Some(transfer) = &transfer
+        && transfer.original.status == AgentStatus::Retired
+    {
+        crate::flock::emit_retired(cfg, &transfer.original);
+    }
     let result = launch_reserved(h, store, &req, cfg, &mut record);
     if result.is_err() {
         // A CLI timeout can follow a successful admission. Retain Starting
@@ -177,6 +253,8 @@ pub fn launch_configured(
     }
     result?;
     drop(_operation);
+    drop(transfer);
+    drop(_placement);
     drop(_ticket_operation);
     drop(_hooks);
     store
@@ -194,19 +272,16 @@ fn save(store: &Store, record: &AgentRecord) -> Result<(), ShepherdError> {
             .iter_mut()
             .find(|stored| stored.name == record.name)
             .ok_or_else(|| ShepherdError::Usage("launch record disappeared".into()))?;
-        // An immediately finishing agent may report while launch waits for
-        // its working signal. Keep that report rather than overwriting it.
-        if stored.status == AgentStatus::Retired {
+        // Reports can land after the launch reload. Preserve their immutable
+        // history and resolved claims along with the accepted result.
+        if stored.task_id != record.task_id
+            || stored.attempt_id != record.attempt_id
+            || stored.status == AgentStatus::Retired
+            || stored.report.is_some()
+        {
             return Ok(());
         }
-        let report = stored.report.clone();
-        let status = stored.status;
         *stored = record.clone();
-        if report.is_some() {
-            stored.report = report;
-            stored.status = status;
-            stored.prompt_pending = false;
-        }
         Ok(())
     })
 }
@@ -312,8 +387,10 @@ fn launch_reserved(
         record.task = req
             .prompt
             .replace("{{agent_name}}", &record.name)
+            .replace("{{task_id}}", record.task_id.as_deref().unwrap_or_default())
             .replace("{{subagent_hint}}", harness.subagent_hint());
         record.runner = runner.name.clone();
+        record.launch_profile = Some(runner.into());
         record.status = AgentStatus::Starting;
         record.prompt_pending = true;
         let (tab, pane) = h.create_tab(&req.workspace_id, &req.tab_label, &req.worktree)?;
@@ -330,6 +407,14 @@ fn launch_reserved(
         if !current_launch(store, record)? {
             return Ok(());
         }
+        if let Some(reference) = h.pane_session_ref(&pane)?.filter(|s| !s.is_empty()) {
+            let mut observation: serde_json::Value =
+                serde_json::from_str(record.observed.as_deref().unwrap_or("{}"))
+                    .unwrap_or_else(|_| serde_json::json!({}));
+            observation["session_ref"] = reference.into();
+            record.observed = Some(observation.to_string());
+            save(store, record)?;
+        }
         if start == AgentStart::NotReady {
             let screen = h.read_visible(&record.name)?;
             if harness.provider_failure(&screen) {
@@ -345,6 +430,12 @@ fn launch_reserved(
                 h.close_tab(&tab)?;
                 if !current_launch(store, record)? {
                     return Ok(());
+                }
+                if !crate::flock::terminal_gone(h, record)? {
+                    return Err(ShepherdError::Usage(
+                        "provider fallback deferred: predecessor terminal is not confirmed stopped"
+                            .into(),
+                    ));
                 }
                 record.status = AgentStatus::LaunchFailed;
                 record.observed = Some(
@@ -770,6 +861,23 @@ mod tests {
                 2
             );
         }
+    }
+
+    #[test]
+    fn launch_save_preserves_completed_assignment_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let store = Store::open(&state, dir.path()).unwrap();
+        let h = FakeHerdr::new(vec![]);
+        let snapshot = launch(&h, &store, req(dir.path(), &state)).unwrap();
+        let completed = crate::flock::store_report(&store, &snapshot.name,
+            r#"{"status":"completed","summary":"done","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+        // The report does not take the launch lock and may land after a reload.
+        save(&store, &snapshot).unwrap();
+        let saved = store.read().unwrap().agents.remove(0);
+        assert_eq!(saved.completed_tasks, completed.completed_tasks);
+        assert_eq!(saved.report, completed.report);
+        assert!(saved.prompt_claim().is_none());
     }
 
     #[test]

@@ -5,6 +5,15 @@ mod pi;
 
 use crate::{error::ShepherdError, roles::Runner};
 
+/// An observation, not an admission policy or an estimated utilization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextHealth {
+    Healthy,
+    NearLimit,
+    Exhausted,
+    Unknown,
+}
+
 pub trait Harness {
     fn kind(&self) -> &'static str;
     fn launch_args(&self, runner: &Runner) -> Vec<String>;
@@ -22,6 +31,14 @@ pub trait Harness {
     }
     fn subagent_hint(&self) -> &'static str;
     fn provider_failure(&self, screen: &str) -> bool;
+    /// AgentInfo has no context telemetry. No supported harness currently has
+    /// a verified, bounded visible gauge in our fixtures, so all return Unknown.
+    /// Do not infer health from conversation text, provider quota errors, or
+    /// invented percentages. A future override needs harness-specific evidence.
+    /// Unknown eligibility and assignment caps belong to the dispatcher.
+    fn context_health(&self, _screen: &str) -> ContextHealth {
+        ContextHealth::Unknown
+    }
     fn resume_args(&self, runner: &Runner, session_ref: Option<&str>) -> Vec<String> {
         let mut args = runner.args.clone();
         match (self.kind(), session_ref) {
@@ -64,6 +81,29 @@ fn provider_failure(screen: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_health_is_unknown_without_a_verified_harness_signal() {
+        // These are untrusted conversation text, not verified status gauges.
+        // Neither a percentage nor an exhaustion phrase proves utilization.
+        for kind in ["codex", "omp", "claude", "pi"] {
+            let harness = harness_for(kind).unwrap();
+            for screen in [
+                "",
+                "idle",
+                "context 99% full",
+                "context exhausted",
+                "100% context left",
+                "quota exhausted",
+            ] {
+                assert_eq!(
+                    harness.context_health(screen),
+                    ContextHealth::Unknown,
+                    "{kind}: {screen}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn managed_omp_overlay_precedes_literal_argument_separator() {
