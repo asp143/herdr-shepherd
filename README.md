@@ -476,7 +476,11 @@ old stored reports cannot complete a new assignment. Exact duplicates of the
 current assignment are idempotent. The optional flag preserves compatibility
 for original unreused assignments; tokenless reports are rejected after reuse.
 Existing stored agents still load, but unverifiable legacy identities start
-fresh.
+fresh. An interrupted legacy revision or CI dispatch with an unbound completed
+role blocks for reconciliation instead of repeating work. The error and the
+agent's `dispatch_reason` identify saved reports that need review; pending
+revision and CI intent remain intact. Already-bound legacy reports still
+advance their original workflow.
 
 Reviewer and QA tasks pin base and HEAD, cover the complete current diff and
 every acceptance criterion, and require new commands and evidence. Earlier

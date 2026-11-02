@@ -71,6 +71,64 @@ pub enum RevisionOutcome {
     Blocked,
 }
 
+/// An old launcher saved agents before binding its workflow reference. There
+/// is no reliable generation token in those records, so never infer completion
+/// from prompt prose or silently launch the same role again after an upgrade.
+/// Keep the report and pending workflow intact for explicit reconciliation.
+pub fn block_unbound_legacy_dispatch(
+    ticket: &mut Ticket,
+    agents: &mut [crate::store::AgentRecord],
+    role: &str,
+    workflow: &str,
+    now: &str,
+    max_revision_rounds: u32,
+) -> Result<Option<String>, ShepherdError> {
+    let checkout = ticket
+        .worktree
+        .as_ref()
+        .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()));
+    let recipients: Vec<_> = agents
+        .iter_mut()
+        .filter(|agent| {
+            agent.ticket == ticket.id
+                && agent.role == role
+                && agent.unit.is_none()
+                && agent.task_id.is_none()
+                && agent.attempt_id.is_none()
+                && agent.report.is_some()
+                && checkout.as_ref().is_some_and(|path| {
+                    agent
+                        .worktree
+                        .canonicalize()
+                        .unwrap_or_else(|_| agent.worktree.clone())
+                        == *path
+                })
+        })
+        .collect();
+    if recipients.is_empty() {
+        return Ok(None);
+    }
+    let names = recipients
+        .iter()
+        .map(|agent| agent.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let message = format!(
+        "unbound legacy dispatch for {workflow} {role}: {names}; inspect and reconcile the saved reports with the pending workflow before resuming; no replacement task was started"
+    );
+    for agent in recipients {
+        agent.dispatch_reason = Some(format!("blocked: {message}"));
+    }
+    super::state::transition_with_limit(
+        ticket,
+        TicketState::Blocked,
+        Some(crate::store::BlockedReason::Escalated),
+        now,
+        max_revision_rounds,
+    )?;
+    Ok(Some(message))
+}
+
 /// Keep revision launch and terminal PR retirement mutually exclusive.
 /// The separate lock permits agent launch to acquire the project state lock.
 pub fn dispatch_lock(
@@ -167,6 +225,26 @@ pub fn resume_revision(
                 attempt_id: None,
                 tested_sha: None,
             });
+        }
+        let run = ticket.revision_run.as_ref().expect("initialized run");
+        if initial.revision_run.is_some() && run.agent.is_none() && run.stage != RevisionStage::Push
+        {
+            let role = match run.stage {
+                RevisionStage::Coder => "coder",
+                RevisionStage::Reviewer => "reviewer",
+                RevisionStage::Qa => "qa",
+                RevisionStage::Push => unreachable!(),
+            };
+            if let Some(message) = block_unbound_legacy_dispatch(
+                ticket,
+                &mut data.agents,
+                role,
+                "revision",
+                now,
+                settings.max_revision_rounds,
+            )? {
+                return Ok(Err(ShepherdError::Usage(message)));
+            }
         }
         let run = ticket.revision_run.as_mut().expect("initialized run");
         if let Some(name) = &run.agent {

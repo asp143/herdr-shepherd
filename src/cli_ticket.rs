@@ -185,6 +185,35 @@ pub fn dispatch_with_backend(
                     if ticket.ci_failure_task.is_none() {
                         return Ok(None);
                     }
+                    if ticket.ci_recovery.is_none() {
+                        let blocked = store.update(|data| {
+                            let current = data
+                                .tickets
+                                .iter_mut()
+                                .find(|current| {
+                                    current.id == id && current.state == TicketState::Building
+                                })
+                                .ok_or_else(|| {
+                                    ShepherdError::Usage(
+                                        "CI retry changed before reconciliation".into(),
+                                    )
+                                })?;
+                            if current.ci_recovery.is_some() {
+                                return Ok(None);
+                            }
+                            herdr_shepherd::ticket::revise::block_unbound_legacy_dispatch(
+                                current,
+                                &mut data.agents,
+                                "coder",
+                                "CI recovery",
+                                &launch::now(),
+                                resolved.shepherd.max_revision_rounds,
+                            )
+                        })?;
+                        if let Some(message) = blocked {
+                            return Err(ShepherdError::Usage(message));
+                        }
+                    }
                     let generation = ci_retry_generation(&ticket);
                     if let Some(recovery) = &ticket.ci_recovery
                         && recovery.generation == generation
@@ -726,6 +755,66 @@ mod dispatch_tests {
             .unwrap();
         f.dispatch();
         assert_eq!(f.store.read().unwrap().agents.len(), 2);
+    }
+
+    #[test]
+    fn interrupted_legacy_ci_never_repeats_completed_coder() {
+        let f = Fixture::new(2);
+        f.ticket("ci", TicketState::Building);
+        let task = "Fix the legacy CI failure";
+        f.store
+            .update(|data| {
+                data.tickets[0].ci_failure_task = Some(task.into());
+                Ok(())
+            })
+            .unwrap();
+        f.dispatch();
+        let name = f.store.read().unwrap().agents[0].name.clone();
+        f.store
+            .update(|data| {
+                data.tickets[0].ci_failure_task = Some(task.into());
+                data.tickets[0].ci_recovery = None;
+                let agent = &mut data.agents[0];
+                agent.task_id = None;
+                agent.attempt_id = None;
+                agent.launch_profile = None;
+                agent.completed_tasks.clear();
+                agent.dispatch_reason = None;
+                Ok(())
+            })
+            .unwrap();
+        herdr_shepherd::flock::store_report(&f.store, &name, r#"{"status":"completed","summary":"legacy CI fixed","tests":["fixture"],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).unwrap();
+        f.store
+            .update(|data| {
+                data.agents[0].completed_tasks.clear();
+                Ok(())
+            })
+            .unwrap();
+        let result = f.dispatch();
+        let data = f.store.read().unwrap();
+        assert_eq!(
+            data.agents.len(),
+            1,
+            "must not repeat a completed legacy CI dispatch: {result}"
+        );
+        assert_eq!(f.h.start_args.borrow().len(), 1);
+        assert_eq!(data.tickets[0].state, TicketState::Blocked);
+        assert_eq!(data.tickets[0].ci_failure_task.as_deref(), Some(task));
+        assert!(
+            result["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("legacy dispatch")
+        );
+        assert!(
+            data.agents[0]
+                .dispatch_reason
+                .as_deref()
+                .unwrap()
+                .contains("reconcile")
+        );
+        assert!(f.dispatch()["started"].as_array().unwrap().is_empty());
+        assert_eq!(f.store.read().unwrap().agents.len(), 1);
     }
 
     #[test]

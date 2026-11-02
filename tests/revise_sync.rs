@@ -1767,3 +1767,103 @@ fn interrupted_revision_delivery_keeps_persisted_assignment() {
         assert_eq!(h.start_args.borrow().len(), if reuse { 2 } else { 1 });
     }
 }
+
+#[test]
+fn interrupted_legacy_revision_never_repeats_completed_role() {
+    if !local_transport_enabled("interrupted_legacy_revision_never_repeats_completed_role") {
+        return;
+    }
+    use herdr_shepherd::{
+        herdr::fake::FakeHerdr,
+        ticket::revise::{RevisionOutcome, RevisionStage},
+    };
+    // Every agent stage had the same separate launch/reference writes.
+    for (stage, role) in [
+        (RevisionStage::Coder, "coder"),
+        (RevisionStage::Reviewer, "reviewer"),
+        (RevisionStage::Qa, "qa"),
+    ] {
+        let repo = Repo::new();
+        let store = stored_revision(&repo);
+        let h = FakeHerdr::new(vec![]);
+        let gh = PushBackend::new(&repo);
+        let cfg = herdr_shepherd::config::load(&repo.gate().config_dir, None).unwrap();
+        let RevisionOutcome::Started { agent, .. } =
+            resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "now").unwrap()
+        else {
+            panic!("expected coder")
+        };
+        // Old binaries saved the agent before the separate run.agent write.
+        store
+            .update(|d| {
+                let run = d.tickets[0].revision_run.as_mut().unwrap();
+                run.stage = stage;
+                run.agent = None;
+                run.task_id = None;
+                run.attempt_id = None;
+                let rec = &mut d.agents[0];
+                rec.role = role.into();
+                rec.task_id = None;
+                rec.attempt_id = None;
+                rec.launch_profile = None;
+                rec.completed_tasks.clear();
+                rec.dispatch_reason = None;
+                Ok(())
+            })
+            .unwrap();
+        herdr_shepherd::flock::store_report(&store, &agent, &serde_json::json!({"status":"completed","summary":"legacy role finished","tests":["fixture"],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":git(&repo.root, &["rev-parse", "HEAD"])}).to_string()).unwrap();
+        store
+            .update(|d| {
+                d.agents[0].completed_tasks.clear();
+                if stage == RevisionStage::Qa {
+                    // Baseline retirement after a report must not hide the gap.
+                    d.agents[0].status = herdr_shepherd::store::AgentStatus::Retired;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let before_starts = h.start_args.borrow().len();
+        let outcome = resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "later");
+        assert_eq!(
+            store.read().unwrap().agents.len(),
+            1,
+            "must not silently repeat completed {role}: {outcome:?}"
+        );
+        assert_eq!(h.start_args.borrow().len(), before_starts);
+        let error = outcome.expect_err("unverifiable legacy dispatch needs reconciliation");
+        assert!(error.to_string().contains("legacy dispatch"));
+        assert!(error.to_string().contains("reconcile"));
+        let data = store.read().unwrap();
+        assert_eq!(data.tickets[0].state, TicketState::Blocked);
+        assert!(
+            data.agents[0]
+                .dispatch_reason
+                .as_deref()
+                .unwrap()
+                .contains("legacy dispatch")
+        );
+        assert!(
+            data.tickets[0]
+                .revision_run
+                .as_ref()
+                .unwrap()
+                .agent
+                .is_none()
+        );
+        if stage == RevisionStage::Coder {
+            // Already-bound legacy records still consume their original report.
+            store
+                .update(|data| {
+                    data.tickets[0].state = TicketState::Revising;
+                    data.tickets[0].blocked_reason = None;
+                    data.tickets[0].revision_run.as_mut().unwrap().agent = Some(agent.clone());
+                    Ok(())
+                })
+                .unwrap();
+            assert!(matches!(
+                resume_revision(&h, &gh, &store, &cfg, &repo.gate(), "T-1", "bound").unwrap(),
+                RevisionOutcome::Started { role, .. } if role == "reviewer"
+            ));
+        }
+    }
+}
