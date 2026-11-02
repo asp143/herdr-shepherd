@@ -397,9 +397,31 @@ impl Herdr for CliHerdr {
         if until_working {
             args.extend(["--wait", "--until", "working", "--timeout", "30000"]);
         }
-        self.request(&args)
-            .map(|_| ())
-            .map_err(ShepherdError::into_prompt_error)
+        let result = (|| {
+            let value = self.request(&args)?;
+            if let Some(error) = value.get("error") {
+                return Err(ShepherdError::HerdrCommand {
+                    code: error
+                        .get("code")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("invalid_prompt_acknowledgement")
+                        .into(),
+                    message: "task prompt was not acknowledged".into(),
+                });
+            }
+            // A waited command must acknowledge the request. Empty or malformed
+            // envelopes can follow an accepted PTY write; do not call them safe
+            // rejections or retry. Keep silent acknowledgements for followups.
+            if until_working
+                && !value
+                    .get("result")
+                    .is_some_and(serde_json::Value::is_object)
+            {
+                return Err(anyhow::anyhow!("task prompt lacks acknowledgement").into());
+            }
+            Ok(())
+        })();
+        result.map_err(ShepherdError::into_prompt_error)
     }
 
     fn send_keys(&self, name: &str, keys: &[String]) -> Result<(), ShepherdError> {
@@ -610,6 +632,63 @@ mod tests {
                 std::fs::read_to_string(log).expect(&diagnostic),
                 "agent\nprompt\nsh-fixture-researcher-1\ntask with spaces\n--wait\n--until\nworking\n--timeout\n30000\n"
             );
+        }
+    }
+
+    #[test]
+    fn task_delivery_uses_verified_recipient_and_waited_acknowledgement() {
+        use super::super::{TaskDelivery, TaskRecipient};
+        for kind in ["codex", "omp", "claude", "pi"] {
+            for (response, exit, expected) in [
+                (
+                    r#"{"result":{"agent":{"agent_status":"working"}}}"#,
+                    0,
+                    "accepted",
+                ),
+                (r#"{"error":{"code":"agent_not_ready"}}"#, 1, "rejected"),
+                (r#"{"error":{"code":"agent_not_found"}}"#, 1, "dead"),
+                (r#"{"error":{"code":"timeout"}}"#, 1, "ambiguous"),
+                (r#"{"error":{"code":"timeout"}}"#, 0, "ambiguous"),
+                ("truncated acknowledgement", 0, "ambiguous"),
+                ("", 0, "ambiguous"),
+                ("{}", 0, "ambiguous"),
+            ] {
+                let (dir, mut h, _listener) = output_fixture(response);
+                h.bin =
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/herdr/fixtures/delivery.sh");
+                std::fs::write(
+                    dir.path().join("recipient"),
+                    json!({"result":{"agent":{
+                        "name":"owned", "agent":kind, "agent_status":"idle", "pane_id":"w:p1"
+                    }}})
+                    .to_string(),
+                )
+                .unwrap();
+                std::fs::write(
+                    dir.path().join("session"),
+                    r#"{"result":{"pane":{"agent_session":{"value":"session-1"}}}}"#,
+                )
+                .unwrap();
+                std::fs::write(dir.path().join("exit-code"), format!("{exit}\n")).unwrap();
+                let recipient = TaskRecipient {
+                    name: "owned".into(),
+                    harness: kind.into(),
+                    pane_id: "w:p1".into(),
+                    session_ref: "session-1".into(),
+                };
+                let outcome = h.deliver_task(&recipient, "task with spaces").unwrap();
+                let actual = match outcome {
+                    TaskDelivery::Accepted => "accepted",
+                    TaskDelivery::Rejected { .. } => "rejected",
+                    TaskDelivery::Dead { .. } => "dead",
+                    TaskDelivery::Ambiguous { .. } => "ambiguous",
+                };
+                assert_eq!(actual, expected, "{kind}: {response}");
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join("requests")).unwrap(),
+                    "agent\nget\nowned\npane\nget\nw:p1\nagent\nprompt\nowned\ntask with spaces\n--wait\n--until\nworking\n--timeout\n30000\n"
+                );
+            }
         }
     }
 
