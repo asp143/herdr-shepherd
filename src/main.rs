@@ -212,6 +212,18 @@ enum TicketCommands {
     Integrate {
         id: String,
     },
+    /// Accept a saved legacy report or discard ambiguous reports and redispatch.
+    Reconcile {
+        id: String,
+        #[arg(
+            long,
+            required_unless_present = "discard_reports",
+            conflicts_with = "discard_reports"
+        )]
+        accept_report: Option<String>,
+        #[arg(long)]
+        discard_reports: bool,
+    },
     Transition {
         id: String,
         #[arg(long)]
@@ -718,6 +730,30 @@ fn run(cli: &Cli) -> Result<(), ShepherdError> {
                     )?;
                     output::emit(cli.json, &result, || {
                         serde_json::to_string_pretty(&result).expect("serializable")
+                    });
+                }
+                TicketCommands::Reconcile {
+                    id,
+                    accept_report,
+                    discard_reports,
+                } => {
+                    let store = herdr_shepherd::store::Store::open(&state_dir(cli), &project)?;
+                    let cfg = herdr_shepherd::trusted::committed_config(
+                        &config::resolve_config_dir(cli.config_dir.as_deref()),
+                        &project,
+                        None,
+                        &state_dir(cli),
+                    )?;
+                    let ticket = herdr_shepherd::ticket::revise::reconcile_legacy_reports(
+                        &store,
+                        &cfg,
+                        id,
+                        accept_report.as_deref(),
+                        *discard_reports,
+                        &herdr_shepherd::launch::now(),
+                    )?;
+                    output::emit(cli.json, &ticket, || {
+                        serde_json::to_string_pretty(&ticket).expect("serializable")
                     });
                 }
                 TicketCommands::Transition { id, to, reason } => {

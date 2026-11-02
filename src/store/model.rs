@@ -63,6 +63,8 @@ pub struct Ticket {
     pub ci_failure_task: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_recovery: Option<crate::ticket::revise::CiRecovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_dispatch: Option<crate::ticket::revise::LegacyDispatch>,
     #[serde(default)]
     pub ci_none_since: Option<String>,
     #[serde(default)]

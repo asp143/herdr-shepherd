@@ -161,8 +161,8 @@ pub fn dispatch_with_backend(
                     return Ok(None);
                 }
                 scheduler::Action::ResumeCiBuild(id) => {
-                    let data = store.read()?;
-                    let ticket = data
+                    let mut data = store.read()?;
+                    let mut ticket = data
                         .tickets
                         .iter()
                         .find(|ticket| ticket.id == id && ticket.state == TicketState::Building)
@@ -187,7 +187,7 @@ pub fn dispatch_with_backend(
                             if current.ci_recovery.is_some() {
                                 return Ok(None);
                             }
-                            herdr_shepherd::ticket::revise::block_unbound_legacy_dispatch(
+                            herdr_shepherd::ticket::revise::reconcile_unbound_legacy_dispatch(
                                 current,
                                 &mut data.agents,
                                 "coder",
@@ -198,6 +198,18 @@ pub fn dispatch_with_backend(
                         })?;
                         if let Some(message) = blocked {
                             return Err(ShepherdError::Usage(message));
+                        }
+                        // Legacy reconciliation may have consumed the completed
+                        // CI task. Never dispatch from the pre-recovery snapshot.
+                        data = store.read()?;
+                        ticket = data
+                            .tickets
+                            .iter()
+                            .find(|ticket| ticket.id == id)
+                            .ok_or_else(|| ShepherdError::Usage("CI ticket disappeared".into()))?
+                            .clone();
+                        if ticket.ci_failure_task.is_none() {
+                            return Ok(None);
                         }
                     }
                     let generation = ci_retry_generation(&ticket);
@@ -260,6 +272,7 @@ pub fn dispatch_with_backend(
                                 "CI generation changed before dispatch".into(),
                             ));
                         }
+                        current.legacy_dispatch = None;
                         current.ci_recovery = Some(herdr_shepherd::ticket::revise::CiRecovery {
                             generation: generation.clone(),
                             assignment: herdr_shepherd::ticket::revise::AssignmentRef::from_agent(
@@ -821,20 +834,17 @@ mod dispatch_tests {
             "must not repeat a completed legacy CI dispatch: {result}"
         );
         assert_eq!(f.h.start_args.borrow().len(), 1);
-        assert_eq!(data.tickets[0].state, TicketState::Blocked);
-        assert_eq!(data.tickets[0].ci_failure_task.as_deref(), Some(task));
-        assert!(
-            result["errors"][0]["message"]
-                .as_str()
+        assert_eq!(data.tickets[0].state, TicketState::Building);
+        assert!(data.tickets[0].ci_failure_task.is_none());
+        assert!(result["errors"].as_array().unwrap().is_empty(), "{result}");
+        assert_eq!(
+            data.tickets[0]
+                .ci_recovery
+                .as_ref()
                 .unwrap()
-                .contains("legacy dispatch")
-        );
-        assert!(
-            data.agents[0]
-                .dispatch_reason
-                .as_deref()
-                .unwrap()
-                .contains("reconcile")
+                .assignment
+                .agent,
+            name
         );
         assert!(f.dispatch()["started"].as_array().unwrap().is_empty());
         assert_eq!(f.store.read().unwrap().agents.len(), 1);

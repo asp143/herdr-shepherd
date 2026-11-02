@@ -477,13 +477,28 @@ old stored reports cannot complete a new assignment. Exact duplicates of the
 current assignment are idempotent. The optional flag preserves compatibility
 for original unreused assignments; tokenless reports are rejected after reuse.
 Existing stored agents still load, but unverifiable legacy identities start
-fresh. Only a saved legacy task with the pending workflow marker (and matching
-revision task) counts as an interrupted dispatch. Unrelated reported or retired
-history does not block a fresh revision or CI task. A matching unbound completed
-role blocks for reconciliation instead of repeating work. The error and the
-agent's `dispatch_reason` identify saved reports that need review; pending
-revision and CI intent remain intact. Already-bound legacy reports still
-advance their original workflow.
+fresh. A saved pre-upgrade report automatically advances its original revision
+or CI workflow when its task marker, role, checkout and pending task match.
+Unrelated reported or retired history does not block a fresh task. The CI marker
+also pins the revision round; block/resume transition clocks do not invalidate
+that saved task.
+
+Multiple matching legacy reports, or an older quarantined CI task whose
+original clock cannot be verified, block dispatch without repeating completed
+work. Inspect the reports with `ticket show ID` and `agent list`, then run either
+`ticket reconcile ID --accept-report AGENT` to bind a saved report, or
+`ticket reconcile ID --discard-reports` to preserve the reports as evidence and
+allow a fresh task. Both commands validate the exact pending quarantine and
+resume its original stage; run `ticket dispatch` afterwards. Cancellation of a
+saved agent is supported and does not prevent reconciliation. The command
+refuses unrelated tickets, changed workflows, unknown reports and active tasks.
+
+For a legacy quarantine saved by an older release, use
+`ticket transition ID --to revising` (or `--to building` for CI), followed by
+`ticket dispatch`. A uniquely matching report recovers automatically, including
+a report whose agent was cancelled. Ambiguous evidence produces the exact
+`ticket reconcile` commands to run. Saved reports are never edited or deleted
+by recovery.
 
 Reviewer and QA tasks pin base and HEAD, cover the complete current diff and
 every acceptance criterion, and require new commands and evidence. Earlier

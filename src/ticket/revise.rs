@@ -87,49 +87,151 @@ pub fn ci_retry_generation(ticket: &Ticket) -> String {
     )
 }
 
-/// An old launcher saved agents before binding its workflow reference. Only
-/// its exact generated marker and pending task can tie an unbound report to
-/// this workflow. Unrelated completed history must not quarantine a new task.
-/// Keep matching evidence intact until the workflow is reconciled.
-pub fn block_unbound_legacy_dispatch(
-    ticket: &mut Ticket,
-    agents: &mut [crate::store::AgentRecord],
+/// Evidence retained when a legacy dispatch needs an explicit decision.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct LegacyDispatch {
+    workflow: String,
+    role: String,
+    marker: String,
+    pending_key: String,
+    candidates: Vec<String>,
+    #[serde(default)]
+    discarded: bool,
+}
+
+// Exclude state/transition clocks: blocking and a public resume must preserve
+// the original CI marker, which the baseline derived from those clocks.
+fn legacy_pending_key(ticket: &Ticket, workflow: &str) -> String {
+    serde_json::json!({
+        "workflow": workflow, "ticket": ticket.id, "branch": ticket.branch,
+        "base": ticket.base, "checkout": ticket.worktree, "pr": ticket.pr_number,
+        "round": ticket.revision_round,
+        "task": if workflow == "revision" { &ticket.revision_task } else { &ticket.ci_failure_task },
+        "run": if workflow == "revision" { ticket.revision_run.as_ref() } else { None },
+        "comments": if workflow == "revision" { accepted_revision_comments(ticket) } else { String::new() },
+        "ci_head": if workflow == "CI recovery" { ticket.ci_head_sha.as_ref() } else { None },
+    }).to_string()
+}
+
+// Only quarantine/resume transitions may be peeled back. A real workflow
+// transition (especially CiWait -> Building) starts a new CI generation, even
+// when a loop-cap reset lets its task text and round recur.
+fn legacy_ci_markers(ticket: &Ticket) -> Vec<String> {
+    let mut previous = ticket.clone();
+    let mut markers = vec![ci_retry_generation(ticket)];
+    loop {
+        let history = &previous.history;
+        let Some(last) = history.last() else {
+            break;
+        };
+        if last.from == TicketState::Blocked && last.to == TicketState::Building {
+            if !history.iter().rev().nth(1).is_some_and(|entry| {
+                entry.from == TicketState::Building
+                    && entry.to == TicketState::Blocked
+                    && entry.reason == Some(crate::store::BlockedReason::Escalated)
+            }) {
+                break;
+            }
+            previous.history.pop();
+        }
+        if !previous.history.last().is_some_and(|entry| {
+            entry.from == TicketState::Building
+                && entry.to == TicketState::Blocked
+                && entry.reason == Some(crate::store::BlockedReason::Escalated)
+        }) {
+            break;
+        }
+        previous.history.pop();
+        previous.updated_at = previous
+            .history
+            .last()
+            .map(|entry| &entry.at)
+            .unwrap_or(&previous.created_at)
+            .clone();
+        markers.push(ci_retry_generation(&previous));
+    }
+    markers
+}
+
+fn legacy_ci_task_matches(ticket: &Ticket, task: &str) -> bool {
+    let Some((marker, saved_task)) = task.split_once('\n') else {
+        return false;
+    };
+    let prefix = format!(
+        "CI retry {} round {} task ",
+        ticket.id, ticket.revision_round
+    );
+    let Some(digest) = marker.strip_prefix(&prefix) else {
+        return false;
+    };
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && ticket.ci_failure_task.as_deref() == Some(saved_task)
+}
+
+fn legacy_ci_verified(ticket: &Ticket, agent: &crate::store::AgentRecord, marker: &str) -> bool {
+    let saved = agent.task.lines().next().unwrap_or_default();
+    saved == marker || legacy_ci_markers(ticket).iter().any(|known| known == saved)
+}
+
+fn legacy_candidates<'a>(
+    ticket: &Ticket,
+    agents: &'a [crate::store::AgentRecord],
     role: &str,
     workflow: &str,
-    now: &str,
-    max_revision_rounds: u32,
-) -> Result<Option<String>, ShepherdError> {
-    let marker = match workflow {
-        "revision" => match &ticket.revision_run {
-            Some(run) => run_marker(run),
-            None => return Ok(None),
-        },
-        "CI recovery" => ci_retry_generation(ticket),
-        _ => return Err(ShepherdError::Usage("unknown legacy workflow".into())),
-    };
+    marker: &str,
+) -> Vec<&'a crate::store::AgentRecord> {
     let checkout = ticket
         .worktree
         .as_ref()
         .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()));
-    let recipients: Vec<_> = agents
-        .iter_mut()
+    agents
+        .iter()
         .filter(|agent| {
             agent.ticket == ticket.id
                 && agent.role == role
                 && agent.unit.is_none()
                 && agent.task_id.is_none()
                 && agent.attempt_id.is_none()
-                && agent.report.is_some()
+                && agent
+                    .report
+                    .as_ref()
+                    .is_some_and(|report| report.task_id.is_none())
+                && agent
+                    .completed_tasks
+                    .iter()
+                    .all(|task| task.task_id.is_none() && task.attempt_id.is_none())
                 && matches!(
                     agent.status,
                     crate::store::AgentStatus::Reported | crate::store::AgentStatus::Retired
                 )
-                && agent.task.lines().any(|line| line == marker)
-                && (workflow != "revision"
-                    || agent.task.contains(&format!(
-                        "\nTask: {}\nAccepted comments:\n",
-                        ticket.revision_task.as_deref().unwrap_or_default()
-                    )))
+                && if workflow == "CI recovery" {
+                    legacy_ci_task_matches(ticket, &agent.task)
+                        && (legacy_ci_verified(ticket, agent, marker)
+                            || ticket.legacy_dispatch.as_ref().is_some_and(|receipt| {
+                                receipt.workflow == workflow
+                                    && receipt.pending_key == legacy_pending_key(ticket, workflow)
+                                    && receipt.candidates.contains(&agent.name)
+                            })
+                            || (legacy_ci_markers(ticket).len() > 1
+                                && agent.dispatch_reason.as_deref().is_some_and(|reason| {
+                                    reason.starts_with(
+                                        "blocked: unbound legacy dispatch for CI recovery coder:",
+                                    )
+                                })))
+                } else {
+                    agent.task.lines().next() == Some(marker)
+                        && agent.task.contains(&format!(
+                            "\nTask: {}\nAccepted comments:\n",
+                            ticket.revision_task.as_deref().unwrap_or_default()
+                        ))
+                        && agent.task.contains(&format!(
+                            "\nAccepted comments:\n{}\nNew diff:",
+                            accepted_revision_comments(ticket)
+                        ))
+                }
                 && checkout.as_ref().is_some_and(|path| {
                     agent
                         .worktree
@@ -138,19 +240,93 @@ pub fn block_unbound_legacy_dispatch(
                         == *path
                 })
         })
-        .collect();
+        .collect()
+}
+
+fn bind_legacy_report(
+    ticket: &mut Ticket,
+    workflow: &str,
+    marker: &str,
+    assignment: AssignmentRef,
+) {
+    if workflow == "revision" {
+        let run = ticket
+            .revision_run
+            .as_mut()
+            .expect("validated legacy revision");
+        run.agent = Some(assignment.agent);
+        run.task_id = assignment.task_id;
+        run.attempt_id = assignment.attempt_id;
+    } else {
+        ticket.ci_recovery = Some(CiRecovery {
+            generation: marker.into(),
+            assignment,
+        });
+        ticket.ci_failure_task = None;
+    }
+    ticket.legacy_dispatch = None;
+}
+
+/// Recover the baseline's separate launch/reference writes using its exact
+/// task marker. One matching completion binds automatically; multiple matches
+/// retain a validated receipt for a public operator decision.
+pub fn reconcile_unbound_legacy_dispatch(
+    ticket: &mut Ticket,
+    agents: &mut [crate::store::AgentRecord],
+    role: &str,
+    workflow: &str,
+    now: &str,
+    max_revision_rounds: u32,
+) -> Result<Option<String>, ShepherdError> {
+    let pending_key = legacy_pending_key(ticket, workflow);
+    let previous = ticket.legacy_dispatch.as_ref().filter(|receipt| {
+        receipt.workflow == workflow && receipt.role == role && receipt.pending_key == pending_key
+    });
+    if previous.is_some_and(|receipt| receipt.discarded) {
+        return Ok(None);
+    }
+    let marker = if let Some(receipt) = previous {
+        receipt.marker.clone()
+    } else {
+        match workflow {
+            "revision" => match &ticket.revision_run {
+                Some(run) => run_marker(run),
+                None => return Ok(None),
+            },
+            "CI recovery" => ci_retry_generation(ticket),
+            _ => return Err(ShepherdError::Usage("unknown legacy workflow".into())),
+        }
+    };
+    let recipients = legacy_candidates(ticket, agents, role, workflow, &marker);
     if recipients.is_empty() {
         return Ok(None);
     }
-    let names = recipients
-        .iter()
-        .map(|agent| agent.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    if let [agent] = recipients.as_slice()
+        && (workflow != "CI recovery" || legacy_ci_verified(ticket, agent, &marker))
+    {
+        let assignment = AssignmentRef::from_agent(agent);
+        bind_legacy_report(ticket, workflow, &marker, assignment);
+        return Ok(None);
+    }
+    let candidates: Vec<_> = recipients.iter().map(|agent| agent.name.clone()).collect();
     let message = format!(
-        "unbound legacy dispatch for {workflow} {role}: {names}; inspect and reconcile the saved reports with the pending workflow before resuming; no replacement task was started"
+        "unbound legacy dispatch for {workflow} {role}: {}; inspect the saved reports, then run `ticket reconcile {} --accept-report <agent>` or `ticket reconcile {} --discard-reports`; no replacement task was started",
+        candidates.join(", "),
+        ticket.id,
+        ticket.id
     );
-    for agent in recipients {
+    ticket.legacy_dispatch = Some(LegacyDispatch {
+        workflow: workflow.into(),
+        role: role.into(),
+        marker,
+        pending_key,
+        candidates: candidates.clone(),
+        discarded: false,
+    });
+    for agent in agents
+        .iter_mut()
+        .filter(|agent| candidates.contains(&agent.name))
+    {
         agent.dispatch_reason = Some(format!("blocked: {message}"));
     }
     super::state::transition_with_limit(
@@ -161,6 +337,105 @@ pub fn block_unbound_legacy_dispatch(
         max_revision_rounds,
     )?;
     Ok(Some(message))
+}
+
+/// Resolve only the exact quarantined workflow. Reports remain immutable even
+/// when discarded; the receipt authorizes one redispatch without accepting them.
+pub fn reconcile_legacy_reports(
+    store: &crate::store::Store,
+    cfg: &crate::config::Config,
+    id: &str,
+    accept_report: Option<&str>,
+    discard_reports: bool,
+    now: &str,
+) -> Result<Ticket, ShepherdError> {
+    let _dispatch = dispatch_lock(store, id)?;
+    let _operation = super::operation::exclusive(store, id)?;
+    let max_rounds = crate::roles::resolve(cfg)?.shepherd.max_revision_rounds;
+    store.update(|data| {
+        let invalid =
+            || ShepherdError::Usage("ticket has no matching legacy quarantine to reconcile".into());
+        if accept_report.is_some() == discard_reports {
+            return Err(ShepherdError::Usage(
+                "choose --accept-report NAME or --discard-reports".into(),
+            ));
+        }
+        let ticket = data
+            .tickets
+            .iter_mut()
+            .find(|ticket| ticket.id == id)
+            .ok_or_else(invalid)?;
+        let receipt = ticket.legacy_dispatch.clone().ok_or_else(invalid)?;
+        let target = match receipt.workflow.as_str() {
+            "revision"
+                if ticket
+                    .revision_run
+                    .as_ref()
+                    .is_some_and(|run| run.agent.is_none() && run.stage != RevisionStage::Push) =>
+            {
+                TicketState::Revising
+            }
+            "CI recovery" if ticket.ci_recovery.is_none() && ticket.ci_failure_task.is_some() => {
+                TicketState::Building
+            }
+            _ => return Err(invalid()),
+        };
+        if ticket.state != TicketState::Blocked
+            || ticket.blocked_reason != Some(crate::store::BlockedReason::Escalated)
+            || receipt.discarded
+            || receipt.pending_key != legacy_pending_key(ticket, &receipt.workflow)
+            || data.agents.iter().any(|agent| {
+                agent.ticket == id
+                    && matches!(
+                        agent.status,
+                        crate::store::AgentStatus::Starting
+                            | crate::store::AgentStatus::Working
+                            | crate::store::AgentStatus::Blocked
+                    )
+            })
+        {
+            return Err(invalid());
+        }
+        let candidates = legacy_candidates(
+            ticket,
+            &data.agents,
+            &receipt.role,
+            &receipt.workflow,
+            &receipt.marker,
+        );
+        if candidates
+            .iter()
+            .map(|agent| &agent.name)
+            .collect::<Vec<_>>()
+            != receipt.candidates.iter().collect::<Vec<_>>()
+        {
+            return Err(invalid());
+        }
+        if let Some(name) = accept_report {
+            let agent = candidates
+                .iter()
+                .find(|agent| agent.name == name)
+                .ok_or_else(|| {
+                    ShepherdError::Usage(
+                        "--accept-report must name a quarantined legacy report".into(),
+                    )
+                })?;
+            bind_legacy_report(
+                ticket,
+                &receipt.workflow,
+                &receipt.marker,
+                AssignmentRef::from_agent(agent),
+            );
+        } else {
+            ticket
+                .legacy_dispatch
+                .as_mut()
+                .expect("validated receipt")
+                .discarded = true;
+        }
+        super::state::transition_with_limit(ticket, target, None, now, max_rounds)?;
+        Ok(ticket.clone())
+    })
 }
 
 /// Keep revision launch and terminal PR retirement mutually exclusive.
@@ -269,7 +544,7 @@ pub fn resume_revision(
                 RevisionStage::Qa => "qa",
                 RevisionStage::Push => unreachable!(),
             };
-            if let Some(message) = block_unbound_legacy_dispatch(
+            if let Some(message) = reconcile_unbound_legacy_dispatch(
                 ticket,
                 &mut data.agents,
                 role,
@@ -487,6 +762,7 @@ pub fn resume_revision(
             run.agent = Some(agent.name.clone());
             run.task_id = agent.task_id.clone();
             run.attempt_id = agent.attempt_id.clone();
+            ticket.legacy_dispatch = None;
             Ok(())
         },
     )?;
@@ -661,8 +937,8 @@ fn run_marker(run: &RevisionRun) -> String {
     format!("Revision {} {:?}", run.base_sha, run.stage)
 }
 
-fn revision_task(ticket: &Ticket, run: &RevisionRun, role: &str) -> String {
-    let comments = ticket
+fn accepted_revision_comments(ticket: &Ticket) -> String {
+    ticket
         .comments
         .iter()
         .filter(|comment| comment.verdict.as_deref() == Some("accepted") && !comment.acknowledged)
@@ -673,7 +949,11 @@ fn revision_task(ticket: &Ticket, run: &RevisionRun, role: &str) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n")
+}
+
+fn revision_task(ticket: &Ticket, run: &RevisionRun, role: &str) -> String {
+    let comments = accepted_revision_comments(ticket);
     let action = match role {
         "coder" => {
             "Implement the revision task and accepted comments. Commit the changes and run relevant tests."
@@ -775,6 +1055,34 @@ fn verified_head(gate: &Gate) -> Result<String, ShepherdError> {
 #[cfg(test)]
 mod assignment_tests {
     use super::*;
+
+    #[test]
+    fn legacy_ci_correlation_requires_exact_task_and_round() {
+        let mut ticket = Ticket {
+            id: "T1".into(),
+            revision_round: 2,
+            ci_failure_task: Some("Fix check A\nDetails".into()),
+            ..Default::default()
+        };
+        let task = format!(
+            "{}\n{}",
+            ci_retry_generation(&ticket),
+            ticket.ci_failure_task.as_deref().unwrap()
+        );
+        assert!(legacy_ci_task_matches(&ticket, &task));
+        // Public block/resume transitions change clocks, but not the task.
+        ticket.updated_at = "resumed".into();
+        assert!(legacy_ci_task_matches(&ticket, &task));
+        ticket.revision_round += 1;
+        assert!(!legacy_ci_task_matches(&ticket, &task));
+        ticket.revision_round -= 1;
+        ticket.ci_failure_task = Some("Fix check B".into());
+        assert!(!legacy_ci_task_matches(&ticket, &task));
+        assert!(!legacy_ci_task_matches(
+            &ticket,
+            "CI retry T1 round 2 task not-a-digest\nFix check B"
+        ));
+    }
 
     #[test]
     fn revision_prompt_binds_report_to_assignment_file_and_token() {
