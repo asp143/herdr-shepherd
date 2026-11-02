@@ -1098,6 +1098,50 @@ mod tests {
     }
 
     #[test]
+    fn reported_cohort_does_not_block_ticket_pr() {
+        let (dir, store) = ready_fixture();
+        store
+            .update(|data| {
+                for role in ["coder", "reviewer", "qa"] {
+                    let report = serde_json::json!({"status":"completed","summary":"current round checked","tests":["fixture"],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":data.tickets[0].qa_commit_sha,"task_id":"current-task"});
+                    let mut prior_report = report.clone();
+                    prior_report["task_id"] = "prior-task".into();
+                    data.agents.push(serde_json::from_value(serde_json::json!({
+                        "name":format!("reported-{role}"), "ticket":"T-1", "role":role,
+                        "runner":"codex-sol-high", "status":"reported", "pane_id":null,
+                        "tab_id":null, "worktree":dir.path(), "task":"verify current diff",
+                        "report":report, "observed":null, "last_progress_at":"0",
+                        "nudges":0, "restarts":0, "prompt_pending":false,
+                        "task_id":"current-task", "attempt_id":"current-task-1",
+                        "completed_tasks":[{"task_id":"prior-task","attempt_id":"prior-task-1",
+                            "task":"prior round", "report":prior_report,"completed_at":"0"},
+                            {"task_id":"current-task","attempt_id":"current-task-1",
+                            "task":"verify current diff", "report":report,"completed_at":"1"}]
+                    })).unwrap());
+                }
+                Ok(())
+            })
+            .unwrap();
+        let before = store.read().unwrap().agents;
+        let cfg = crate::config::load(&dir.path().join("cfg"), None).unwrap();
+        let gh = FakeBackend::new(vec![Ok(Some(pr_status()))]);
+        let ticket = open(
+            &store,
+            &gh,
+            &gate(dir.path()),
+            &cfg,
+            "T-1",
+            "Fix boundary",
+            &["Check input".into()],
+            &["cargo test".into()],
+            "2",
+        )
+        .unwrap();
+        assert_eq!(ticket.state, TicketState::CiWait);
+        assert_eq!(store.read().unwrap().agents, before);
+    }
+
+    #[test]
     fn initial_and_ci_fix_push_reject_head_after_qa() {
         for existing_pr in [None, Some(7)] {
             let (dir, store) = ready_fixture();
