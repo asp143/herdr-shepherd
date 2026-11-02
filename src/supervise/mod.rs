@@ -4022,6 +4022,15 @@ mod tests {
                 .parse()
                 .unwrap();
             let rec = reused_assignment(&store);
+            store
+                .update(|data| {
+                    data.tickets[0].ci_recovery = Some(crate::ticket::revise::CiRecovery {
+                        generation: "pending-ci-generation".into(),
+                        assignment: crate::ticket::revise::AssignmentRef::from_agent(&rec),
+                    });
+                    Ok(())
+                })
+                .unwrap();
             h.pane_sessions
                 .borrow_mut()
                 .insert("w1:p1".into(), "current-session".into());
@@ -4049,6 +4058,14 @@ mod tests {
             assert_eq!(current.task, rec.task);
             assert_eq!(current.completed_tasks, rec.completed_tasks);
             assert!(current.report.is_none());
+            assert!(
+                store.read().unwrap().tickets[0]
+                    .ci_recovery
+                    .as_ref()
+                    .unwrap()
+                    .assignment
+                    .matches(&current)
+            );
             assert!(crate::flock::store_report_for_task(&store, &current.name, Some("task-1"),
                 r#"{"status":"completed","summary":"old task","tests":[],"changed_paths":[],"blockers":[],"findings":[],"commit_sha":null}"#).is_err());
             if recovery == Decision::Respawn {

@@ -328,6 +328,67 @@ fn rejected_or_dead_delivery_transfers_reserved_task() {
 }
 
 #[test]
+fn replacement_reservation_rebinds_caller_before_input() {
+    use crate::ticket::revise::{AssignmentRef, CiRecovery};
+
+    for code in ["agent_not_ready", "agent_not_found"] {
+        let (dir, store, h, cfg, old) = fixture("coder");
+        let callback_store = store.clone();
+        let submitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = submitted.clone();
+        *h.on_prompt.borrow_mut() = Some(Box::new(move |name| {
+            let data = callback_store.read().unwrap();
+            let recipient = data.agents.iter().find(|a| a.name == name).unwrap();
+            let recovery = data.tickets[0].ci_recovery.as_ref().unwrap();
+            assert!(
+                recovery.assignment.matches(recipient),
+                "input reached a recipient before its caller reference was durable"
+            );
+            assert!(recipient.report.is_none());
+            seen.lock().unwrap().push(recovery.assignment.clone());
+        }));
+        h.prompt_results.borrow_mut().push_back((
+            false,
+            Err(ShepherdError::HerdrCommand {
+                code: code.into(),
+                message: "rejected before input".into(),
+            }),
+        ));
+        let next = crate::flock::spawn_with_reservation(
+            &h,
+            &store,
+            &cfg,
+            request(dir.path(), "coder"),
+            &|data, agent| {
+                data.tickets[0].ci_recovery = Some(CiRecovery {
+                    generation: "pending-ci-generation".into(),
+                    assignment: AssignmentRef::from_agent(agent),
+                });
+                Ok(())
+            },
+        )
+        .unwrap();
+        let inputs = submitted.lock().unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].agent, old.name);
+        assert_eq!(inputs[1].agent, next.name);
+        assert_ne!(inputs[0].agent, inputs[1].agent);
+        assert_eq!(inputs[0].task_id, inputs[1].task_id);
+        assert_ne!(inputs[0].attempt_id, inputs[1].attempt_id);
+        let data = store.read().unwrap();
+        assert!(
+            data.tickets[0]
+                .ci_recovery
+                .as_ref()
+                .unwrap()
+                .assignment
+                .matches(&next)
+        );
+        assert_eq!(next.status, AgentStatus::Working);
+    }
+}
+
+#[test]
 fn matching_report_wins_even_when_ack_times_out() {
     let (dir, store, h, cfg, old) = fixture("coder");
     let observed = store.clone();
